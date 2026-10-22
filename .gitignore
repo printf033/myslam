@@ -1,0 +1,4 @@
+.codewhale/
+build/
+
+*.log

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-ci:
+    name: Build & Test (Ubuntu / C++26)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            ninja-build \
+            pkgconf \
+            libtbb-dev \
+            git
+
+      - name: Checkout Code (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify Code Formatting (clang-format)
+        run: |
+          CHECK_DIRS=()
+          for d in src examples tests; do
+            [ -d "$d" ] && CHECK_DIRS+=("$d")
+          done
+
+          if [ ${#CHECK_DIRS[@]} -gt 0 ]; then
+            find "${CHECK_DIRS[@]}" -type f \( -name "*.cpp" -o -name "*.hpp" \) -print0 \
+              | xargs -0 -r clang-format --dry-run -Werror
+          fi
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DMYSLAM_BUILD_TESTS=ON \
+            -DMYSLAM_BUILD_EXAMPLES=ON
+
+      - name: Build All Targets
+        run: cmake --build build -j$(nproc)
+
+      - name: Run Test Suite
+        run: ctest --test-dir build --output-on-failure --schedule-random
