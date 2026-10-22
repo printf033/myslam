@@ -11,7 +11,7 @@ target_compile_features(myslam INTERFACE
 )
 
 target_compile_options(myslam INTERFACE
-    $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>>:-Wall -Wextra -fmacro-prefix-map=${myslam_SOURCE_DIR}/=>
+    $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>>:-Wall -Wextra -fmacro-prefix-map=${PROJECT_SOURCE_DIR}/=>
 )
 
 find_package(Threads REQUIRED)
