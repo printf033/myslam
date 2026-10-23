@@ -523,6 +523,16 @@ namespace myslam::vio
         const gtsam::NavState &latestNavState() const { return latestNavState_; }
         const gtsam::imuBias::ConstantBias &latestBias() const { return currentBias_; }
 
+        /**
+         * @brief 当前优化估计（含活跃路标 L 变量），用于点云导出与可视化
+         */
+        const gtsam::Values &currentEstimate() const { return currentEstimate_; }
+
+        /**
+         * @brief 已三角化路标（未随窗口边缘化的原始结果）
+         */
+        const std::unordered_map<int, gtsam::Point3> &triangulatedLandmarks() const { return triangulatedLandmarks_; }
+
     private:
         VioConfig config_;
         std::shared_ptr<gtsam::Cal3_S2> K_;

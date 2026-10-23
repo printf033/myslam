@@ -36,6 +36,7 @@ namespace myslam::vio
         int featureId{-1};          // 全局唯一的特征点 ID
         gtsam::Point2 uv{0, 0};     // 像素坐标 (px)
         gtsam::Point2 uvNorm{0, 0}; // 归一化相机平面坐标 (x, y)
+        bool isNew{false};          // 本帧新检测（非上一帧跟踪而来），用于可视化与调试
     };
 
     /**

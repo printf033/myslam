@@ -34,6 +34,8 @@ endif()
 # -----------------------------------------------------------------------------
 option(MYSLAM_BUILD_EXAMPLES "Build example programs" ${MYSLAM_IS_TOP_LEVEL})
 option(MYSLAM_BUILD_TESTS    "Build tests"            ${MYSLAM_IS_TOP_LEVEL})
+option(MYSLAM_BUILD_DATASET_TOOLS
+    "Build OpenCV-based dataset replay tools (requires OpenCV)" OFF)
 
 # -----------------------------------------------------------------------------
 # Targets

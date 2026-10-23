@@ -74,9 +74,14 @@ namespace myslam::vio
 
         /**
          * @brief 尝试执行静态检测与重力粗对齐
+         *
+         * @param enforceStationary 是否强制静止检测。数据集回放时设备往往从运动
+         *        状态开始，长时间无法满足静止条件；此时以 false 调用，直接用
+         *        最近一段 IMU 的均值做重力对齐（世界系取初始 IMU 系）。
          * @return 是否成功完成对齐
          */
-        bool tryGravityAlignment(gtsam::Rot3 &outRWb, gtsam::imuBias::ConstantBias &outBias)
+        bool tryGravityAlignment(gtsam::Rot3 &outRWb, gtsam::imuBias::ConstantBias &outBias,
+                                 bool enforceStationary = true)
         {
             if (imuSamples_.size() < 40)
             {
@@ -113,7 +118,7 @@ namespace myslam::vio
                 imuSamples_.size(), accStd, gyroStd);
 
             // 静态检测门限：若方差过大说明有剧烈晃动，拒绝静态初始化
-            if (accStd > 0.25 || gyroStd > 0.05)
+            if (enforceStationary && (accStd > 0.25 || gyroStd > 0.05))
             {
                 mylog::warn("[初始化-步骤1] 设备处于动态激励中，未能满足静止条件，重置样本集");
                 imuSamples_.clear();
