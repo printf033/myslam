@@ -329,6 +329,47 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
         expectNear(config.vio.bodyPSensor.translation().x(), 0.10, "默认配置的外参平移与代码默认值一致");
         expectTrue(config.vio.bodyPSensor.rotation().equals(gtsam::Rot3(0, 0, 1, -1, 0, 0, 0, -1, 0), 1e-12),
                    "默认配置的外参旋转与代码默认值一致");
+        expectTrue(config.intrinsics.isValid(), "默认配置的 dataset 内参合法");
+        expectTrue(config.replay.viz.trailMaxPoints == 20000, "默认配置的可视化参数与代码默认值一致");
+    }
+
+    /**
+     * @brief dataset 节：纯数据结构、路径可清空、非法内参被拒绝
+     */
+    void checkDatasetSection()
+    {
+        const auto path = writeLua("dataset", R"(
+dataset = {
+    intrinsics = { fx = 500.0, imageWidth = 320, imageHeight = 240 },
+    replay = { stride = 3, maxFeatures = 120, outputTum = "out.tum", plyPath = "" },
+    viz = { showWindow = true, videoPath = "", playbackRate = 1.0 },
+}
+)");
+
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+
+        expectTrue(report.project, "dataset 节解析成功且不影响 VIO 配置");
+        expectNear(config.intrinsics.fx, 500.0, "dataset.intrinsics.fx 覆盖生效");
+        expectTrue(config.intrinsics.imageWidth == 320, "dataset.intrinsics.imageWidth 覆盖生效");
+        expectTrue(config.intrinsics.isValid(), "覆盖后的内参仍然合法");
+        expectTrue(config.replay.stride == 3, "dataset.replay.stride 覆盖生效");
+        expectTrue(config.replay.maxFeatures == 120, "dataset.replay.maxFeatures 覆盖生效");
+        expectTrue(config.replay.outputTum == std::filesystem::path("out.tum"), "outputTum 路径生效");
+        expectTrue(config.replay.plyPath.empty(), "空串可清空路径字段");
+        expectTrue(config.replay.viz.showWindow, "dataset.viz.showWindow 生效");
+        expectNear(config.replay.viz.playbackRate, 1.0, "dataset.viz.playbackRate 生效");
+        // dataset 与 vio 是独立节，前者不应污染后者
+        expectNear(config.vio.fx, 460.0, "dataset 节不影响 vio 内参");
+
+        const auto badIntrinsics = writeLua("dataset-bad", R"(
+dataset = { intrinsics = { fx = 0.0 } }
+)");
+        myslam::config::ProjectConfig badConfig;
+        const auto badReport = loadFrom(badIntrinsics, badConfig);
+        std::filesystem::remove(badIntrinsics);
+        expectTrue(!badReport.project, "非法内参（fx 被钳到 1.0 之外的 0）被拒绝");
     }
 
 } // namespace
@@ -348,6 +389,7 @@ int main()
     checkEmptyScript();
     checkLoggingSection();
     checkShippedConfig();
+    checkDatasetSection();
 
     if (g_failures == 0)
     {

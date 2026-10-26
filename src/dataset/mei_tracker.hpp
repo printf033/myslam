@@ -19,6 +19,7 @@
  * 建立不同关键帧之间的共视关系并三角化。
  */
 
+#include "dataset/types.hpp"
 #include "logger.hpp"
 #include "vio/types.hpp"
 #include <algorithm>
@@ -32,35 +33,6 @@
 
 namespace myslam::dataset
 {
-
-    /**
-     * @brief SubT Handheld1 的 MEI 相机参数（与 intrinsics_subt_handheld.yaml 一致）
-     */
-    struct MeiIntrinsics
-    {
-        // 原始 MEI 内参（yaml 中 calibration 前四项）
-        double fx{758.3153257832925};
-        double fy{676.6492212772476};
-        double cx{318.27111164892506};
-        double cy{239.79816832491474};
-        // MEI 模型参数与畸变系数
-        double xi{1.583106303248484};
-        double k1{-0.059098218173967695};
-        double k2{0.1793477408661115};
-        double p1{0.0016819528105368057};
-        double p2{-0.0005887999624264534};
-        // 虚拟针孔焦距缩放（与 MASt3R-Fusion 的 K_opt = K * scale 一致）
-        double pinholeScale{0.4};
-        int imageWidth{640};
-        int imageHeight{480};
-
-        double pinholeFx() const { return fx * pinholeScale; }
-        double pinholeFy() const { return fy * pinholeScale; }
-        double pinholeCx() const { return cx; }
-        double pinholeCy() const { return cy; }
-
-        bool isValid() const { return fx > 0.0 && fy > 0.0 && pinholeScale > 0.0 && imageWidth > 0 && imageHeight > 0; }
-    };
 
     /**
      * @brief MEI 像素 -> 去畸变针孔像素

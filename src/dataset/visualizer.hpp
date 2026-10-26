@@ -12,6 +12,7 @@
  * 下方为状态栏：左侧是轨迹小地图（世界系 XY），右侧是运行状态文字。
  */
 
+#include "dataset/types.hpp"
 #include "vio/types.hpp"
 #include <algorithm>
 #include <cmath>
@@ -28,22 +29,6 @@
 
 namespace myslam::dataset
 {
-
-    /**
-     * @brief 可视化配置
-     */
-    struct VisualizationConfig
-    {
-        bool showWindow{false};          ///< 打开实时窗口
-        std::filesystem::path videoPath; ///< 视频输出路径，空则不写
-        int displayStride{1};            ///< 每多少帧渲染一次（1=每帧）
-        int panelHeight{180};            ///< 底部状态栏高度（像素）
-        int trailMaxPoints{20000};       ///< 轨迹小地图保留的最大点数
-        int videoFps{20};                ///< 视频帧率
-        /// 播放倍速：0 = 不限速（离线全速，约 100+ 帧/秒）；
-        /// 1 = 按相机时间戳实时播放；2 = 两倍速。仅作用于实时窗口。
-        double playbackRate{0.0};
-    };
 
     /**
      * @brief 回放可视化器

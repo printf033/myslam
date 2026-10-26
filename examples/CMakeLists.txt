@@ -19,6 +19,10 @@ if(MYSLAM_BUILD_DATASET_TOOLS)
         myslam::myslam_sanitized
         ${OpenCV_LIBS}
     )
+    # 可选 Lua 配置支持（与 gen_bin 生成的示例一致）
+    if(TARGET myslam::myslam_lua)
+        target_link_libraries(2_subt_dataset PRIVATE myslam::myslam_lua)
+    endif()
     target_include_directories(2_subt_dataset PRIVATE ${OpenCV_INCLUDE_DIRS})
 
     # OpenCV highgui 通过 pango 间接依赖 fontconfig；部分发行版只装了运行时库

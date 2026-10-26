@@ -18,11 +18,13 @@
 #include "dataset/subt_dataset.hpp"
 #include "log_config.hpp"
 #include "logger.hpp"
+#include "lua_config.hpp"
 #include "vio/types.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
 #include <string>
@@ -46,7 +48,11 @@ namespace
                      "                     [--fx F] [--fy F] [--cx F]\n"
                      "                     [--cy F] [--xi F] [--k1 F] [--k2 F] [--p1 F] [--p2 F]\n"
                      "                     [--width W] [--height H] [--ply cloud.ply]\n"
-                     "                     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R]\n");
+                     "                     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R]\n"
+                     "                     [--config config/myslam.lua]\n"
+                     "\n"
+                     "--config 指定的文件作为默认值基线，命令行参数优先；未指定时尝试读取\n"
+                     "当前目录的 config/myslam.lua（不存在则全部用内置默认值）。\n");
     }
 
     bool parseDouble(const char *value, double &out)
@@ -72,10 +78,43 @@ namespace
 
 int main(int argc, char **argv)
 {
-    // 默认写入当前目录的日志文件（与 example 1 一致）；设置 MYSLAM_CONSOLE_LOG=1
-    // 时改用 mylog 默认的 stdout 输出，便于调试崩溃路径（文件输出带缓冲，异常
-    // 终止可能丢失尾部日志）。MYSLAM_LOG_LEVEL 可覆盖日志级别。
-    if (std::getenv("MYSLAM_CONSOLE_LOG") == nullptr)
+    // 配置文件先行解析：--config 显式指定，否则尝试读当前目录的 config/myslam.lua。
+    // 必须在 main 开头扫描一遍，因为配置是 CLI 参数的基线默认值。
+    std::filesystem::path configPath = "config/myslam.lua";
+    bool explicitConfig = false;
+    for (int i = 1; i + 1 < argc; ++i)
+    {
+        if (std::string(argv[i]) == "--config")
+        {
+            configPath = argv[i + 1];
+            explicitConfig = true;
+        }
+    }
+
+    // MYSLAM_CONSOLE_LOG=1 时保留 mylog 默认的 stdout 输出，便于调试崩溃路径
+    // （文件输出带缓冲，异常终止可能丢失尾部日志）；此时也不让配置文件的
+    // logger 节改写输出后端。
+    const bool consoleLog = std::getenv("MYSLAM_CONSOLE_LOG") != nullptr;
+
+    myslam::config::ProjectConfig project;
+    myslam::config::LoadReport loadReport;
+    if (std::filesystem::is_regular_file(configPath))
+    {
+        loadReport = myslam::config::load(configPath, project, /*applyLogging=*/!consoleLog);
+        if (explicitConfig && !loadReport.project)
+        {
+            std::fprintf(stderr, "[error] 配置文件 %s 校验失败，未修改任何运行参数\n", configPath.string().c_str());
+            return 2;
+        }
+    }
+    else if (explicitConfig)
+    {
+        std::fprintf(stderr, "[error] 配置文件不存在: %s\n", configPath.string().c_str());
+        return 2;
+    }
+
+    // 未从配置得到日志后端时回退到代码默认（当前工作目录的单文件输出）
+    if (!loadReport.logging && !consoleLog)
     {
         myslam::LogConfig logConfig;
         if (const char *level = std::getenv("MYSLAM_LOG_LEVEL"))
@@ -92,8 +131,9 @@ int main(int argc, char **argv)
     std::string imuPath;
     std::string stampPath;
     std::string outputPath;
-    myslam::dataset::MeiIntrinsics intrinsics;
-    myslam::dataset::DatasetRunConfig runConfig;
+    // 配置作为基线，下面的命令行分支逐项覆盖
+    myslam::dataset::MeiIntrinsics intrinsics = project.intrinsics;
+    myslam::dataset::DatasetRunConfig runConfig = project.replay;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -124,6 +164,10 @@ int main(int argc, char **argv)
         if (arg == "--data")
         {
             dataDir = value;
+        }
+        else if (arg == "--config")
+        {
+            // 已在 main 开头加载，这里仅消费掉取值避免被当作未知参数
         }
         else if (arg == "--imu")
         {

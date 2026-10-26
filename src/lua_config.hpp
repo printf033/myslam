@@ -27,6 +27,7 @@
  * @endcode
  */
 
+#include "dataset/types.hpp"
 #include "vio/system.hpp"
 #include "vio/types.hpp"
 #include <cmath>
@@ -60,8 +61,10 @@ namespace myslam::config
      */
     struct ProjectConfig
     {
-        vio::VioConfig vio{};       ///< 视觉惯性参数
-        vio::SystemConfig system{}; ///< 运行时序与验收门限
+        vio::VioConfig vio{};                ///< 视觉惯性参数
+        vio::SystemConfig system{};          ///< 运行时序与验收门限
+        dataset::MeiIntrinsics intrinsics{}; ///< 数据集相机内参（MEI 模型）
+        dataset::DatasetRunConfig replay{};  ///< 数据集回放与可视化配置
     };
 
     /**
@@ -188,6 +191,70 @@ namespace myslam::config
         }
 
         /**
+         * @brief 读取浮点字段但不允许自动纠正：越界即判定配置非法
+         *
+         * 用于“钳位会洗白用户错误”的字段：例如焦距写 0 若被钳到 1.0，
+         * 表面合法但物理上荒谬，几何链路会在运行期才崩。
+         *
+         * @param L Lua 状态机
+         * @param idx 配置节表在栈上的索引
+         * @param section 节名（用于诊断）
+         * @param key 字段名
+         * @param lo 允许下界（含）
+         * @param hi 允许上界（含）
+         * @param field 待写入字段
+         * @return true 字段缺失（保留原值）或取值合法
+         * @return false 字段存在但越界
+         */
+        inline bool loadDoubleStrict(lua_State *L, int idx, std::string_view section, const char *key, double lo,
+                                     double hi, double &field)
+        {
+            double value = field;
+            if (!readFiniteDouble(L, idx, section, key, value))
+            {
+                return true;
+            }
+            if (value < lo || value > hi)
+            {
+                reportError("{}.{} = {} 超出合法区间 [{}, {}]（该字段不允许自动纠正）", section, key, value, lo, hi);
+                return false;
+            }
+            field = value;
+            return true;
+        }
+
+        /**
+         * @brief 读取整数型字段但不允许自动纠正：越界即判定配置非法
+         *
+         * @param L Lua 状态机
+         * @param idx 配置节表在栈上的索引
+         * @param section 节名（用于诊断）
+         * @param key 字段名
+         * @param lo 允许下界（含）
+         * @param hi 允许上界（含）
+         * @param field 待写入字段
+         * @return true 字段缺失（保留原值）或取值合法
+         * @return false 字段存在但越界
+         */
+        inline bool loadIntegerStrict(lua_State *L, int idx, std::string_view section, const char *key, long long lo,
+                                      long long hi, int &field)
+        {
+            double value = 0.0;
+            if (!readFiniteDouble(L, idx, section, key, value))
+            {
+                return true;
+            }
+            const long long raw = static_cast<long long>(value);
+            if (raw < lo || raw > hi)
+            {
+                reportError("{}.{} = {} 超出合法区间 [{}, {}]（该字段不允许自动纠正）", section, key, raw, lo, hi);
+                return false;
+            }
+            field = static_cast<int>(raw);
+            return true;
+        }
+
+        /**
          * @brief 读取布尔字段
          *
          * @param L Lua 状态机
@@ -206,6 +273,34 @@ namespace myslam::config
             else if (!lua_isnil(L, -1))
             {
                 reportError("{}.{} 应为布尔值，实际为 {}，已忽略", section, key, typeName(L));
+            }
+            lua_pop(L, 1);
+        }
+
+        /**
+         * @brief 读取字符串字段；空串视为“未设置”
+         *
+         * 路径类字段以空串表示“不输出”，因此允许写 @c "" 清空默认值。
+         *
+         * @param L Lua 状态机
+         * @param idx 配置节表在栈上的索引
+         * @param section 节名（用于诊断）
+         * @param key 字段名
+         * @param field 待写入路径；字段缺失或类型错误时保持原值
+         */
+        inline void loadPath(lua_State *L, int idx, std::string_view section, const char *key,
+                             std::filesystem::path &field)
+        {
+            lua_getfield(L, idx, key);
+            if (lua_type(L, -1) == LUA_TSTRING)
+            {
+                size_t length = 0;
+                const char *text = lua_tolstring(L, -1, &length);
+                field = std::filesystem::path(std::string(text, length));
+            }
+            else if (!lua_isnil(L, -1))
+            {
+                reportError("{}.{} 应为字符串路径，实际为 {}，已忽略", section, key, typeName(L));
             }
             lua_pop(L, 1);
         }
@@ -560,14 +655,158 @@ namespace myslam::config
             return true;
         }
 
+        /**
+         * @brief 解析 Lua 的 @c dataset.intrinsics 节（MEI 相机内参）
+         *
+         * @param L Lua 状态机
+         * @param idx 父表（dataset）在栈上的索引
+         * @param cfg 待填充内参
+         * @return true 解析成功（含钳位告警）
+         */
+        inline bool loadIntrinsicsSection(lua_State *L, int idx, dataset::MeiIntrinsics &cfg)
+        {
+            constexpr std::string_view kSection = "dataset.intrinsics";
+            lua_getfield(L, idx, "intrinsics");
+            if (!lua_istable(L, -1))
+            {
+                if (!lua_isnil(L, -1))
+                {
+                    reportError("dataset.intrinsics 应为 table，实际为 {}，已忽略", typeName(L));
+                    lua_pop(L, 1);
+                    return false;
+                }
+                lua_pop(L, 1);
+                return true;
+            }
+
+            const int tableIdx = lua_gettop(L);
+            checkUnknownKeys(
+                L, tableIdx, kSection,
+                {"fx", "fy", "cx", "cy", "xi", "k1", "k2", "p1", "p2", "pinholeScale", "imageWidth", "imageHeight"});
+
+            loadDouble(L, tableIdx, kSection, "cx", -1e6, 1e6, cfg.cx);
+            loadDouble(L, tableIdx, kSection, "cy", -1e6, 1e6, cfg.cy);
+            loadDouble(L, tableIdx, kSection, "xi", -10.0, 10.0, cfg.xi);
+            loadDouble(L, tableIdx, kSection, "k1", -10.0, 10.0, cfg.k1);
+            loadDouble(L, tableIdx, kSection, "k2", -10.0, 10.0, cfg.k2);
+            loadDouble(L, tableIdx, kSection, "p1", -10.0, 10.0, cfg.p1);
+            loadDouble(L, tableIdx, kSection, "p2", -10.0, 10.0, cfg.p2);
+            // 焦距、缩放与图像尺寸是几何链路的硬前提：越界时报错而非钳位，
+            // 否则 fx=0 被钳到 1.0 会“表面合法、运行期崩”。
+            bool valid = true;
+            valid = loadDoubleStrict(L, tableIdx, kSection, "fx", 1.0, 1e6, cfg.fx) && valid;
+            valid = loadDoubleStrict(L, tableIdx, kSection, "fy", 1.0, 1e6, cfg.fy) && valid;
+            valid = loadDoubleStrict(L, tableIdx, kSection, "pinholeScale", 1e-3, 10.0, cfg.pinholeScale) && valid;
+            valid = loadIntegerStrict(L, tableIdx, kSection, "imageWidth", 1, 100'000, cfg.imageWidth) && valid;
+            valid = loadIntegerStrict(L, tableIdx, kSection, "imageHeight", 1, 100'000, cfg.imageHeight) && valid;
+
+            lua_pop(L, 1);
+            return valid && cfg.isValid();
+        }
+
+        /**
+         * @brief 解析 Lua 的 @c dataset.replay 与 @c dataset.viz 两节
+         *
+         * 路径字段允许写空串表示“不输出”，因此用 @c "" 可以清掉代码默认值。
+         *
+         * @param L Lua 状态机
+         * @param idx 父表（dataset）在栈上的索引
+         * @param cfg 待填充回放配置（含嵌套的可视化配置）
+         * @return true 解析成功
+         * @return false 存在自相矛盾或类型错误的配置
+         */
+        inline bool loadReplaySection(lua_State *L, int idx, dataset::DatasetRunConfig &cfg)
+        {
+            bool valid = true;
+
+            lua_getfield(L, idx, "replay");
+            if (lua_istable(L, -1))
+            {
+                const int tableIdx = lua_gettop(L);
+                constexpr std::string_view kSection = "dataset.replay";
+                checkUnknownKeys(
+                    L, tableIdx, kSection,
+                    {"outputTum", "startFrame", "maxFrames", "stride", "maxFeatures", "maxDuration", "plyPath"});
+
+                loadPath(L, tableIdx, kSection, "outputTum", cfg.outputTum);
+                loadPath(L, tableIdx, kSection, "plyPath", cfg.plyPath);
+                loadInteger(L, tableIdx, kSection, "startFrame", 0, 10'000'000, cfg.startFrame);
+                loadInteger(L, tableIdx, kSection, "maxFrames", 0, 10'000'000, cfg.maxFrames);
+                loadInteger(L, tableIdx, kSection, "stride", 1, 10'000, cfg.stride);
+                loadInteger(L, tableIdx, kSection, "maxFeatures", 1, 1'000'000, cfg.maxFeatures);
+                loadDouble(L, tableIdx, kSection, "maxDuration", 0.0, 86'400.0, cfg.maxDuration);
+            }
+            else if (!lua_isnil(L, -1))
+            {
+                reportError("dataset.replay 应为 table，实际为 {}，已忽略", typeName(L));
+                valid = false;
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, idx, "viz");
+            if (lua_istable(L, -1))
+            {
+                const int tableIdx = lua_gettop(L);
+                constexpr std::string_view kSection = "dataset.viz";
+                checkUnknownKeys(L, tableIdx, kSection,
+                                 {"showWindow", "videoPath", "displayStride", "panelHeight", "trailMaxPoints",
+                                  "videoFps", "playbackRate"});
+
+                loadBool(L, tableIdx, kSection, "showWindow", cfg.viz.showWindow);
+                loadPath(L, tableIdx, kSection, "videoPath", cfg.viz.videoPath);
+                loadInteger(L, tableIdx, kSection, "displayStride", 1, 10'000, cfg.viz.displayStride);
+                loadInteger(L, tableIdx, kSection, "panelHeight", 0, 4'000, cfg.viz.panelHeight);
+                loadInteger(L, tableIdx, kSection, "trailMaxPoints", 1, 10'000'000, cfg.viz.trailMaxPoints);
+                loadInteger(L, tableIdx, kSection, "videoFps", 1, 1'000, cfg.viz.videoFps);
+                loadDouble(L, tableIdx, kSection, "playbackRate", 0.0, 100.0, cfg.viz.playbackRate);
+            }
+            else if (!lua_isnil(L, -1))
+            {
+                reportError("dataset.viz 应为 table，实际为 {}，已忽略", typeName(L));
+                valid = false;
+            }
+            lua_pop(L, 1);
+
+            // 窗口与视频都没有启用时，渲染参数无意义但不致命
+            return valid;
+        }
+
+        /**
+         * @brief 解析 Lua 的 @c dataset 节
+         *
+         * @param L Lua 状态机
+         * @param idx dataset 表在栈上的索引
+         * @param intrinsics 待填充相机内参
+         * @param replay 待填充回放配置
+         * @return true 解析成功
+         * @return false 存在无法自动纠正的配置错误
+         */
+        inline bool loadDatasetSection(lua_State *L, int idx, dataset::MeiIntrinsics &intrinsics,
+                                       dataset::DatasetRunConfig &replay)
+        {
+            checkUnknownKeys(L, idx, "dataset", {"intrinsics", "replay", "viz"});
+
+            bool valid = true;
+            if (!loadIntrinsicsSection(L, idx, intrinsics))
+            {
+                reportError("dataset.intrinsics 校验失败：内参或图像尺寸非法");
+                valid = false;
+            }
+            if (!loadReplaySection(L, idx, replay))
+            {
+                valid = false;
+            }
+            return valid;
+        }
+
     } // namespace detail
 
     /**
      * @brief 从 Lua 脚本加载项目配置与日志配置
      *
      * 执行顺序：
-     * 1. 以调用方传入的 @p out 为基线解析 @c vio / @c system 两节到临时副本，
-     *    校验全部通过后一次性写回；失败则 @p out 保持不变；
+     * 1. 以调用方传入的 @p out 为基线解析 @c vio / @c system / @c dataset 三节到
+     *    临时副本，校验全部通过后一次性写回；失败则 @p out 保持不变；
      * 2. 若 @p applyLogging 为真，把同一份脚本交给 @c mylog::reloadConfig 应用
      *    @c logger / @c fileManager 两节，成功后安装 FileManager 共享单文件输出。
      *    （@c reloadConfig 只改写配置对象，输出后端仍需调用方显式安装，
@@ -575,6 +814,9 @@ namespace myslam::config
      *    两部分各自原子，互不回滚。
      *
      * 未识别的配置节会被忽略，便于在同一个文件里放其它工具的配置。
+     *
+     * @c dataset 节只包含纯数据（内参、回放与可视化开关），不依赖 OpenCV；
+     * 即使本次构建关闭了 @c MYSLAM_BUILD_DATASET_TOOLS 也可以解析。
      *
      * @param config Lua 配置文件路径
      * @param out 待覆盖的项目配置；字段缺失时保留其当前值
@@ -637,6 +879,19 @@ namespace myslam::config
         else if (!lua_isnil(L, -1))
         {
             detail::reportError("配置节 system 应为 table，实际为 {}", detail::typeName(L));
+            projectValid = false;
+        }
+        lua_pop(L, 1);
+
+        lua_getglobal(L, "dataset");
+        if (lua_istable(L, -1))
+        {
+            const bool datasetValid = detail::loadDatasetSection(L, lua_gettop(L), parsed.intrinsics, parsed.replay);
+            projectValid = projectValid && datasetValid;
+        }
+        else if (!lua_isnil(L, -1))
+        {
+            detail::reportError("配置节 dataset 应为 table，实际为 {}", detail::typeName(L));
             projectValid = false;
         }
         lua_pop(L, 1);

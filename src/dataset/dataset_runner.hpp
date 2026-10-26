@@ -17,6 +17,7 @@
 #include "dataset/mei_tracker.hpp"
 #include "dataset/ply_export.hpp"
 #include "dataset/subt_dataset.hpp"
+#include "dataset/types.hpp"
 #include "dataset/visualizer.hpp"
 #include "logger.hpp"
 #include "vio/backend.hpp"
@@ -37,35 +38,6 @@
 
 namespace myslam::dataset
 {
-
-    /**
-     * @brief 数据集回放配置
-     */
-    struct DatasetRunConfig
-    {
-        std::filesystem::path outputTum; ///< 关键帧轨迹输出（TUM 格式），空则不写
-        int startFrame{0};               ///< 从第几帧开始回放
-        int maxFrames{0};                ///< 最多处理的图像帧数，0 表示全部
-        int stride{1};                   ///< 每隔多少帧取一帧
-        int maxFeatures{200};            ///< 每帧特征数上限
-        double maxDuration{0.0};         ///< 最长回放时长 (s)，0 表示不限
-        std::filesystem::path plyPath;   ///< 路标/轨迹点云导出路径，空则不写
-        VisualizationConfig viz;         ///< 实时可视化配置（窗口与视频）
-    };
-
-    /**
-     * @brief 回放结果统计
-     */
-    struct DatasetRunReport
-    {
-        std::size_t framesProcessed{0};
-        std::size_t keyframes{0};
-        std::size_t imuSamples{0};
-        std::size_t resets{0};
-        bool initialized{false};
-        double elapsedSeconds{0.0};
-        double durationSeconds{0.0};
-    };
 
     /**
      * @brief 数据集回放器
