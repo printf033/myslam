@@ -1,0 +1,26 @@
+#pragma once
+
+/**
+ * @file myslam.hpp
+ * @brief 项目名称与版本号（由 CMake 从 myslam.hpp.in 生成，请勿直接编辑构建产物）
+ *
+ * 版本号的唯一来源是顶层 CMakeLists.txt 中的 project(VERSION)；
+ * 需要修改版本时只改那一处，构建时自动注入到本文件。
+ */
+
+#include <string_view>
+
+namespace myslam
+{
+
+    /**
+     * @brief 项目名称
+     */
+    inline constexpr std::string_view kProjectName = "@MYSLAM_PROJECT_NAME@";
+
+    /**
+     * @brief 项目版本号（语义化版本：主.次.补丁）
+     */
+    inline constexpr std::string_view kVersion = "@MYSLAM_VERSION@";
+
+} // namespace myslam

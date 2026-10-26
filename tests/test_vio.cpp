@@ -48,7 +48,9 @@ int main()
     myslam::vio::SystemConfig systemConfig;
 
     expectTrue(config.fx > 0.0 && config.fy > 0.0, "camera intrinsics are positive");
-    expectTrue(systemConfig.imuDt > 0.0 && systemConfig.cameraDt > 0.0, "sample steps are positive");
+    expectTrue(myslam::vio::SystemConfig::imuDtFrom(config.imuRateHz) > 0.0 && systemConfig.cameraDt > 0.0,
+               "sample steps are positive");
+    expectTrue(myslam::vio::SystemConfig::imuDtFrom(0.0) == 0.0, "non-positive imu rate yields zero step");
     expectTrue(systemConfig.rmseThreshold > 0.0, "rmse threshold is positive");
 
     myslam::vio::VioSystem system(config, systemConfig);

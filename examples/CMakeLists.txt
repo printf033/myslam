@@ -1,6 +1,10 @@
 function(gen_bin name)
     add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE myslam::myslam myslam::myslam_sanitized)
+    # Lua 配置支持可选：关闭 MYSLAM_ENABLE_LUA 时 myslam_lua 目标不存在
+    if(TARGET myslam::myslam_lua)
+        target_link_libraries(${name} PRIVATE myslam::myslam_lua)
+    endif()
 endfunction()
 
 gen_bin(1_visual_inertial_odometry)

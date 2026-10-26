@@ -1,10 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(myslam
-    VERSION 0.1.0
+    VERSION 0.1.1
     DESCRIPTION "A C++26 SLAM project built on gtsam, following mylog engineering conventions"
     LANGUAGES CXX
 )
+
+# -----------------------------------------------------------------------------
+# Version / project name single source of truth
+#
+# 上面的 project() 是唯一来源；src/CMakeLists.txt 通过 configure_file 把它注入
+# 到构建期头文件 myslam.hpp 中，C++ 侧不再重复写死版本号。
+# -----------------------------------------------------------------------------
+set(MYSLAM_PROJECT_NAME "${PROJECT_NAME}")
+set(MYSLAM_VERSION "${PROJECT_VERSION}")
 
 # -----------------------------------------------------------------------------
 # Detect if myslam is built as a top-level project or included as a subproject
@@ -51,6 +60,19 @@ if(MYSLAM_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# -----------------------------------------------------------------------------
+# Runtime configuration assets
+#
+# config/ 下的 Lua 配置文件随构建树同步一份，示例程序从构建目录运行时可直接
+# 用相对路径 config/myslam.lua 找到。COPYONLY 仍会跟踪源文件变化：改完 lua
+# 后构建会自动重新配置并刷新副本。
+# -----------------------------------------------------------------------------
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/config/myslam.lua"
+    "${CMAKE_CURRENT_BINARY_DIR}/config/myslam.lua"
+    COPYONLY
+)
 
 # -----------------------------------------------------------------------------
 # Developer Tooling (only active when building as top-level project)

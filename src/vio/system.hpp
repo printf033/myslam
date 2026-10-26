@@ -33,13 +33,27 @@ namespace myslam::vio
 
     /**
      * @brief 系统运行配置：仿真时序与验收门限
+     *
+     * 不保存 IMU 采样步长：步长与 IMU 采样率是同一物理量的两种表述，
+     * 采样率的唯一来源是 @c VioConfig::imuRateHz（噪声模型离散化同样依赖它）。
+     * 因此这里只提供派生规则，保证两者永不脱节。
      */
     struct SystemConfig
     {
-        double imuDt{0.005};        ///< IMU 采样步长 (s)，对应 200 Hz
         double cameraDt{0.050};     ///< 相机采样步长 (s)，对应 20 Hz
         double totalDuration{5.0};  ///< 仿真/运行时长 (s)
         double rmseThreshold{0.20}; ///< 平移 RMSE 验收门限 (m)
+
+        /**
+         * @brief 由 IMU 采样率派生采样步长
+         *
+         * @param imuRateHz IMU 采样率 (Hz)，取自 @c VioConfig::imuRateHz
+         * @return double 采样步长 (s)；采样率非正时返回 0，由调用方判定非法
+         */
+        [[nodiscard]] static constexpr double imuDtFrom(double imuRateHz) noexcept
+        {
+            return imuRateHz > 0.0 ? 1.0 / imuRateHz : 0.0;
+        }
     };
 
     /**
@@ -86,7 +100,7 @@ namespace myslam::vio
             mylog::info("[配置参数] IMU 特性: 加速度白噪声={:.4f}, 陀螺白噪声={:.5f}, 滑动窗口规模={}",
                         config_.accelNoiseSigma, config_.gyroNoiseSigma, config_.maxSlidingWindowSize);
 
-            const double imuDt = systemConfig_.imuDt;
+            const double imuDt = SystemConfig::imuDtFrom(config_.imuRateHz);
             const double camDt = systemConfig_.cameraDt;
 
             double currentTime = 0.0;
