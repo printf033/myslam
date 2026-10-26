@@ -42,8 +42,9 @@ int main(int argc, char **argv)
 
     myslam::config::ProjectConfig project;
     myslam::config::LoadReport loadReport;
+    const bool configFileExists = std::filesystem::is_regular_file(configPath);
 
-    if (std::filesystem::is_regular_file(configPath))
+    if (configFileExists)
     {
         loadReport = myslam::config::load(configPath, project);
     }
@@ -72,6 +73,11 @@ int main(int argc, char **argv)
     if (loadReport.project)
     {
         std::fprintf(stderr, "[info] 已加载配置: %s\n", configPath.string().c_str());
+    }
+    else if (configFileExists)
+    {
+        // 文件存在但解析失败：原因已由 config 层输出，这里不重复猜测
+        std::fprintf(stderr, "[info] 配置文件 %s 未能加载，使用内置默认配置\n", configPath.string().c_str());
     }
     else
     {

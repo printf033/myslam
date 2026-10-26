@@ -32,6 +32,7 @@ jobs:
             libtbb-dev \
             libboost-all-dev \
             libeigen3-dev \
+            libluajit-5.1-dev \
             git \
             pipx
 
@@ -68,6 +69,19 @@ jobs:
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DMYSLAM_BUILD_TESTS=ON \
             -DMYSLAM_BUILD_EXAMPLES=ON
+
+      # myslam 的 Lua 支持在找不到 LuaJIT 时会自动降级为 OFF，而配置测试随之
+      # 不被注册；那样 CI 会静默地少测一整块代码。这里把降级当成失败。
+      - name: Verify Lua support was enabled
+        run: |
+          grep -q '^MYSLAM_ENABLE_LUA:BOOL=ON' build/CMakeCache.txt || {
+            echo "::error::MYSLAM_ENABLE_LUA is OFF; LuaJIT was not found during configure"
+            exit 1
+          }
+          ctest --test-dir build -N | grep -q 'myslam_config_test' || {
+            echo "::error::myslam_config_test was not registered"
+            exit 1
+          }
 
       - name: Build All Targets
         run: cmake --build build -j$(nproc)

@@ -57,15 +57,36 @@ endif()
 # 与子库 mylog 的 MYLOG_ENABLE_LUA 同一策略：默认开启，未链接
 # myslam::myslam_lua 时 src/lua_config.hpp 退化为桩实现（load() 恒返回失败），
 # 项目仍可正常构建与运行。
+#
+# LuaJIT 是可选依赖，因此这里不用 REQUIRED：缺失时只告警并将
+# MYSLAM_ENABLE_LUA 降为 OFF，避免未装 LuaJIT 的环境连 configure 都无法完成。
 # -----------------------------------------------------------------------------
 option(MYSLAM_ENABLE_LUA "Enable Lua (LuaJIT) configuration support" ON)
 
 if(MYSLAM_ENABLE_LUA)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(LUAJIT REQUIRED IMPORTED_TARGET luajit)
+    find_package(PkgConfig QUIET)
 
-    add_library(myslam_lua INTERFACE)
-    add_library(myslam::myslam_lua ALIAS myslam_lua)
-    target_link_libraries(myslam_lua INTERFACE myslam::myslam PkgConfig::LUAJIT)
-    target_compile_definitions(myslam_lua INTERFACE MYSLAM_HAS_LUA=1)
+    set(MYSLAM_LUAJIT_FOUND OFF)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LUAJIT IMPORTED_TARGET luajit)
+        if(TARGET PkgConfig::LUAJIT)
+            set(MYSLAM_LUAJIT_FOUND ON)
+        endif()
+    endif()
+
+    if(MYSLAM_LUAJIT_FOUND)
+        add_library(myslam_lua INTERFACE)
+        add_library(myslam::myslam_lua ALIAS myslam_lua)
+        target_link_libraries(myslam_lua INTERFACE myslam::myslam PkgConfig::LUAJIT)
+        target_compile_definitions(myslam_lua INTERFACE MYSLAM_HAS_LUA=1)
+        message(STATUS "myslam: Lua configuration enabled (LuaJIT ${LUAJIT_VERSION})")
+    else()
+        set(MYSLAM_ENABLE_LUA OFF CACHE BOOL
+            "Enable Lua (LuaJIT) configuration support" FORCE)
+        message(WARNING
+            "myslam: LuaJIT not found (pkg-config module 'luajit'), "
+            "so MYSLAM_ENABLE_LUA has been turned OFF. "
+            "Install it to enable Lua configuration: "
+            "Debian/Ubuntu 'libluajit-5.1-dev', Arch 'luajit', macOS 'luajit'.")
+    endif()
 endif()

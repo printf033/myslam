@@ -1,0 +1,444 @@
+# myslam
+
+[English](README.md) | 简体中文
+
+C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `IncrementalFixedLagSmoother`，
+将 IMU 预积分因子与视觉重投影因子放进同一个因子图，按时间窗口边缘化。
+
+- **语言标准**：C++26（由 CMake 强制）
+- **依赖**：[GTSAM](https://github.com/borglab/gtsam) 4.3、[mylog](https://github.com/printf033/mylog)（均为 submodule）
+- **可选依赖**：LuaJIT 2.1（配置加载）、OpenCV 4（数据集回放工具）
+- **版本号**：唯一来源为 `CMakeLists.txt` 的 `project(VERSION)`，运行时经 `myslam::kVersion` 读取
+
+---
+
+## 目录
+
+- [系统架构](#系统架构)
+- [数据流](#数据流)
+- [模块职责](#模块职责)
+- [运行流程](#运行流程)
+- [目录结构](#目录结构)
+- [环境要求](#环境要求)
+- [构建](#构建)
+- [运行](#运行)
+- [配置系统](#配置系统)
+- [数据集回放](#数据集回放)
+- [脚本](#脚本)
+- [测试](#测试)
+- [工程规范](#工程规范)
+- [当前限制](#当前限制)
+
+---
+
+## 系统架构
+
+系统由五部分组成，按调用顺序排列：
+
+1. **初始化器** `VioInitializer` — 状态机 `UNINITIALIZED → STATIONARY_COLLECTING →
+   GRAVITY_ALIGNED → TRACKING_OK`，异常时进入 `LOST_DEGRADED`。静止判定同时使用加速度与
+   陀螺标准差；重力对齐后执行陀螺零偏标定，输出初始位姿、速度与零偏。
+2. **关键帧决策** `KeyframeSelector` — 按平均视差、特征留存率、时间保底三项判据决定当前
+   相机帧是否作为关键帧进入后端。时间保底判据附加最小三角化视差条件。
+3. **后端** `VioBackend` — 组合 `CombinedImuFactor`（IMU 预积分）与 `ProjectionFactor`
+   （视觉重投影），由 `IncrementalFixedLagSmoother` 在 `slidingWindowLag` 时间窗口内求解并
+   边缘化窗口外状态。视觉残差使用 Huber 核。
+4. **外推器** `HighRatePropagator` — 在两次优化之间按 IMU 采样递推状态，并在每次优化后以
+   优化结果重置递推基线。
+5. **健康监测** `HealthMonitor` — 检查零偏模长、速度模长与活跃观测数，超阈值时返回告警文本。
+
+仿真与真实数据集两条输入路径复用上述全部组件，仅替换传感器来源。
+
+## 数据流
+
+![系统架构](docs/architecture_zh.svg)
+
+图中两列对应两个采样速率。每列分为初始化与追踪两个阶段：同一列内两个阶段由当前
+`SystemState` 决定，互斥执行。蓝色框为同一个 `VioBackend` 实例在两个速率路径上的调用。
+
+主循环由 `VioSystem::run()` 驱动：以 IMU 采样步长推进时间，每次 IMU 到达时更新预积分或外推；
+相机帧到达时执行初始化或关键帧决策，关键帧触发后端优化并重置外推基线。
+
+## 模块职责
+
+| 模块 | 职责 |
+| :--- | :--- |
+| `vio/types.hpp` | 传感器数据结构（`ImuMeasurement` / `CameraFrame` / `FeatureObservation`）与配置结构 `VioConfig` |
+| `vio/initializer.hpp` | 初始化状态机 `SystemState` 与静止检测、重力对齐、零偏标定 |
+| `vio/keyframe_selector.hpp` | 关键帧决策，返回 `DecisionResult`（是否关键帧、原因、视差、留存率） |
+| `vio/backend.hpp` | 因子图构建、三角化、分层外点门控、边缘化、`latestNavState()` |
+| `vio/propagator.hpp` | IMU 频率状态递推与基线重置 |
+| `vio/health_monitor.hpp` | 零偏、速度、观测数检查，返回 `HealthReport` |
+| `vio/simulator.hpp` | 3D 轨迹与 IMU / 相机观测生成，附解析真值 |
+| `vio/system.hpp` | 双速率主循环编排、`SystemConfig`、精度评估 |
+| `vio/vio.hpp` | 聚合头，包含上述全部组件 |
+| `lua_config.hpp` | Lua 配置加载，产出 `ProjectConfig` |
+| `log_config.hpp` | mylog C++ API 封装（级别 + 文件输出） |
+| `dataset/types.hpp` | 回放配置与统计结构；只含标准库，不含 OpenCV |
+| `dataset/subt_dataset.hpp` | SubT 序列读取：IMU CSV、相机时间戳、图像索引 |
+| `dataset/mei_tracker.hpp` | MEI 模型畸变校正与 GFTT + LK 光流跟踪 |
+| `dataset/dataset_runner.hpp` | 真实序列回放编排，复用 VIO 组件 |
+| `dataset/visualizer.hpp` | OpenCV 窗口与视频输出 |
+| `dataset/ply_export.hpp` | 路标与轨迹导出为 PLY |
+
+`vio/*` 与 `dataset/types.hpp` 不包含 OpenCV 头文件，因此关闭数据集工具时仍可构建并解析配置。
+
+## 运行流程
+
+### 初始化
+
+`VioInitializer::feedImu()` 累积静止样本，同时统计加速度与陀螺标准差。`tryGravityAlignment()`
+在样本满足条件后执行：由平均比力方向求 roll/pitch，由陀螺均值估计零偏，输出 `Rot3` 与
+`ConstantBias`。`VioSystem` 收到成功后调用 `VioBackend::initializeSystem()` 写入首帧先验，
+并将状态置为 `TRACKING_OK`。
+
+### 关键帧与后端
+
+关键帧判定通过后，`VioBackend::processKeyframe()` 依次执行：
+
+1. 用上一关键帧与本关键帧的特征对应关系三角化新路标，视差低于
+   `minTriangulationParallaxPx` 的点跳过；
+2. 以预积分预测位姿计算重投影残差，超过 `maxReprojectionErrorPreopt` 的观测临时拒绝；
+3. 插入 `ProjectionFactor` 并调用 smoother 更新，按 `extraSmootherIterations` 追加迭代；
+4. 以优化后位姿重算残差，超过 `maxReprojectionError` 且连续多帧超限者永久标记外点，
+   单帧超过 `maxReprojectionErrorHard` 者直接剔除；
+5. 检查 `HealthMonitor`，记录告警。
+
+关键帧数据同时维护滑动窗口规模统计与固定滞后窗口时长 `slidingWindowLag`。
+
+### 精度评估
+
+`VioSystem::evaluate()` 对关键帧位姿与仿真真值逐帧求平移误差，输出 RMSE 与最大偏差；
+RMSE 低于 `rmseThreshold` 时判定通过。
+
+---
+
+## 目录结构
+
+```
+myslam/
+├── CMakeLists.txt            # 顶层构建、版本号唯一来源、format 目标
+├── config/myslam.lua         # 默认运行配置（构建时复制到 build/config/）
+├── src/
+│   ├── CMakeLists.txt        # INTERFACE 目标 myslam / myslam_lua / myslam_sanitized
+│   ├── myslam.hpp.in         # 版本号模板，configure_file 生成
+│   ├── lua_config.hpp        # Lua 配置加载
+│   ├── log_config.hpp        # 日志配置
+│   ├── vio/                  # VIO 核心，无 OpenCV 依赖
+│   └── dataset/              # 数据集回放，OpenCV 仅存在于本层
+├── examples/
+│   ├── 1_visual_inertial_odometry.cpp   # 仿真运行示例
+│   └── 2_subt_dataset.cpp               # 真实数据集回放
+├── tests/
+│   ├── test_vio.cpp          # VIO 冒烟测试与精度断言
+│   └── test_lua_config.cpp   # 配置解析、钳位、交叉校验、失败路径
+├── docs/
+│   ├── architecture.svg      # 系统架构图（英文）
+│   └── architecture_zh.svg   # 系统架构图（中文）
+├── scripts/
+│   ├── run_subt.sh           # 数据集回放脚本
+│   ├── plot_tum.py           # TUM 轨迹绘图
+│   ├── gen_architecture_svg.py  # 生成 docs/ 下的架构图
+│   └── setup-hooks.sh        # 安装 pre-commit 格式化钩子
+└── third_party/              # gtsam / mylog（git submodule）
+```
+
+---
+
+## 环境要求
+
+| 项目 | 要求 |
+| :--- | :--- |
+| CMake | ≥ 3.20 |
+| 编译器 | 支持 `-std=c++26`（GCC 14+） |
+| 构建工具 | Ninja 或 Make |
+| 系统库 | TBB、Boost、Eigen3、Threads |
+| LuaJIT | 2.1+ 且可被 `pkg-config` 发现；缺失时 Lua 支持自动关闭，其余功能不受影响 |
+| OpenCV | 4.x（仅 `MYSLAM_BUILD_DATASET_TOOLS=ON` 时） |
+| clang-format | 23.1.3（提交钩子与 CI 按此版本校验） |
+
+Ubuntu 安装：
+
+```bash
+sudo apt-get install -y build-essential cmake ninja-build pkgconf \
+    libtbb-dev libboost-all-dev libeigen3-dev libluajit-5.1-dev
+# 仅数据集工具需要
+sudo apt-get install -y libopencv-dev
+# 格式化工具
+pipx install "clang-format==23.1.3"
+```
+
+---
+
+## 构建
+
+```bash
+git clone --recursive <repo-url> myslam
+cd myslam
+
+cmake -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+cmake --build build -j"$(nproc)"
+ctest --test-dir build --output-on-failure
+```
+
+首次构建会编译 GTSAM。
+
+### 构建选项
+
+| 选项 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `MYSLAM_BUILD_EXAMPLES` | 顶层构建时 `ON` | 构建示例程序 |
+| `MYSLAM_BUILD_TESTS` | 顶层构建时 `ON` | 构建测试 |
+| `MYSLAM_BUILD_DATASET_TOOLS` | `OFF` | 构建 OpenCV 数据集回放工具 |
+| `MYSLAM_SANITIZE` | 顶层构建时 `ON` | Debug 下启用 ASan/UBSan |
+| `MYSLAM_ENABLE_LUA` | `ON` | Lua 配置支持；找不到 LuaJIT 时自动降为 `OFF` 并给出告警 |
+
+经 `add_subdirectory` 引入时，上述开关默认改为 `OFF`。
+
+### 数据集工具的独立构建
+
+Debug + ASan 下关键帧优化耗时较长，数据集回放使用单独的 Release 构建：
+
+```bash
+cmake -B build-release -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DMYSLAM_SANITIZE=OFF \
+    -DMYSLAM_BUILD_TESTS=OFF \
+    -DMYSLAM_BUILD_DATASET_TOOLS=ON
+cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
+```
+
+`scripts/run_subt.sh` 默认使用 `build-release`。
+
+### 版本号
+
+版本字符串只在 `project(VERSION ...)` 出现一次，`configure_file` 将其写入
+`<build>/src/generated/myslam.hpp`。修改版本号后重新构建即可。
+
+### 格式化
+
+```bash
+cmake --build build --target format        # 就地格式化
+cmake --build build --target format-check  # 仅检查
+```
+
+`scripts/setup-hooks.sh` 安装 pre-commit 钩子，未格式化代码无法提交。
+
+---
+
+## 运行
+
+### 仿真
+
+```bash
+cd build
+./bin/1_visual_inertial_odometry
+```
+
+按默认配置运行 5 秒仿真（IMU 200 Hz / 相机 20 Hz），输出：
+
+```
+评估关键帧样本数 : 24
+整体平移 RMSE 误差: 0.0365 米
+最大轨迹偏差       : 0.0778 米
+```
+
+退出码 `0` 表示 RMSE 低于 `system.rmseThreshold`（默认 0.20 m）。
+
+日志写入**当前工作目录**的 `.log` 文件（由 mylog 的 `FileManager` 管理），终端只输出
+`[info] 已加载配置: ...`。结果需打开日志文件查看。
+
+### 指定配置文件
+
+```bash
+./bin/1_visual_inertial_odometry                        # 读 config/myslam.lua，缺失则用内置默认值
+./bin/1_visual_inertial_odometry my_config.lua          # 显式指定；加载或校验失败退出码 1
+```
+
+---
+
+## 配置系统
+
+运行期参数由 Lua 脚本提供，默认文件 `config/myslam.lua`，构建时复制到 `build/config/`。
+
+### 配置节
+
+| 节 | 消费方 | 内容 |
+| :--- | :--- | :--- |
+| `vio` | `VioConfig` | 相机内参、外参、IMU 噪声、Huber 核阈值、关键帧策略、滑动窗口 |
+| `system` | `SystemConfig` | 相机步长、运行时长、RMSE 门限 |
+| `dataset` | `MeiIntrinsics` / `DatasetRunConfig` | 数据集内参、回放范围、可视化开关 |
+| `logger` / `fileManager` | mylog | 日志级别、缓冲、滚动与保留策略 |
+
+字段均可省略，省略时保留代码内置默认值。
+
+### 加载机制
+
+- 脚本在未注册标准库的裸 `lua_State` 中执行，`io`/`os`/`package`/`debug` 不可用；
+  另有指令预算（`kInstructionBudget`，5000 万条）。
+- 先解析到临时副本，全部校验通过后写回 `ProjectConfig`；任一步失败则保持调用方原配置。
+- 越界分两类：调参类字段钳位到安全区间并告警；焦距、针孔缩放、图像尺寸等硬前提字段
+  直接判非法，不自动纠正。
+- 配置节中出现未登记键时逐条告警。
+- 交叉约束校验：关键帧间隔上下界、重投影门限的相对关系、相机与 IMU 采样率关系。
+
+### 派生量
+
+IMU 采样步长不是配置项，由 `vio.imuRateHz` 派生：
+
+```cpp
+const double imuDt = vio::SystemConfig::imuDtFrom(config_.imuRateHz);  // 1 / imuRateHz
+```
+
+旧配置中残留的 `system.imuDt` 会输出迁移提示。
+
+### 代码中加载
+
+```cpp
+#include "lua_config.hpp"
+
+myslam::config::ProjectConfig project;
+const auto report = myslam::config::load("config/myslam.lua", project, /*applyLogging=*/true);
+
+if (!report.project) { /* 沿用内置默认值 */ }
+if (!report.logging) { /* 回退到 mylog C++ API */ }
+```
+
+未链接 `myslam::myslam_lua` 时该头文件为桩实现，`load()` 返回失败。
+
+---
+
+## 数据集回放
+
+`2_subt_dataset` 使用与仿真相同的 VIO 组件，仅替换传感器来源。数据布局：
+
+```
+Handheld1_Folder/
+├── cam_0/
+│   ├── 0.png, 1.png, ...
+│   └── timestamps.txt      # 每行一个纳秒时间戳
+└── imu/
+    └── imu_data.csv        # timestamp, q_x, q_y, q_z, q_w,
+                            # ang_vel_{x,y,z}, lin_acc_{x,y,z}
+```
+
+### 针对该数据集的处理
+
+**MEI 相机模型**：后端以 `gtsam::Cal3_S2` 做重投影，而该序列使用 MEI 模型。`MeiFeatureTracker`
+先用 radtan 模型反解畸变，再按 MEI 模型反投影为射线，最后以 `pinholeScale` 缩放的虚拟针孔
+内参投回像素平面。虚拟内参同步写入 `VioConfig`。
+
+**IMU 时间断档**：检测到相邻 IMU 样本间隔超过 `kMaxImuGapSeconds`（0.1 s）时，重建整条
+VIO 流水线并重新初始化。重置次数计入 `DatasetRunReport::resets`。
+
+### 用法
+
+```bash
+build-release/bin/2_subt_dataset \
+    --data  /path/Handheld1_Folder/cam_0 \
+    --imu   /path/Handheld1_Folder/imu/imu_data.csv \
+    --stamps /path/Handheld1_Folder/cam_0/timestamps.txt \
+    [--output traj.tum] [--start-frame N] [--max-frames N] [--stride N] \
+    [--max-features N] [--max-duration S] [--ply cloud.ply] \
+    [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R] \
+    [--config config/myslam.lua]
+```
+
+`--config` 提供基线默认值，命令行参数优先。未指定时读取当前目录的 `config/myslam.lua`，
+不存在则使用内置默认值。
+
+`--fx/--fy/--cx/--cy/--xi/--k1/--k2/--p1/--p2/--width/--height/--pinhole-scale` 可逐项覆盖
+MEI 内参。
+
+### 可视化
+
+- `--viz`：OpenCV 窗口（需要 `DISPLAY`，ESC/q 退出）
+- `--video FILE`：编码为视频（mp4 不可用时回退 `.avi`/MJPG）
+- `--viz-rate R`：`0` 全速、`1` 实时、`2` 两倍速
+
+画面布局：上方为原图与特征点（绿色=跨帧跟踪成功，橙色=本帧新增），下方状态栏左侧为轨迹
+小地图，右侧为运行状态。
+
+### 轨迹查看
+
+```bash
+scripts/plot_tum.py traj.tum --save traj.png          # 3D / XY 俯视 / 位置速度三联图
+scripts/plot_tum.py traj.tum --ply cloud.ply --show
+```
+
+PLY 点云可用 MeshLab / CloudCompare / Open3D 打开。
+
+---
+
+## 脚本
+
+### `scripts/run_subt.sh`
+
+```bash
+scripts/run_subt.sh                          # 默认序列，从第 2300 帧起
+scripts/run_subt.sh --max-frames 0           # 跑完剩余全部帧
+scripts/run_subt.sh --root /path/Handheld2_Folder
+scripts/run_subt.sh --viz                    # 实时窗口
+scripts/run_subt.sh --video out.avi --ply cloud.ply
+scripts/run_subt.sh --plot                   # 回放后绘图
+scripts/run_subt.sh --no-build               # 跳过编译
+```
+
+默认序列路径为 `../MASt3R-Fusion/dataset/Handheld1_Folder`，可用 `--root` 或 `SUBT_ROOT` 覆盖。
+默认从第 2300 帧开始（该序列前段存在曝光跳变与 IMU 断档）。未指定 `--max-frames` 时脚本使用
+`500000`。
+
+### `scripts/plot_tum.py`
+
+需要 `numpy` 与 `matplotlib`。输出 3D 轨迹、XY 俯视、位置与速度随时间变化三张子图。
+
+### `scripts/setup-hooks.sh`
+
+安装 `.githooks/pre-commit`（`git config core.hooksPath .githooks`），以
+`clang-format --dry-run -Werror` 校验暂存文件。
+
+---
+
+## 测试
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+| 测试 | 覆盖内容 |
+| :--- | :--- |
+| `myslam_test` | 公开 API 可用、关键帧非空、RMSE 在门限内、派生步长有效 |
+| `myslam_config_test` | 解析、钳位、交叉校验、未知键、四元数单位化、失败路径、日志节生效、默认配置自洽 |
+
+CI（`.github/workflows/ci.yml`）在 Ubuntu 上使用 `g++-14` 执行格式检查、构建与测试，
+`clang-format` 固定为 23.1.3。
+
+---
+
+## 工程规范
+
+规范来自 mylog 子库，完整说明见项目 `instructions.md`。
+
+- C++26，4 空格缩进，Allman 大括号，120 列
+- 类型 `CamelCase`；函数与局部变量 `camelBack`；成员变量 `_` 后缀
+- 常量 `k` 前缀 + `CamelCase`；枚举与宏 `UPPER_CASE`；命名空间 `lower_case`
+- 构建开关前缀 `MYSLAM_*`；测试目标 `myslam_test`
+- Doxygen 注释；提交前通过 clang-format
+
+---
+
+## 当前限制
+
+- 不含回环检测与全局重定位，误差随时间累积。
+- 不含地图持久化，路标随边缘化窗口回收。
+- 仅支持单目相机 + IMU，无多相机、深度或 GNSS 融合。
+- 无 `install()` 与 `export()` 规则；`myslam` 是 INTERFACE 目标，`INSTALL_INTERFACE` 为预留，
+  生成的头文件未安装。
+- 配置在启动时一次性加载，无运行期热重载。
+- 日志写入当前工作目录，未按项目路径归档。
+- 若环境中存在遮蔽系统 `libfontconfig` 的前缀（如 conda），数据集工具运行时会报
+  `undefined symbol: FcConfigSetDefaultSubstitute`，可用
+  `LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` 覆盖。
