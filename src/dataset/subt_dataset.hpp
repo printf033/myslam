@@ -19,13 +19,18 @@
  */
 
 #include "logger.hpp"
-#include "vio/types.hpp"
+#include "vio/params.hpp"
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace myslam::dataset
@@ -39,6 +44,14 @@ namespace myslam::dataset
         double timestamp{0.0};         // 相对秒
         gtsam::Vector3 gyro{0, 0, 0};  // 角速度 (rad/s)
         gtsam::Vector3 accel{0, 0, 0}; // 比力 (m/s^2)
+    };
+
+    /**
+     * @brief 序列加载失败的具体原因
+     */
+    struct DatasetError
+    {
+        std::string message; ///< 面向使用者的说明
     };
 
     /**
@@ -56,23 +69,30 @@ namespace myslam::dataset
 
         /**
          * @brief 加载全部元数据
-         * @return 目录/文件缺失或格式错误时返回 false
+         * @return 成功时无值；目录/文件缺失或格式错误时返回具体原因
          */
-        bool load()
+        std::expected<void, DatasetError> load()
         {
             if (!std::filesystem::is_directory(cameraDir_))
             {
-                mylog::error("相机图像目录不存在: {}", cameraDir_.string());
-                return false;
+                const std::string message = std::format("相机图像目录不存在: {}", cameraDir_.string());
+                mylog::error("{}", message);
+                return std::unexpected(DatasetError{message});
             }
-            if (!loadStamps() || !loadImu())
+            if (const auto stamps = loadStamps(); !stamps)
             {
-                return false;
+                return std::unexpected(stamps.error());
+            }
+            if (const auto imu = loadImu(); !imu)
+            {
+                return std::unexpected(imu.error());
             }
             if (stampsNs_.empty() || imuNs_.empty())
             {
-                mylog::error("时间戳或 IMU 数据为空: stamps={}, imu={}", stampsNs_.size(), imuNs_.size());
-                return false;
+                const std::string message =
+                    std::format("时间戳或 IMU 数据为空: stamps={}, imu={}", stampsNs_.size(), imuNs_.size());
+                mylog::error("{}", message);
+                return std::unexpected(DatasetError{message});
             }
 
             // 相对化：int64 域先减原点，再换算到秒，避免 1.68e18 ns 的精度损失
@@ -96,7 +116,7 @@ namespace myslam::dataset
                 mylog::warn("[数据加载] 首条 IMU 晚于首帧图像 {:.3f} s，初始化阶段可能缺少惯性数据",
                             imu_[0].timestamp - stamps_.front());
             }
-            return true;
+            return {};
         }
 
         std::size_t size() const { return stamps_.size(); }
@@ -132,13 +152,14 @@ namespace myslam::dataset
         }
 
     private:
-        bool loadStamps()
+        std::expected<void, DatasetError> loadStamps()
         {
             std::ifstream in(stampFile_);
             if (!in)
             {
-                mylog::error("无法打开时间戳文件: {}", stampFile_.string());
-                return false;
+                const std::string message = std::format("无法打开时间戳文件: {}", stampFile_.string());
+                mylog::error("{}", message);
+                return std::unexpected(DatasetError{message});
             }
             std::string line;
             while (std::getline(in, line))
@@ -147,32 +168,41 @@ namespace myslam::dataset
                 {
                     continue;
                 }
-                try
+                // 与 IMU CSV 不同，时间戳是序列的时间基准，坏行不能静默跳过
+                std::int64_t value = 0;
+                const auto [parsed, ec] = std::from_chars(line.data(), line.data() + line.size(), value);
+                if (ec != std::errc{} || parsed != line.data() + line.size())
                 {
-                    stampsNs_.push_back(std::stoll(line));
+                    const std::string message = std::format("时间戳格式错误: '{}'", line);
+                    mylog::error("{}", message);
+                    return std::unexpected(DatasetError{message});
                 }
-                catch (const std::exception &)
-                {
-                    mylog::error("时间戳格式错误: '{}'", line);
-                    return false;
-                }
+                stampsNs_.push_back(value);
             }
-            return !stampsNs_.empty();
+            if (stampsNs_.empty())
+            {
+                const std::string message = std::format("时间戳文件为空: {}", stampFile_.string());
+                mylog::error("{}", message);
+                return std::unexpected(DatasetError{message});
+            }
+            return {};
         }
 
-        bool loadImu()
+        std::expected<void, DatasetError> loadImu()
         {
             std::ifstream in(imuCsv_);
             if (!in)
             {
-                mylog::error("无法打开 IMU 文件: {}", imuCsv_.string());
-                return false;
+                const std::string message = std::format("无法打开 IMU 文件: {}", imuCsv_.string());
+                mylog::error("{}", message);
+                return std::unexpected(DatasetError{message});
             }
             std::string line;
             if (!std::getline(in, line))
             {
-                mylog::error("IMU 文件为空: {}", imuCsv_.string());
-                return false;
+                const std::string message = std::format("IMU 文件为空: {}", imuCsv_.string());
+                mylog::error("{}", message);
+                return std::unexpected(DatasetError{message});
             }
             imu_.reserve(200000);
             imuNs_.reserve(200000);
@@ -194,32 +224,48 @@ namespace myslam::dataset
                 record.accel = gtsam::Vector3(fields[8], fields[9], fields[10]);
                 imu_.push_back(record);
             }
-            return !imu_.empty();
+            if (imu_.empty())
+            {
+                const std::string message = std::format("IMU 文件无有效数据行: {}", imuCsv_.string());
+                mylog::error("{}", message);
+                return std::unexpected(DatasetError{message});
+            }
+            return {};
         }
 
         /**
          * @brief 解析固定列数的逗号分隔行
-         * @return 字段数不足时返回 false
+         *
+         * 使用 std::from_chars 而非 std::stod：后者以异常报告解析失败，
+         * 会把"跳过一行坏数据"这种常规分支变成异常路径。from_chars 不分配、
+         * 不抛异常，且不依赖 locale（stod 受全局 locale 影响）。
+         *
+         * @param line     待解析的整行
+         * @param out      输出数组，长度至少 expected
+         * @param expected 期望字段数
+         * @return 字段数不足或有字段无法解析为有限数值时返回 false
          */
-        static bool parseCsv(const std::string &line, double *out, int expected)
+        static bool parseCsv(std::string_view line, double *out, int expected)
         {
             std::size_t begin = 0;
             int count = 0;
             while (count < expected)
             {
                 const std::size_t end = line.find(',', begin);
-                const std::string token =
-                    line.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-                try
-                {
-                    out[count] = std::stod(token);
-                }
-                catch (const std::exception &)
+                const std::size_t length = (end == std::string_view::npos ? line.size() : end) - begin;
+                const char *first = line.data() + begin;
+                const char *last = first + length;
+
+                double value = 0.0;
+                const auto [parsed, ec] = std::from_chars(first, last, value);
+                if (ec != std::errc{} || parsed != last || !std::isfinite(value))
                 {
                     return false;
                 }
+                out[count] = value;
                 ++count;
-                if (end == std::string::npos)
+
+                if (end == std::string_view::npos)
                 {
                     break;
                 }

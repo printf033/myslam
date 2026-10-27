@@ -2,11 +2,11 @@
 
 /**
  * @file initializer.hpp
- * @brief 工业级多阶段鲁棒初始化状态机（静止检测、重力对齐、陀螺零偏标定）。
+ * @brief 多阶段鲁棒初始化状态机（静止检测、重力对齐、陀螺零偏标定）。
  */
 
 #include "logger.hpp"
-#include "vio/types.hpp"
+#include "vio/params.hpp"
 #include <cmath>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>

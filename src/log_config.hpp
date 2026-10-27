@@ -12,11 +12,16 @@
  * myslam::LogConfig logConfig;
  * logConfig.level = "debug";
  * logConfig.fileManager.fileCapacity = 50ULL << 20;
- * myslam::configureLogging(logConfig);
+ * if (const auto result = myslam::configureLogging(logConfig); !result)
+ * {
+ *     std::fprintf(stderr, "%s\n", result.error().message.c_str());
+ * }
  * @endcode
  */
 
 #include "fileManager.hpp"
+#include <expected>
+#include <format>
 #include <string>
 
 namespace myslam
@@ -34,23 +39,30 @@ namespace myslam
     };
 
     /**
+     * @brief 日志配置失败的说明
+     */
+    struct LogConfigError
+    {
+        std::string message; ///< 面向使用者的说明
+    };
+
+    /**
      * @brief 通过 mylog C++ API 配置日志：级别 + FileManager 共享单文件输出
      *
      * @param config 日志配置
-     * @return true 配置成功
-     * @return false 日志级别无效；此时不修改当前输出配置
+     * @return 成功时无值；日志级别无效时返回错误，且不修改当前输出配置
      */
-    inline bool configureLogging(const LogConfig &config = {})
+    inline std::expected<void, LogConfigError> configureLogging(const LogConfig &config = {})
     {
         if (!mylog::setSuppressLevel(config.level))
         {
-            return false;
+            return std::unexpected(LogConfigError{std::format("无效的日志级别: \"{}\"", config.level)});
         }
 
         mylog::FileManager::getInstance().setConfig(config.fileManager);
         mylog::Logger::getInstance().setOutputFunction(mylog::FileManager::createFileOutputFunction());
         mylog::Logger::getInstance().setFlushFunction(mylog::FileManager::createFileFlushFunction());
-        return true;
+        return {};
     }
 
     /**

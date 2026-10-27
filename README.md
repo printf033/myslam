@@ -70,7 +70,7 @@ and a keyframe triggers backend optimization followed by a propagator reset.
 
 | Module | Responsibility |
 | :--- | :--- |
-| `vio/types.hpp` | Sensor structs (`ImuMeasurement` / `CameraFrame` / `FeatureObservation`) and `VioConfig` |
+| `vio/params.hpp` | Sensor structs (`ImuMeasurement` / `CameraFrame` / `FeatureObservation`) and `VioConfig` |
 | `vio/initializer.hpp` | `SystemState` state machine, stationarity detection, gravity alignment, bias calibration |
 | `vio/keyframe_selector.hpp` | Keyframe decision returning `DecisionResult` (flag, reason, parallax, retention) |
 | `vio/backend.hpp` | Factor graph construction, triangulation, layered outlier gating, marginalization, `latestNavState()` |
@@ -153,7 +153,7 @@ myslam/
 │   ├── plot_tum.py           # TUM trajectory plotting
 │   ├── gen_architecture_svg.py  # generates the diagrams under docs/
 │   └── setup-hooks.sh        # install the pre-commit formatting hook
-└── third_party/              # gtsam / mylog (git submodules)
+└── thirdparty/              # gtsam / mylog (git submodules)
 ```
 
 ---
@@ -319,10 +319,10 @@ A leftover `system.imuDt` in an older config produces a migration message.
 #include "lua_config.hpp"
 
 myslam::config::ProjectConfig project;
-const auto report = myslam::config::load("config/myslam.lua", project, /*applyLogging=*/true);
+const auto result = myslam::config::load("config/myslam.lua", project, /*applyLogging=*/true);
 
-if (!report.project) { /* keep built-in defaults */ }
-if (!report.logging) { /* fall back to the mylog C++ API */ }
+if (!result) { /* keep built-in defaults; result.error().message explains why */ }
+else if (!result->logging) { /* fall back to the mylog C++ API */ }
 ```
 
 Without linking `myslam::myslam_lua`, the header is a stub whose `load()` returns failure.
@@ -351,9 +351,24 @@ MEI model. `MeiFeatureTracker` first inverts the radtan distortion, then back-pr
 under the MEI model, and finally projects through virtual pinhole intrinsics scaled by
 `pinholeScale`. The virtual intrinsics are mirrored into `VioConfig`.
 
-**IMU timestamp gaps**: when consecutive IMU samples are separated by more than
-`kMaxImuGapSeconds` (0.1 s), the whole VIO pipeline is rebuilt and re-initialized. The reset count
-is reported in `DatasetRunReport::resets`.
+**IMU timestamp gaps**: consecutive samples separated by more than
+`maxImuGapFactor / imuRateHz` are treated as a gap (default 10 sample periods, i.e. 50 ms at
+200 Hz; adjustable via `dataset.replay.maxImuGapFactor`). Two rules apply:
+
+- Zero-order hold never spans a gap: there is no IMU data inside it, so integration stops one
+  sample period after the last valid sample instead of extrapolating across the missing time;
+- The pipeline is rebuilt and re-initialized. Segment count is reported in
+  `DatasetRunReport::segments`, resets in `resets`.
+
+Each segment re-initializes from a local origin, so their coordinate frames differ and
+**trajectories and point clouds must not be concatenated across segments**. The TUM output marks
+segment boundaries with `#` comment lines (`plot_tum.py` skips them), and the report warns when
+there is more than one segment.
+
+The preintegration boundary is aligned to the camera timestamp: a camera time usually falls
+between two IMU samples, so integration is truncated proportionally at `cameraTime`, and the
+straddling sample is only partially consumed with its remainder left for the next frame. The
+interval covered by `CombinedImuFactor` therefore ends exactly at the keyframe timestamp.
 
 ### Usage
 

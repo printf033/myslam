@@ -1,8 +1,8 @@
 #pragma once
 
 /**
- * @file types.hpp
- * @brief 传感器数据结构（IMU 测量、相机帧、特征观测）与系统配置 `VioConfig`。
+ * @file params.hpp
+ * @brief 传感器数据结构（IMU 测量、相机帧、特征观测）与系统参数 `VioConfig`。
  */
 
 #include <cstddef>

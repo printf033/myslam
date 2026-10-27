@@ -18,7 +18,9 @@
 #include "lua_config.hpp"
 #include "vio/vio.hpp"
 #include <cstdio>
+#include <expected>
 #include <filesystem>
+#include <format>
 #include <string>
 
 #if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
@@ -41,47 +43,39 @@ int main(int argc, char **argv)
         explicitConfig ? std::filesystem::path(argv[1]) : std::filesystem::path("config/myslam.lua");
 
     myslam::config::ProjectConfig project;
-    myslam::config::LoadReport loadReport;
     const bool configFileExists = std::filesystem::is_regular_file(configPath);
 
-    if (configFileExists)
-    {
-        loadReport = myslam::config::load(configPath, project);
-    }
-    else if (explicitConfig)
-    {
-        std::fprintf(stderr, "[error] 配置文件不存在: %s\n", configPath.string().c_str());
-        return 1;
-    }
+    // load() 的失败原因由 ConfigError 携带，调用方无需再猜测文件是否存在
+    const myslam::config::LoadResult loaded =
+        configFileExists ? myslam::config::load(configPath, project)
+                         : myslam::config::LoadResult(std::unexpected(
+                               myslam::config::ConfigError{myslam::config::ConfigErrorKind::FileNotFound,
+                                                           std::format("配置文件不存在: {}", configPath.string())}));
 
-    if (explicitConfig && !loadReport.project)
+    if (!loaded && explicitConfig)
     {
-        std::fprintf(stderr, "[error] 配置文件 %s 校验失败，未修改任何运行参数\n", configPath.string().c_str());
+        std::fprintf(stderr, "[error] %s (%s)\n", loaded.error().message.c_str(), loaded.error().kindName().data());
         return 1;
     }
 
     // 没有可用的 Lua 日志配置时回退到 mylog 的 C++ API
-    if (!loadReport.logging)
+    const bool loggingApplied = loaded.has_value() && loaded->logging;
+    if (!loggingApplied)
     {
         myslam::LogConfig logConfig;
-        if (!myslam::configureLogging(logConfig))
+        if (const auto result = myslam::configureLogging(logConfig); !result)
         {
-            std::fprintf(stderr, "[warning] 日志级别无效，沿用当前日志配置\n");
+            std::fprintf(stderr, "[warning] %s，沿用当前日志配置\n", result.error().message.c_str());
         }
     }
 
-    if (loadReport.project)
+    if (loaded)
     {
         std::fprintf(stderr, "[info] 已加载配置: %s\n", configPath.string().c_str());
     }
-    else if (configFileExists)
-    {
-        // 文件存在但解析失败：原因已由 config 层输出，这里不重复猜测
-        std::fprintf(stderr, "[info] 配置文件 %s 未能加载，使用内置默认配置\n", configPath.string().c_str());
-    }
     else
     {
-        std::fprintf(stderr, "[info] 未找到 %s，使用内置默认配置\n", configPath.string().c_str());
+        std::fprintf(stderr, "[info] %s，使用内置默认配置\n", loaded.error().message.c_str());
     }
 
     myslam::vio::VioSystem system(project.vio, project.system);

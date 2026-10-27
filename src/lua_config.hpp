@@ -20,19 +20,22 @@
  *
  * @code
  * myslam::config::ProjectConfig cfg;
- * if (!myslam::config::load("config/myslam.lua", cfg))
+ * const auto result = myslam::config::load("config/myslam.lua", cfg);
+ * if (!result)
  * {
- *     // 沿用代码内置默认值
+ *     // 沿用代码内置默认值；result.error() 给出失败类别与说明
+ *     std::fprintf(stderr, "[%s] %s\n", result.error().kindName().data(), result.error().message.c_str());
  * }
  * @endcode
  */
 
 #include "dataset/types.hpp"
+#include "vio/params.hpp"
 #include "vio/system.hpp"
-#include "vio/types.hpp"
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <initializer_list>
@@ -68,21 +71,66 @@ namespace myslam::config
     };
 
     /**
-     * @brief 加载结果：区分项目参数与日志配置各自的成败
+     * @brief 配置加载失败的类别
+     */
+    enum class ConfigErrorKind
+    {
+        FileNotFound,     ///< 路径不存在或不是普通文件
+        LuaRuntime,       ///< Lua 虚拟机创建失败、脚本语法错误或执行出错
+        InvalidStructure, ///< 配置节类型不符（例如 `vio = 42`）
+        InvalidValue,     ///< 字段值越界、缺失或违反交叉约束
+        Unsupported,      ///< 本次构建未启用 Lua 支持
+    };
+
+    /**
+     * @brief 配置加载失败的具体原因
      *
-     * 两个部分互不回滚：日志配置失败不影响项目参数应用，反之亦然。
-     * 需要"全有或全无"语义时检查 @c ok()。
+     * 只携带定位问题所需的最小信息；详细告警仍逐条写入 stderr。
+     */
+    struct ConfigError
+    {
+        ConfigErrorKind kind{ConfigErrorKind::InvalidValue}; ///< 失败类别
+        std::string message;                                 ///< 面向使用者的说明
+
+        /**
+         * @brief 类别名称，便于日志与测试断言
+         */
+        [[nodiscard]] constexpr std::string_view kindName() const noexcept
+        {
+            switch (kind)
+            {
+            case ConfigErrorKind::FileNotFound:
+                return "FileNotFound";
+            case ConfigErrorKind::LuaRuntime:
+                return "LuaRuntime";
+            case ConfigErrorKind::InvalidStructure:
+                return "InvalidStructure";
+            case ConfigErrorKind::InvalidValue:
+                return "InvalidValue";
+            case ConfigErrorKind::Unsupported:
+                return "Unsupported";
+            }
+            return "Unknown";
+        }
+    };
+
+    /**
+     * @brief 加载成功时的附带信息
+     *
+     * 项目参数已写入调用方的 @c ProjectConfig；日志配置是独立的一部分，
+     * 其失败不影响项目参数，因此单独以标志报告而不作为错误返回。
      */
     struct LoadReport
     {
-        bool project{false}; ///< 项目参数解析成功并已写入调用方配置
         bool logging{false}; ///< logger / fileManager 节已由 mylog 应用
-
-        /**
-         * @brief 两部分是否都成功
-         */
-        [[nodiscard]] bool ok() const noexcept { return project && logging; }
     };
+
+    /**
+     * @brief 配置加载结果
+     *
+     * 失败时不修改调用方的 @c ProjectConfig，因此可以安全地沿用旧配置。
+     */
+    using LoadResult = std::expected<LoadReport, ConfigError>;
 
     /// 脚本最多可执行的 Lua 指令数，与 mylog 的配置加载保持同一量级
     inline constexpr int kInstructionBudget = 50'000'000;
@@ -735,6 +783,8 @@ namespace myslam::config
                 loadInteger(L, tableIdx, kSection, "stride", 1, 10'000, cfg.stride);
                 loadInteger(L, tableIdx, kSection, "maxFeatures", 1, 1'000'000, cfg.maxFeatures);
                 loadDouble(L, tableIdx, kSection, "maxDuration", 0.0, 86'400.0, cfg.maxDuration);
+                // 倍数低于 2 会把正常抖动误判为断档，上限 1000 已远超任何合理缺样
+                loadDouble(L, tableIdx, kSection, "maxImuGapFactor", 2.0, 1'000.0, cfg.maxImuGapFactor);
             }
             else if (!lua_isnil(L, -1))
             {
@@ -821,9 +871,9 @@ namespace myslam::config
      * @param config Lua 配置文件路径
      * @param out 待覆盖的项目配置；字段缺失时保留其当前值
      * @param applyLogging 是否同时应用日志配置
-     * @return LoadReport 各部分成败
+     * @return LoadResult 成功时携带 LoadReport；失败时携带 ConfigError 且 @p out 未被修改
      */
-    inline LoadReport load(const std::filesystem::path &config, ProjectConfig &out, bool applyLogging = true)
+    inline LoadResult load(const std::filesystem::path &config, ProjectConfig &out, bool applyLogging = true)
     {
         LoadReport report;
 
@@ -831,14 +881,15 @@ namespace myslam::config
         if (!std::filesystem::is_regular_file(config, ec))
         {
             detail::reportError("配置文件不存在或不可读: {}", config.string());
-            return report;
+            return std::unexpected(
+                ConfigError{ConfigErrorKind::FileNotFound, std::format("配置文件不存在或不可读: {}", config.string())});
         }
 
         lua_State *L = luaL_newstate();
         if (L == nullptr)
         {
             detail::reportError("无法创建 Lua 状态机（内存不足）");
-            return report;
+            return std::unexpected(ConfigError{ConfigErrorKind::LuaRuntime, "无法创建 Lua 状态机（内存不足）"});
         }
 
         lua_sethook(
@@ -849,13 +900,16 @@ namespace myslam::config
         if (luaL_loadfile(L, config.string().c_str()) != 0 || lua_pcall(L, 0, 0, 0) != 0)
         {
             const char *err = lua_tostring(L, -1);
-            detail::reportError("执行 {} 失败: {}", config.string(), err != nullptr ? err : "未知 Lua 错误");
+            const std::string detailText = err != nullptr ? err : "未知 Lua 错误";
+            detail::reportError("执行 {} 失败: {}", config.string(), detailText);
             lua_close(L);
-            return report;
+            return std::unexpected(
+                ConfigError{ConfigErrorKind::LuaRuntime, std::format("执行 {} 失败: {}", config.string(), detailText)});
         }
 
         ProjectConfig parsed = out;
         bool projectValid = true;
+        std::string structureError; // 仅在配置节类型不符时填充
 
         lua_getglobal(L, "vio");
         if (lua_istable(L, -1))
@@ -866,6 +920,7 @@ namespace myslam::config
         else if (!lua_isnil(L, -1))
         {
             detail::reportError("配置节 vio 应为 table，实际为 {}", detail::typeName(L));
+            structureError = std::format("配置节 vio 应为 table，实际为 {}", detail::typeName(L));
             projectValid = false;
         }
         lua_pop(L, 1);
@@ -879,6 +934,7 @@ namespace myslam::config
         else if (!lua_isnil(L, -1))
         {
             detail::reportError("配置节 system 应为 table，实际为 {}", detail::typeName(L));
+            structureError = std::format("配置节 system 应为 table，实际为 {}", detail::typeName(L));
             projectValid = false;
         }
         lua_pop(L, 1);
@@ -892,17 +948,24 @@ namespace myslam::config
         else if (!lua_isnil(L, -1))
         {
             detail::reportError("配置节 dataset 应为 table，实际为 {}", detail::typeName(L));
+            structureError = std::format("配置节 dataset 应为 table，实际为 {}", detail::typeName(L));
             projectValid = false;
         }
         lua_pop(L, 1);
 
         lua_close(L);
 
-        if (projectValid)
+        if (!projectValid)
         {
-            out = parsed;
-            report.project = true;
+            const ConfigErrorKind kind =
+                structureError.empty() ? ConfigErrorKind::InvalidValue : ConfigErrorKind::InvalidStructure;
+            const std::string message =
+                structureError.empty() ? std::format("配置文件 {} 的字段校验未通过，详见上方逐条告警", config.string())
+                                       : structureError;
+            return std::unexpected(ConfigError{kind, message});
         }
+
+        out = parsed;
 
         if (applyLogging)
         {
@@ -926,15 +989,16 @@ namespace myslam::config
      * @param config 配置文件路径（仅用于诊断输出）
      * @param out 调用方配置，保持原样
      * @param applyLogging 未使用
-     * @return LoadReport 各部分均为 false
+     * @return LoadResult 恒为 ConfigError{Unsupported}
      */
-    inline LoadReport load(const std::filesystem::path &config, ProjectConfig &out, bool applyLogging = true)
+    inline LoadResult load(const std::filesystem::path &config, ProjectConfig &out, bool applyLogging = true)
     {
         (void)out;
         (void)applyLogging;
-        std::fprintf(stderr, "[myslam] config error: 本构建未启用 Lua 配置支持（MYSLAM_ENABLE_LUA=OFF），无法加载 %s\n",
-                     config.string().c_str());
-        return LoadReport{};
+        const std::string message =
+            std::format("本构建未启用 Lua 配置支持（MYSLAM_ENABLE_LUA=OFF），无法加载 {}", config.string());
+        std::fprintf(stderr, "[myslam] config error: %s\n", message.c_str());
+        return std::unexpected(ConfigError{ConfigErrorKind::Unsupported, message});
     }
 
 #endif // MYSLAM_HAS_LUA

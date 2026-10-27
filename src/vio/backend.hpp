@@ -7,7 +7,7 @@
 
 #include "logger.hpp"
 #include "vio/health_monitor.hpp"
-#include "vio/types.hpp"
+#include "vio/params.hpp"
 #include <algorithm>
 #include <chrono>
 #include <deque>
@@ -177,7 +177,7 @@ namespace myslam::vio
                         gtsam::Point3 ptC1 = tWc1.transformTo(ptW);
                         gtsam::Point3 ptC2 = tWc2.transformTo(ptW);
 
-                        // 工业校验：三角化结果必须在两帧上重投影一致，剔除受误匹配污染
+                        // 校验：三角化结果必须在两帧上重投影一致，剔除受误匹配污染
                         // 的三角化 (外点观测可能在此之前尚未进入重投影门控)
                         double reprojErr1 = 0.0;
                         double reprojErr2 = 0.0;

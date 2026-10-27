@@ -11,9 +11,9 @@
 #include "vio/health_monitor.hpp"
 #include "vio/initializer.hpp"
 #include "vio/keyframe_selector.hpp"
+#include "vio/params.hpp"
 #include "vio/propagator.hpp"
 #include "vio/simulator.hpp"
-#include "vio/types.hpp"
 #include <cmath>
 #include <cstddef>
 #include <gtsam/geometry/Point3.h>

@@ -49,7 +49,7 @@ option(MYSLAM_BUILD_DATASET_TOOLS
 # -----------------------------------------------------------------------------
 # Targets
 # -----------------------------------------------------------------------------
-add_subdirectory(third_party)
+add_subdirectory(thirdparty)
 add_subdirectory(src)
 
 if(MYSLAM_BUILD_EXAMPLES)
@@ -80,8 +80,11 @@ configure_file(
 if(MYSLAM_IS_TOP_LEVEL)
     find_program(CLANG_FORMAT_EXE clang-format)
     if(CLANG_FORMAT_EXE)
-        # GLOB_RECURSE already walks subdirectories such as src/vio
-        file(GLOB_RECURSE MYSLAM_CXX_FILES
+        # GLOB_RECURSE already walks subdirectories such as src/vio.
+        # CONFIGURE_DEPENDS makes the build system re-scan on rename/add/delete;
+        # without it a renamed file leaves a stale entry and `format` fails on
+        # the old path until someone re-runs cmake by hand.
+        file(GLOB_RECURSE MYSLAM_CXX_FILES CONFIGURE_DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/examples/*.hpp"

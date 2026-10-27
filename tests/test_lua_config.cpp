@@ -61,10 +61,16 @@ namespace
         return path;
     }
 
-    /// 加载指定脚本（不触碰日志配置），返回报告
-    myslam::config::LoadReport loadFrom(const std::filesystem::path &path, myslam::config::ProjectConfig &config)
+    /// 加载指定脚本（不触碰日志配置），返回 std::expected 结果
+    myslam::config::LoadResult loadFrom(const std::filesystem::path &path, myslam::config::ProjectConfig &config)
     {
         return myslam::config::load(path, config, /*applyLogging=*/false);
+    }
+
+    /// 把配置加载的成败折算成布尔，便于逐条断言
+    bool succeeded(const myslam::config::LoadResult &result)
+    {
+        return result.has_value();
     }
 
     /**
@@ -90,7 +96,7 @@ system = { totalDuration = 1.25, cameraDt = 0.05 }
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "合法配置解析成功");
+        expectTrue(succeeded(report), "合法配置解析成功");
         expectNear(config.vio.fx, 123.0, "vio.fx 覆盖生效");
         expectNear(config.vio.minTrackingRatio, 0.5, "vio.minTrackingRatio 覆盖生效");
         expectTrue(config.vio.extraSmootherIterations == 3, "vio.extraSmootherIterations 覆盖生效");
@@ -120,7 +126,7 @@ system = { cameraDt = 0.05 }
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "越界值钳位后配置仍然有效");
+        expectTrue(succeeded(report), "越界值钳位后配置仍然有效");
         expectNear(config.vio.minTrackingRatio, 1.0, "minTrackingRatio 钳位到上界 1.0");
         expectTrue(config.vio.maxSlidingWindowSize == 1, "maxSlidingWindowSize 钳位到下界 1");
         expectNear(config.vio.fx, 460.0, "字符串字段被忽略并保持默认");
@@ -141,7 +147,7 @@ system = { cameraDt = 0.05 }
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "合法采样率配置解析成功");
+        expectTrue(succeeded(report), "合法采样率配置解析成功");
         expectNear(config.vio.imuRateHz, 100.0, "vio.imuRateHz 覆盖生效");
         expectNear(myslam::config::ProjectConfig{}.system.cameraDt, 0.05, "未配置的 cameraDt 保持默认");
         expectNear(myslam::vio::SystemConfig::imuDtFrom(config.vio.imuRateHz), 0.01, "100 Hz 派生出 10 ms 步长");
@@ -155,7 +161,7 @@ system = { imuDt = 0.02, cameraDt = 0.05 }
         const auto legacyReport = loadFrom(legacy, legacyConfig);
         std::filesystem::remove(legacy);
 
-        expectTrue(legacyReport.project, "旧配置的 imuDt 不影响加载成功");
+        expectTrue(succeeded(legacyReport), "旧配置的 imuDt 不影响加载成功");
         expectNear(myslam::vio::SystemConfig::imuDtFrom(legacyConfig.vio.imuRateHz), 0.005,
                    "旧 imuDt 被忽略，仍由采样率派生");
     }
@@ -177,7 +183,7 @@ vio = {
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(!report.project, "关键帧间隔矛盾时配置被拒绝");
+        expectTrue(!succeeded(report), "关键帧间隔矛盾时配置被拒绝");
         expectNear(config.vio.fx, 460.0, "失败时不写回调用方配置");
 
         const auto path2 = writeLua("camera-faster", R"(
@@ -188,7 +194,7 @@ system = { cameraDt = 0.005 }
         const auto report2 = loadFrom(path2, config2);
         std::filesystem::remove(path2);
 
-        expectTrue(!report2.project, "相机快于 IMU 时配置被拒绝");
+        expectTrue(!succeeded(report2), "相机快于 IMU 时配置被拒绝");
     }
 
     /**
@@ -205,7 +211,7 @@ system = { totalDuration = 2.0 }
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "未知键只告警、不失败");
+        expectTrue(succeeded(report), "未知键只告警、不失败");
         expectNear(config.vio.fx, 460.0, "拼错的内参字段未生效");
         expectNear(config.vio.gyroNoiseSigma, 3.6e-4, "拼错的噪声字段未生效");
         expectNear(config.system.totalDuration, 2.0, "同节内的合法字段仍生效");
@@ -229,7 +235,7 @@ vio = {
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "合法外参解析成功");
+        expectTrue(succeeded(report), "合法外参解析成功");
         // 四元数 (2,0,0,0) 单位化后是恒等旋转
         expectTrue(config.vio.bodyPSensor.rotation().equals(gtsam::Rot3(), 1e-12), "外参四元数被单位化为恒等旋转");
         expectNear(config.vio.bodyPSensor.translation().x(), 1.5, "外参平移 x 生效");
@@ -242,7 +248,7 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
         myslam::config::ProjectConfig config2;
         const auto report2 = loadFrom(zeroPath, config2);
         std::filesystem::remove(zeroPath);
-        expectTrue(!report2.project, "零模长四元数被拒绝");
+        expectTrue(!succeeded(report2), "零模长四元数被拒绝");
     }
 
     /**
@@ -252,19 +258,37 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
     {
         myslam::config::ProjectConfig config;
         const auto missing = loadFrom(std::filesystem::temp_directory_path() / "myslam_cfg_does_not_exist.lua", config);
-        expectTrue(!missing.project, "配置文件缺失时返回失败");
+        expectTrue(!succeeded(missing), "配置文件缺失时返回失败");
+        expectTrue(missing.error().kind == myslam::config::ConfigErrorKind::FileNotFound,
+                   "缺失文件归类为 FileNotFound");
+        expectTrue(!missing.error().message.empty(), "失败时携带说明文本");
 
         const auto syntax = writeLua("syntax", "vio = { fx = ");
         const auto syntaxReport = loadFrom(syntax, config);
         std::filesystem::remove(syntax);
-        expectTrue(!syntaxReport.project, "语法错误的脚本返回失败");
+        expectTrue(!succeeded(syntaxReport), "语法错误的脚本返回失败");
+        expectTrue(syntaxReport.error().kind == myslam::config::ConfigErrorKind::LuaRuntime,
+                   "语法错误归类为 LuaRuntime");
 
         const auto wrongType = writeLua("wrong-type", "vio = 42\nsystem = { totalDuration = 1.0 }");
         myslam::config::ProjectConfig config2;
         const auto wrongTypeReport = loadFrom(wrongType, config2);
         std::filesystem::remove(wrongType);
-        expectTrue(!wrongTypeReport.project, "配置节不是 table 时返回失败");
+        expectTrue(!succeeded(wrongTypeReport), "配置节不是 table 时返回失败");
+        expectTrue(wrongTypeReport.error().kind == myslam::config::ConfigErrorKind::InvalidStructure,
+                   "配置节类型错误归类为 InvalidStructure");
         expectNear(config2.system.totalDuration, 5.0, "失败时不写回调用方配置");
+
+        // 字段校验失败（对比度矛盾）应与结构错误区分开
+        const auto contradiction = writeLua("contradiction-kind", R"(
+vio = { minKeyframeInterval = 0.5, maxKeyframeInterval = 0.2 }
+)");
+        myslam::config::ProjectConfig config3;
+        const auto contradictionReport = loadFrom(contradiction, config3);
+        std::filesystem::remove(contradiction);
+        expectTrue(contradictionReport.error().kind == myslam::config::ConfigErrorKind::InvalidValue,
+                   "交叉约束失败归类为 InvalidValue");
+        expectTrue(contradictionReport.error().kindName() == "InvalidValue", "kindName 与枚举一致");
     }
 
     /**
@@ -277,7 +301,7 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "空脚本解析成功");
+        expectTrue(succeeded(report), "空脚本解析成功");
         expectNear(config.vio.fx, 460.0, "空脚本保持默认内参");
         expectNear(config.system.totalDuration, 5.0, "空脚本保持默认时长");
     }
@@ -292,8 +316,8 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
         const auto report = myslam::config::load(path, config, /*applyLogging=*/true);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "无 vio / system 节时项目配置仍然成功");
-        expectTrue(report.logging, "logger 节被 mylog 接受");
+        expectTrue(succeeded(report), "无 vio / system 节时项目配置仍然成功");
+        expectTrue(report->logging, "logger 节被 mylog 接受");
         expectTrue(mylog::getCurrentSuppressLevel() == mylog::LEVEL::WARN, "suppressLevel 已真实生效");
 
         // 恢复级别，避免影响后续用例与测试框架输出
@@ -323,7 +347,7 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
 
         myslam::config::ProjectConfig config;
         const auto report = loadFrom(found, config);
-        expectTrue(report.project, "仓库默认配置通过全部校验");
+        expectTrue(succeeded(report), "仓库默认配置通过全部校验");
         expectNear(config.vio.fx, 460.0, "默认配置的 fx 与代码默认值一致");
         expectNear(config.vio.accelNoiseSigma, 0.0057, "默认配置的加速度噪声与代码默认值一致");
         expectNear(config.vio.bodyPSensor.translation().x(), 0.10, "默认配置的外参平移与代码默认值一致");
@@ -350,7 +374,7 @@ dataset = {
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
 
-        expectTrue(report.project, "dataset 节解析成功且不影响 VIO 配置");
+        expectTrue(succeeded(report), "dataset 节解析成功且不影响 VIO 配置");
         expectNear(config.intrinsics.fx, 500.0, "dataset.intrinsics.fx 覆盖生效");
         expectTrue(config.intrinsics.imageWidth == 320, "dataset.intrinsics.imageWidth 覆盖生效");
         expectTrue(config.intrinsics.isValid(), "覆盖后的内参仍然合法");
@@ -360,8 +384,31 @@ dataset = {
         expectTrue(config.replay.plyPath.empty(), "空串可清空路径字段");
         expectTrue(config.replay.viz.showWindow, "dataset.viz.showWindow 生效");
         expectNear(config.replay.viz.playbackRate, 1.0, "dataset.viz.playbackRate 生效");
+        // IMU 断档阈值属于回放时序参数，必须可从配置覆盖
+        expectNear(config.replay.maxImuGapFactor, myslam::dataset::DatasetRunConfig{}.maxImuGapFactor,
+                   "未配置 maxImuGapFactor 时保持默认");
+        expectTrue(myslam::dataset::DatasetRunConfig{}.maxImuGapFactor > 0.0, "断档倍数默认为正数");
         // dataset 与 vio 是独立节，前者不应污染后者
         expectNear(config.vio.fx, 460.0, "dataset 节不影响 vio 内参");
+
+        const auto gapPath = writeLua("dataset-gap", R"(
+dataset = { replay = { maxImuGapFactor = 4.5 } }
+)");
+        myslam::config::ProjectConfig gapConfig;
+        const auto gapReport = loadFrom(gapPath, gapConfig);
+        std::filesystem::remove(gapPath);
+        expectTrue(succeeded(gapReport), "maxImuGapFactor 可配置");
+        expectNear(gapConfig.replay.maxImuGapFactor, 4.5, "maxImuGapFactor 覆盖生效");
+
+        // 倍数小于 2 会把正常采样抖动误判为断档，因此钳位到下界
+        const auto tooSmall = writeLua("dataset-gap-small", R"(
+dataset = { replay = { maxImuGapFactor = 0.5 } }
+)");
+        myslam::config::ProjectConfig tooSmallConfig;
+        const auto tooSmallReport = loadFrom(tooSmall, tooSmallConfig);
+        std::filesystem::remove(tooSmall);
+        expectTrue(succeeded(tooSmallReport), "过小的断档倍数不致命");
+        expectNear(tooSmallConfig.replay.maxImuGapFactor, 2.0, "过小倍数钳位到 2.0");
 
         const auto badIntrinsics = writeLua("dataset-bad", R"(
 dataset = { intrinsics = { fx = 0.0 } }
@@ -369,7 +416,7 @@ dataset = { intrinsics = { fx = 0.0 } }
         myslam::config::ProjectConfig badConfig;
         const auto badReport = loadFrom(badIntrinsics, badConfig);
         std::filesystem::remove(badIntrinsics);
-        expectTrue(!badReport.project, "非法内参（fx 被钳到 1.0 之外的 0）被拒绝");
+        expectTrue(!succeeded(badReport), "非法内参（fx 被钳到 1.0 之外的 0）被拒绝");
     }
 
 } // namespace

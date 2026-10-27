@@ -19,12 +19,14 @@
 #include "log_config.hpp"
 #include "logger.hpp"
 #include "lua_config.hpp"
-#include "vio/types.hpp"
+#include "vio/params.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <filesystem>
+#include <format>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
 #include <string>
@@ -97,34 +99,36 @@ int main(int argc, char **argv)
     const bool consoleLog = std::getenv("MYSLAM_CONSOLE_LOG") != nullptr;
 
     myslam::config::ProjectConfig project;
-    myslam::config::LoadReport loadReport;
-    if (std::filesystem::is_regular_file(configPath))
+    const bool configFileExists = std::filesystem::is_regular_file(configPath);
+    const myslam::config::LoadResult loaded =
+        configFileExists ? myslam::config::load(configPath, project, /*applyLogging=*/!consoleLog)
+                         : myslam::config::LoadResult(std::unexpected(
+                               myslam::config::ConfigError{myslam::config::ConfigErrorKind::FileNotFound,
+                                                           std::format("配置文件不存在: {}", configPath.string())}));
+
+    if (!loaded && explicitConfig)
     {
-        loadReport = myslam::config::load(configPath, project, /*applyLogging=*/!consoleLog);
-        if (explicitConfig && !loadReport.project)
-        {
-            std::fprintf(stderr, "[error] 配置文件 %s 校验失败，未修改任何运行参数\n", configPath.string().c_str());
-            return 2;
-        }
-    }
-    else if (explicitConfig)
-    {
-        std::fprintf(stderr, "[error] 配置文件不存在: %s\n", configPath.string().c_str());
+        std::fprintf(stderr, "[error] %s (%s)\n", loaded.error().message.c_str(), loaded.error().kindName().data());
         return 2;
     }
 
     // 未从配置得到日志后端时回退到代码默认（当前工作目录的单文件输出）
-    if (!loadReport.logging && !consoleLog)
+    const bool loggingApplied = loaded.has_value() && loaded->logging;
+    if (!loggingApplied && !consoleLog)
     {
         myslam::LogConfig logConfig;
         if (const char *level = std::getenv("MYSLAM_LOG_LEVEL"))
         {
             logConfig.level = level;
         }
-        if (!myslam::configureLogging(logConfig))
+        if (const auto result = myslam::configureLogging(logConfig); !result)
         {
-            std::fprintf(stderr, "[warning] 日志级别无效，沿用当前日志配置\n");
+            std::fprintf(stderr, "[warning] %s，沿用当前日志配置\n", result.error().message.c_str());
         }
+    }
+    if (!loaded)
+    {
+        std::fprintf(stderr, "[info] %s，使用内置默认配置\n", loaded.error().message.c_str());
     }
 
     std::string dataDir;
@@ -295,8 +299,10 @@ int main(int argc, char **argv)
     runConfig.outputTum = outputPath;
 
     myslam::dataset::SubtSequence sequence(dataDir, imuPath, stampPath);
-    if (!sequence.load())
+    if (const auto loadedSequence = sequence.load(); !loadedSequence)
     {
+        // 具体原因已由 SubtSequence 记录到日志，这里只给出面向终端的摘要
+        std::fprintf(stderr, "[error] %s\n", loadedSequence.error().message.c_str());
         return 1;
     }
 

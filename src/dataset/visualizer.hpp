@@ -13,7 +13,7 @@
  */
 
 #include "dataset/types.hpp"
-#include "vio/types.hpp"
+#include "vio/params.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>

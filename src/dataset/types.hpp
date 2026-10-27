@@ -76,6 +76,10 @@ namespace myslam::dataset
         double maxDuration{0.0};         ///< 最长回放时长 (s)，0 表示不限
         std::filesystem::path plyPath;   ///< 路标/轨迹点云导出路径，空则不写
         VisualizationConfig viz;         ///< 实时可视化配置（窗口与视频）
+        /// IMU 断档判定倍数：相邻采样间隔超过 `maxImuGapFactor / imuRateHz` 即视为
+        /// 数据断层，重建流水线并重新初始化。默认 10 倍正常采样周期
+        /// （200 Hz 下为 50 ms），用于识别的短于旧硬编码 0.1 s 的缺样。
+        double maxImuGapFactor{10.0};
     };
 
     /**
@@ -90,6 +94,11 @@ namespace myslam::dataset
         bool initialized{false};
         double elapsedSeconds{0.0};
         double durationSeconds{0.0};
+        /// 处理过的流水线段数。每段因 IMU 断档或优化失败而重建，各自从局部
+        /// 原点重新初始化，坐标系互不相同，轨迹不可跨段直接拼接。
+        std::size_t segments{0};
+        /// 各段关键帧数之和与跨段累积的关键帧列表不一致时，以本字段为准
+        std::size_t trajectorySamples{0};
     };
 
 } // namespace myslam::dataset

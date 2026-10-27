@@ -6,13 +6,24 @@
  */
 
 #include <cstddef>
+#include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <gtsam/geometry/Point3.h>
+#include <string>
 #include <vector>
 
 namespace myslam::dataset
 {
+
+    /**
+     * @brief PLY 导出失败的具体原因
+     */
+    struct PlyError
+    {
+        std::string message; ///< 面向使用者的说明
+    };
 
     /**
      * @brief 写入 PLY 点云（ASCII）
@@ -20,15 +31,16 @@ namespace myslam::dataset
      * @param path      输出路径
      * @param landmarks 路标点（青色）
      * @param trajectory 轨迹关键帧位置（黄色）
-     * @return 文件成功打开并写完时为 true
+     * @return 成功时无值；无法打开文件或写入中途失败时返回具体原因
      */
-    inline bool writePly(const std::filesystem::path &path, const std::vector<gtsam::Point3> &landmarks,
-                         const std::vector<gtsam::Point3> &trajectory)
+    inline std::expected<void, PlyError> writePly(const std::filesystem::path &path,
+                                                  const std::vector<gtsam::Point3> &landmarks,
+                                                  const std::vector<gtsam::Point3> &trajectory)
     {
         std::ofstream out(path);
         if (!out)
         {
-            return false;
+            return std::unexpected(PlyError{std::format("无法写入 PLY 文件: {}", path.string())});
         }
 
         const std::size_t total = landmarks.size() + trajectory.size();
@@ -52,7 +64,11 @@ namespace myslam::dataset
         {
             out << p.x() << " " << p.y() << " " << p.z() << " 255 200 0\n";
         }
-        return static_cast<bool>(out);
+        if (!out)
+        {
+            return std::unexpected(PlyError{std::format("写入 PLY 文件时发生错误: {}", path.string())});
+        }
+        return {};
     }
 
 } // namespace myslam::dataset

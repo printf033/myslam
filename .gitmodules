@@ -1,6 +1,6 @@
-[submodule "third_party/mylog"]
-	path = third_party/mylog
+[submodule "thirdparty/mylog"]
+	path = thirdparty/mylog
 	url = https://github.com/printf033/mylog.git
-[submodule "third_party/gtsam"]
-	path = third_party/gtsam
+[submodule "thirdparty/gtsam"]
+	path = thirdparty/gtsam
 	url = https://github.com/borglab/gtsam.git

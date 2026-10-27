@@ -5,7 +5,7 @@
  * @brief 高频（200Hz）零延迟状态外推器。
  */
 
-#include "vio/types.hpp"
+#include "vio/params.hpp"
 #include <gtsam/navigation/ImuBias.h>
 #include <gtsam/navigation/NavState.h>
 

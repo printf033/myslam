@@ -63,7 +63,7 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 
 | 模块 | 职责 |
 | :--- | :--- |
-| `vio/types.hpp` | 传感器数据结构（`ImuMeasurement` / `CameraFrame` / `FeatureObservation`）与配置结构 `VioConfig` |
+| `vio/params.hpp` | 传感器数据结构（`ImuMeasurement` / `CameraFrame` / `FeatureObservation`）与配置结构 `VioConfig` |
 | `vio/initializer.hpp` | 初始化状态机 `SystemState` 与静止检测、重力对齐、零偏标定 |
 | `vio/keyframe_selector.hpp` | 关键帧决策，返回 `DecisionResult`（是否关键帧、原因、视差、留存率） |
 | `vio/backend.hpp` | 因子图构建、三角化、分层外点门控、边缘化、`latestNavState()` |
@@ -140,7 +140,7 @@ myslam/
 │   ├── plot_tum.py           # TUM 轨迹绘图
 │   ├── gen_architecture_svg.py  # 生成 docs/ 下的架构图
 │   └── setup-hooks.sh        # 安装 pre-commit 格式化钩子
-└── third_party/              # gtsam / mylog（git submodule）
+└── thirdparty/              # gtsam / mylog（git submodule）
 ```
 
 ---
@@ -301,10 +301,10 @@ const double imuDt = vio::SystemConfig::imuDtFrom(config_.imuRateHz);  // 1 / im
 #include "lua_config.hpp"
 
 myslam::config::ProjectConfig project;
-const auto report = myslam::config::load("config/myslam.lua", project, /*applyLogging=*/true);
+const auto result = myslam::config::load("config/myslam.lua", project, /*applyLogging=*/true);
 
-if (!report.project) { /* 沿用内置默认值 */ }
-if (!report.logging) { /* 回退到 mylog C++ API */ }
+if (!result) { /* 沿用内置默认值；result.error().message 说明原因 */ }
+else if (!result->logging) { /* 回退到 mylog C++ API */ }
 ```
 
 未链接 `myslam::myslam_lua` 时该头文件为桩实现，`load()` 返回失败。
@@ -331,8 +331,19 @@ Handheld1_Folder/
 先用 radtan 模型反解畸变，再按 MEI 模型反投影为射线，最后以 `pinholeScale` 缩放的虚拟针孔
 内参投回像素平面。虚拟内参同步写入 `VioConfig`。
 
-**IMU 时间断档**：检测到相邻 IMU 样本间隔超过 `kMaxImuGapSeconds`（0.1 s）时，重建整条
-VIO 流水线并重新初始化。重置次数计入 `DatasetRunReport::resets`。
+**IMU 时间断档**：相邻样本间隔超过 `maxImuGapFactor / imuRateHz` 时判定为断层（默认 10 倍采样
+周期，200 Hz 下为 50 ms，可在 `dataset.replay.maxImuGapFactor` 调整）。断档处理有两条规则：
+
+- 零阶保持不跨越缺口：断档区间没有 IMU 数据，预积分停在该样本后一个采样周期处，不会把
+  最后一条测量外推整段缺失时间；
+- 重建流水线并重新初始化。段数计入 `DatasetRunReport::segments`，重置次数计入 `resets`。
+
+各段独立从局部原点重新初始化，坐标系互不相同，因此**轨迹与点云不可跨段直接拼接**。TUM
+输出在段边界写入 `#` 注释行作为标记（`plot_tum.py` 会跳过），段数大于 1 时报告会给出提示。
+
+预积分边界与相机时刻严格对齐：相机时刻通常落在两条 IMU 样本之间，积分在 `cameraTime`
+处按比例截断，跨越边界的样本只消费前半段，剩余留给下一帧，因此 `CombinedImuFactor` 覆盖的
+区间末端与关键帧时间戳一致。
 
 ### 用法
 

@@ -104,6 +104,9 @@ dataset = {
         stride = 1,       -- 每隔多少帧取一帧，最小 1
         maxFeatures = 200, -- 每帧特征数上限
         maxDuration = 0.0, -- 最长回放时长 (s)，0 = 不限
+        -- IMU 断档判定倍数：相邻间隔超过 maxImuGapFactor / vio.imuRateHz 即视为断层。
+        -- 200 Hz 下默认 10 倍 = 50 ms；断档处不跨缺口积分，并重建流水线重新初始化。
+        maxImuGapFactor = 10.0,
     },
 
     -- 实时可视化（需要 OpenCV highgui；两者都关闭时不做渲染）

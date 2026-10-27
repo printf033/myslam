@@ -23,8 +23,8 @@
 #include "vio/backend.hpp"
 #include "vio/initializer.hpp"
 #include "vio/keyframe_selector.hpp"
+#include "vio/params.hpp"
 #include "vio/propagator.hpp"
-#include "vio/types.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -77,6 +77,9 @@ namespace myslam::dataset
                 int keyframeId{0};
                 std::size_t imuSinceLastKeyframe{0};
                 double initDeadline{-1.0}; ///< 超过该时刻仍未初始化则放宽静止检测
+                /// 已积分的物理时刻。预积分必须精确停在这里，使关键帧时间戳与
+                /// CombinedImuFactor 覆盖的区间末端一致。-1 表示尚未开始。
+                double integratedUntil{-1.0};
             };
 
             std::optional<Pipeline> pipeline;
@@ -93,6 +96,7 @@ namespace myslam::dataset
             }
 
             DatasetRunReport report;
+            report.segments = 1; // 首个流水线构成第 1 段
             DatasetVisualizer visualizer(runConfig_.viz);
             std::vector<gtsam::Point2> trail;              // 关键帧 XY 轨迹（用于小地图）
             std::vector<gtsam::Point3> exportedLandmarks;  // 跨重置累积的路标点
@@ -123,11 +127,13 @@ namespace myslam::dataset
             };
 
             std::size_t imuCursor = 0;
-            double lastImuTime = -1.0;
+            std::size_t countedImuSamples = 0;
             const auto &stamps = sequence.stamps();
             const auto &imu = sequence.imu();
-            const double defaultDt = 1.0 / std::max(1.0, config_.imuRateHz);
-            constexpr double kMaxImuGapSeconds = 0.1;
+            const double nominalDt = 1.0 / std::max(1.0, config_.imuRateHz);
+            // 断档阈值按采样率倍数给出：固定 0.1 s 会漏掉 200 Hz 下缺 5~19 个样本
+            // 的短断档，而那些断档同样不能跨越积分。
+            const double maxGapSeconds = std::max(nominalDt, runConfig_.maxImuGapFactor * nominalDt);
 
             const std::size_t firstFrame =
                 runConfig_.startFrame > 0 ? static_cast<std::size_t>(runConfig_.startFrame) : 0;
@@ -145,44 +151,97 @@ namespace myslam::dataset
                     break;
                 }
 
-                // 积分该相机帧时刻之前的全部 IMU 样本
+                // 把 IMU 精确积分到 cameraTime。
+                //
+                // 关键点：相机时刻通常落在两条 IMU 样本之间。若只积分到「不晚于
+                // cameraTime 的最后一条样本」，预积分末端会比关键帧时间戳早最多一个
+                // 采样周期，导致 CombinedImuFactor 覆盖的区间与状态时间戳错位，
+                // 固定滞后窗口的边缘化边界也随之偏移。
+                //
+                // 这里采用零阶保持：样本 k 的测量代表 [t_k, t_{k+1})。积分在
+                // cameraTime 处截断，跨越边界的样本只消费其前半段，剩余部分留给
+                // 下一帧，由 integratedUntil 记录截断位置。
                 std::size_t integratedThisFrame = 0;
-                for (; imuCursor < imu.size() && imu[imuCursor].timestamp <= cameraTime; ++imuCursor)
+                while (imuCursor < imu.size())
                 {
                     const ImuRecord &record = imu[imuCursor];
-                    if (lastImuTime >= 0.0 && record.timestamp - lastImuTime > kMaxImuGapSeconds)
+                    if (record.timestamp > cameraTime)
                     {
-                        mylog::warn("[回放] 检测到 IMU 时间跳变 {:.3f}s (t={:.4f}s)，重置 VIO 系统并重新初始化",
-                                    record.timestamp - lastImuTime, record.timestamp);
-                        report.keyframes += static_cast<std::size_t>(pipeline->keyframeId);
-                        accumulatePoints(*pipeline, exportedLandmarks, exportedTrajectory);
-                        pipeline.emplace(config_, intrinsics_, runConfig_.maxFeatures);
-                        ++report.resets;
+                        break; // 该样本完全位于相机时刻之后
                     }
-                    lastImuTime = record.timestamp;
 
-                    vio::ImuMeasurement measurement;
-                    measurement.timestamp = record.timestamp;
-                    measurement.accel = record.accel;
-                    measurement.gyro = record.gyro;
-                    ++report.imuSamples;
+                    // 每样本只做一次断档检测与计数；跨边界的样本会被后续帧再次访问
+                    if (imuCursor >= countedImuSamples)
+                    {
+                        countedImuSamples = imuCursor + 1;
+                        ++report.imuSamples;
 
-                    if (pipeline->initializer.state() != vio::SystemState::TRACKING_OK)
-                    {
-                        pipeline->initializer.feedImu(measurement);
+                        if (imuCursor > 0)
+                        {
+                            const double gap = record.timestamp - imu[imuCursor - 1].timestamp;
+                            if (gap > maxGapSeconds)
+                            {
+                                mylog::warn("[回放] IMU 断档 {:.3f}s (t={:.4f}s) 超过阈值 {:.3f}s，"
+                                            "重建流水线并重新初始化（第 {} 段）",
+                                            gap, record.timestamp, maxGapSeconds, report.segments + 1);
+                                report.keyframes += static_cast<std::size_t>(pipeline->keyframeId);
+                                accumulatePoints(*pipeline, exportedLandmarks, exportedTrajectory);
+                                pipeline.emplace(config_, intrinsics_, runConfig_.maxFeatures);
+                                ++report.resets;
+                                ++report.segments;
+                                writeTumSegment(tum, report.segments, cameraTime);
+                                // 新段从零开始积分，绝不沿用跨断层的 dt
+                                pipeline->integratedUntil = -1.0;
+                            }
+                        }
                     }
-                    else
+
+                    // 样本代表的区间 [record.timestamp, segEnd)。零阶保持只能维持一个
+                    // 正常采样周期：若下一条样本距离过远（断档），绝不能把该测量外推
+                    // 整段缺失时间，否则预积分会虚拟出不存在的匀速运动。
+                    double segEnd =
+                        (imuCursor + 1 < imu.size()) ? imu[imuCursor + 1].timestamp : record.timestamp + nominalDt;
+                    if (segEnd - record.timestamp > maxGapSeconds)
                     {
-                        const double dt = imuCursor == 0 ? defaultDt : record.timestamp - imu[imuCursor - 1].timestamp;
-                        pipeline->backend.integrateImu(measurement, dt > 0.0 ? dt : defaultDt);
-                        pipeline->propagator.propagate(measurement);
-                        ++integratedThisFrame;
-                        ++pipeline->imuSinceLastKeyframe;
+                        segEnd = record.timestamp + nominalDt;
                     }
+                    const double from = pipeline->integratedUntil < 0.0
+                                            ? record.timestamp
+                                            : std::max(pipeline->integratedUntil, record.timestamp);
+                    const double to = std::min(segEnd, cameraTime);
+
+                    if (to > from)
+                    {
+                        vio::ImuMeasurement measurement;
+                        measurement.timestamp = record.timestamp;
+                        measurement.accel = record.accel;
+                        measurement.gyro = record.gyro;
+
+                        if (pipeline->initializer.state() != vio::SystemState::TRACKING_OK)
+                        {
+                            pipeline->initializer.feedImu(measurement);
+                        }
+                        else
+                        {
+                            pipeline->backend.integrateImu(measurement, to - from);
+                            pipeline->propagator.propagate(measurement);
+                            ++integratedThisFrame;
+                            ++pipeline->imuSinceLastKeyframe;
+                        }
+                        pipeline->integratedUntil = to;
+                    }
+
+                    if (segEnd > cameraTime)
+                    {
+                        break; // 已截断到相机时刻，样本残余留给下一帧
+                    }
+                    ++imuCursor;
                 }
-                mylog::debug("[回放] 帧 #{} t={:.4f}s: 积分 IMU {} 条, 累计 {} 条, 状态={}", frameIndex, cameraTime,
-                             integratedThisFrame, report.imuSamples,
-                             vio::systemStateToString(pipeline->initializer.state()));
+                mylog::debug(
+                    "[回放] 帧 #{} t={:.4f}s: 积分 IMU {} 条, 累计 {} 条, 状态={}, 预积分终点={:.6f}s (偏差 {:.6f}s)",
+                    frameIndex, cameraTime, integratedThisFrame, report.imuSamples,
+                    vio::systemStateToString(pipeline->initializer.state()), pipeline->integratedUntil,
+                    pipeline->integratedUntil < 0.0 ? 0.0 : cameraTime - pipeline->integratedUntil);
 
                 cv::Mat gray = cv::imread(sequence.imagePath(frameIndex), cv::IMREAD_GRAYSCALE);
                 if (gray.empty())
@@ -230,8 +289,11 @@ namespace myslam::dataset
                         pipeline->initializer.setState(vio::SystemState::TRACKING_OK);
                         pipeline->lastKeyframe = frame;
                         pipeline->imuSinceLastKeyframe = 0;
+                        // initializeSystem 内部重置了预积分，积分基线同步移到相机时刻
+                        pipeline->integratedUntil = cameraTime;
                         report.initialized = true;
                         writeTum(tum, cameraTime, initPose);
+                        ++report.trajectorySamples;
                         trail.emplace_back(initPose.x(), initPose.y());
                         ++pipeline->keyframeId;
                     }
@@ -264,6 +326,8 @@ namespace myslam::dataset
                             accumulatePoints(*pipeline, exportedLandmarks, exportedTrajectory);
                             pipeline.emplace(config_, intrinsics_, runConfig_.maxFeatures);
                             ++report.resets;
+                            ++report.segments;
+                            writeTumSegment(tum, report.segments, cameraTime);
                             continue;
                         }
                         pipeline->propagator.resetWithOptimizedState(cameraTime, pipeline->backend.latestNavState(),
@@ -273,6 +337,7 @@ namespace myslam::dataset
 
                         const gtsam::Pose3 pose = pipeline->backend.latestNavState().pose();
                         writeTum(tum, cameraTime, pose);
+                        ++report.trajectorySamples;
                         trail.emplace_back(pose.x(), pose.y());
                         ++pipeline->keyframeId;
                     }
@@ -283,31 +348,56 @@ namespace myslam::dataset
             if (!runConfig_.plyPath.empty() && pipeline)
             {
                 accumulatePoints(*pipeline, exportedLandmarks, exportedTrajectory);
-                if (writePly(runConfig_.plyPath, exportedLandmarks, exportedTrajectory))
+                if (const auto written = writePly(runConfig_.plyPath, exportedLandmarks, exportedTrajectory); written)
                 {
                     mylog::info("点云已导出: {} ({} 个路标, {} 个轨迹点)", runConfig_.plyPath.string(),
                                 exportedLandmarks.size(), exportedTrajectory.size());
                 }
                 else
                 {
-                    mylog::warn("点云导出失败: {}", runConfig_.plyPath.string());
+                    mylog::warn("点云导出失败: {}", written.error().message);
                 }
             }
             report.durationSeconds = stamps.empty() ? 0.0 : stamps.back() - stamps.front();
             report.elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count();
 
             mylog::info("================================================================================");
-            mylog::info("📊 数据集回放完成: 处理 {} 帧, 关键帧 {}, IMU {} 条, 系统重置 {} 次, 初始化 {}",
-                        report.framesProcessed, report.keyframes, report.imuSamples, report.resets,
-                        report.initialized ? "成功" : "未完成");
+            mylog::info("📊 数据集回放完成: 处理 {} 帧, 关键帧 {}, IMU {} 条, 初始化 {}", report.framesProcessed,
+                        report.keyframes, report.imuSamples, report.initialized ? "成功" : "未完成");
             mylog::info("   回放时长 {:.2f} s (序列总长 {:.2f} s), 墙钟耗时 {:.2f} s", report.durationSeconds,
                         stamps.empty() ? 0.0 : stamps.back() - stamps.front(), report.elapsedSeconds);
+            if (report.segments > 1)
+            {
+                mylog::warn("   序列被 IMU 断档切成 {} 段，各段独立重新初始化，"
+                            "轨迹与点云坐标互不连续，统计量只能按段解读",
+                            report.segments);
+                mylog::warn("   跨段输出共 {} 条轨迹记录，直接拼接会在段边界出现位置跳变", report.trajectorySamples);
+            }
             mylog::info("================================================================================");
             return report;
         }
 
     private:
         int stride() const { return runConfig_.stride > 0 ? runConfig_.stride : 1; }
+
+        /**
+         * @brief 在 TUM 轨迹中标记段边界
+         *
+         * 各段独立初始化，坐标系不同，轨迹不可跨段直接拼接。TUM 格式本身没有
+         * 分段概念，因此用注释行标注；plot_tum.py 会跳过 `#` 开头的行。
+         *
+         * @param stream 输出流
+         * @param segment 即将开始的段号（从 2 起）
+         * @param timestamp 段起点的相机时刻
+         */
+        static void writeTumSegment(std::ofstream &stream, std::size_t segment, double timestamp)
+        {
+            if (!stream.is_open())
+            {
+                return;
+            }
+            stream << "# segment " << segment << " begins at t=" << timestamp << " (独立初始化，坐标不与上一段连续)\n";
+        }
 
         static void writeTum(std::ofstream &stream, double timestamp, const gtsam::Pose3 &pose)
         {

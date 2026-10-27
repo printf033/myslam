@@ -5,7 +5,7 @@
  * @brief 自适应关键帧决策（视差 / 共视率 / 时间保底）。
  */
 
-#include "vio/types.hpp"
+#include "vio/params.hpp"
 #include <format>
 #include <gtsam/geometry/Point2.h>
 #include <optional>
