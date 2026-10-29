@@ -6,8 +6,9 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 将 IMU 预积分因子与视觉重投影因子放进同一个因子图，按时间窗口边缘化。
 
 - **语言标准**：C++26（由 CMake 强制）
-- **依赖**：[GTSAM](https://github.com/borglab/gtsam) 4.3、[mylog](https://github.com/printf033/mylog)（均为 submodule）
-- **可选依赖**：LuaJIT 2.1（配置加载）、OpenCV 4（数据集回放工具）
+- **依赖**：[GTSAM](https://github.com/borglab/gtsam) 4.3、[mylog](https://github.com/printf033/mylog)、
+  [OpenCV](https://github.com/opencv/opencv) 4.x、[MASt3R](https://github.com/naver/mast3r)（均为 submodule）
+- **可选依赖**：LuaJIT 2.1（配置加载）；也可用系统安装的 OpenCV 4 替代 submodule
 - **版本号**：唯一来源为 `CMakeLists.txt` 的 `project(VERSION)`，运行时经 `myslam::kVersion` 读取
 
 ---
@@ -152,7 +153,7 @@ myslam/
 │   ├── plot_tum.py           # TUM 轨迹绘图
 │   ├── gen_architecture_svg.py  # 生成 docs/ 下的架构图
 │   └── setup-hooks.sh        # 安装 pre-commit 格式化钩子
-└── thirdparty/              # gtsam / mylog（git submodule）
+└── thirdparty/              # gtsam / mylog / opencv / mast3r（git submodule）
 ```
 
 ---
@@ -166,7 +167,7 @@ myslam/
 | 构建工具 | Ninja 或 Make |
 | 系统库 | TBB、Boost、Eigen3、Threads |
 | LuaJIT | 2.1+ 且可被 `pkg-config` 发现；缺失时 Lua 支持自动关闭，其余功能不受影响 |
-| OpenCV | 4.x（仅 `MYSLAM_BUILD_DATASET_TOOLS=ON` 时） |
+| OpenCV | 4.x，仅 `MYSLAM_BUILD_DATASET_TOOLS=ON` 时需要；默认用系统包，`MYSLAM_USE_BUNDLED_OPENCV=ON` 时改用 `thirdparty/opencv` 子模块 |
 | clang-format | 23.1.3（提交钩子与 CI 按此版本校验） |
 
 Ubuntu 安装：
@@ -174,7 +175,7 @@ Ubuntu 安装：
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkgconf \
     libtbb-dev libboost-all-dev libeigen3-dev libluajit-5.1-dev
-# 仅数据集工具需要
+# 仅数据集工具需要（系统 OpenCV 后端；用 MYSLAM_USE_BUNDLED_OPENCV 时可跳过）
 sudo apt-get install -y libopencv-dev
 # 格式化工具
 pipx install "clang-format==23.1.3"
@@ -196,7 +197,8 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-首次构建会编译 GTSAM。
+首次构建会编译 GTSAM。只构建核心时可跳过约 225 MB 的 `thirdparty/opencv` 与
+`thirdparty/mast3r`，改用 `git submodule update --init thirdparty/gtsam thirdparty/mylog`。
 
 ### 构建选项
 
@@ -205,6 +207,7 @@ ctest --test-dir build --output-on-failure
 | `MYSLAM_BUILD_EXAMPLES` | 顶层构建时 `ON` | 构建示例程序 |
 | `MYSLAM_BUILD_TESTS` | 顶层构建时 `ON` | 构建测试 |
 | `MYSLAM_BUILD_DATASET_TOOLS` | `OFF` | 构建 OpenCV 数据集回放工具 |
+| `MYSLAM_USE_BUNDLED_OPENCV` | `OFF` | 从 `thirdparty/opencv` 子模块构建 OpenCV，不再使用系统包 |
 | `MYSLAM_SANITIZE` | 顶层构建时 `ON` | Debug 下启用 ASan/UBSan |
 | `MYSLAM_ENABLE_LUA` | `ON` | Lua 配置支持；找不到 LuaJIT 时自动降为 `OFF` 并给出告警 |
 
@@ -224,6 +227,36 @@ cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
 ```
 
 `scripts/run_subt.sh` 默认使用 `build-release`。
+
+### 内置 OpenCV
+
+`thirdparty/opencv` 是钉在 4.x 分支上的子模块，数据集工具可以直接针对随仓库演进的版本构建，
+而不必依赖宿主发行版装的 OpenCV：
+
+```bash
+cmake -B build-release -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DMYSLAM_SANITIZE=OFF \
+    -DMYSLAM_BUILD_TESTS=OFF \
+    -DMYSLAM_BUILD_DATASET_TOOLS=ON \
+    -DMYSLAM_USE_BUNDLED_OPENCV=ON
+cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
+```
+
+只配置回放工具真正用到的模块（`core`、`imgproc`、`imgcodecs`、`features2d`、`video`、
+`calib3d`、`highgui`、`videoio`），并关闭测试、示例、Python/Java 绑定与可选编解码器
+（JPEG2000、TIFF、OpenEXR、GDAL、gPhoto2）。首次 configure 会从源码编译这些模块，
+耗时明显长于系统包后端。
+
+两种来源都暴露同一个 `myslam::opencv` 接口目标，消费方无需区分。跟随上游更新：
+`git submodule update --remote thirdparty/opencv`。
+
+### MASt3R
+
+`thirdparty/mast3r` 钉住 [naver/mast3r](https://github.com/naver/mast3r) —— SubT 序列背后的三维重建工具链。
+它是 Python/PyTorch 项目，不参与 C++ 构建：仓库只跟踪其版本，使 `MeiFeatureTracker` 对齐的数据集
+布局与 MEI 内参 / 针孔缩放预处理，能跟随产出这些数据的模型一同演进。更新：
+`git submodule update --remote thirdparty/mast3r`。
 
 ### 版本号
 

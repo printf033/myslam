@@ -7,8 +7,9 @@ Visual-inertial odometry (VIO) in C++26. The backend uses GTSAM's
 in a single factor graph, marginalizing states that leave the time window.
 
 - **Language standard**: C++26 (enforced by CMake)
-- **Dependencies**: [GTSAM](https://github.com/borglab/gtsam) 4.3, [mylog](https://github.com/printf033/mylog) (both submodules)
-- **Optional**: LuaJIT 2.1 (configuration), OpenCV 4 (dataset replay tools)
+- **Dependencies**: [GTSAM](https://github.com/borglab/gtsam) 4.3, [mylog](https://github.com/printf033/mylog),
+  [OpenCV](https://github.com/opencv/opencv) 4.x and [MASt3R](https://github.com/naver/mast3r) (all git submodules)
+- **Optional**: LuaJIT 2.1 (configuration); a system OpenCV 4 install as an alternative to the bundled submodule
 - **Version**: single source is `project(VERSION)` in `CMakeLists.txt`; read at runtime via `myslam::kVersion`
 
 ---
@@ -170,7 +171,7 @@ myslam/
 │   ├── plot_tum.py           # TUM trajectory plotting
 │   ├── gen_architecture_svg.py  # generates the diagrams under docs/
 │   └── setup-hooks.sh        # install the pre-commit formatting hook
-└── thirdparty/              # gtsam / mylog (git submodules)
+└── thirdparty/              # gtsam / mylog / opencv / mast3r (git submodules)
 ```
 
 ---
@@ -184,7 +185,7 @@ myslam/
 | Build tool | Ninja or Make |
 | System libraries | TBB, Boost, Eigen3, Threads |
 | LuaJIT | 2.1+, discoverable via `pkg-config`; when missing, Lua support is turned off automatically |
-| OpenCV | 4.x (only when `MYSLAM_BUILD_DATASET_TOOLS=ON`) |
+| OpenCV | 4.x, only when `MYSLAM_BUILD_DATASET_TOOLS=ON`; taken from the system by default, or built from `thirdparty/opencv` with `MYSLAM_USE_BUNDLED_OPENCV=ON` |
 | clang-format | 23.1.3 (commit hook and CI both check against this version) |
 
 Install on Ubuntu:
@@ -192,7 +193,7 @@ Install on Ubuntu:
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkgconf \
     libtbb-dev libboost-all-dev libeigen3-dev libluajit-5.1-dev
-# dataset tools only
+# dataset tools only (system OpenCV backend; skip it for MYSLAM_USE_BUNDLED_OPENCV)
 sudo apt-get install -y libopencv-dev
 # formatter
 pipx install "clang-format==23.1.3"
@@ -214,7 +215,9 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-The first build compiles GTSAM.
+The first build compiles GTSAM. Core-only builds can skip the ~225 MB of
+`thirdparty/opencv` + `thirdparty/mast3r` with
+`git submodule update --init thirdparty/gtsam thirdparty/mylog`.
 
 ### Build options
 
@@ -223,6 +226,7 @@ The first build compiles GTSAM.
 | `MYSLAM_BUILD_EXAMPLES` | `ON` when top-level | Build example programs |
 | `MYSLAM_BUILD_TESTS` | `ON` when top-level | Build tests |
 | `MYSLAM_BUILD_DATASET_TOOLS` | `OFF` | Build the OpenCV dataset replay tools |
+| `MYSLAM_USE_BUNDLED_OPENCV` | `OFF` | Build OpenCV from `thirdparty/opencv` instead of using system packages |
 | `MYSLAM_SANITIZE` | `ON` when top-level | Enable ASan/UBSan in Debug |
 | `MYSLAM_ENABLE_LUA` | `ON` | Lua configuration support; falls back to `OFF` with a warning when LuaJIT is missing |
 
@@ -242,6 +246,37 @@ cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
 ```
 
 `scripts/run_subt.sh` defaults to `build-release`.
+
+### Bundled OpenCV
+
+`thirdparty/opencv` is a tracked submodule pinned to the 4.x branch, so the dataset tools can build
+against a version that evolves with this repository instead of the host distribution:
+
+```bash
+cmake -B build-release -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DMYSLAM_SANITIZE=OFF \
+    -DMYSLAM_BUILD_TESTS=OFF \
+    -DMYSLAM_BUILD_DATASET_TOOLS=ON \
+    -DMYSLAM_USE_BUNDLED_OPENCV=ON
+cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
+```
+
+Only the modules the replay tools need are configured (`core`, `imgproc`, `imgcodecs`,
+`features2d`, `video`, `calib3d`, `highgui`, `videoio`), with tests, samples, Python/Java bindings
+and the optional codecs (JPEG2000, TIFF, OpenEXR, GDAL, gPhoto2) disabled. The first configure
+builds those modules from source, so expect a longer compile than the system-package backend.
+
+Both backends expose the same `myslam::opencv` interface target; consumers do not care which one is
+active. Follow upstream with `git submodule update --remote thirdparty/opencv`.
+
+### MASt3R
+
+`thirdparty/mast3r` pins [naver/mast3r](https://github.com/naver/mast3r), the reconstruction stack
+behind the SubT sequences. It is a Python/PyTorch project, so it takes no part in the C++ build: the
+repository only tracks the version so the dataset layout and the MEI intrinsics / pinhole-scale
+preprocessing that `MeiFeatureTracker` mirrors stay in sync with the model that produced them.
+Update it with `git submodule update --remote thirdparty/mast3r`.
 
 ### Version
 

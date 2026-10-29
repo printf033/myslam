@@ -17,6 +17,7 @@
 #   scripts/run_subt.sh --viz                        # 实时窗口（ESC/q 退出）
 #   scripts/run_subt.sh --video out.avi --ply cloud.ply
 #   scripts/run_subt.sh --max-frames 0 --viz --viz-rate 1   # 全程实时播放
+#   OPENCV_BUNDLED=1 scripts/run_subt.sh            # 用 thirdparty/opencv 子模块构建 OpenCV
 #
 set -euo pipefail
 
@@ -36,10 +37,12 @@ VIZ="${VIZ:-0}"
 VIZ_STRIDE="${VIZ_STRIDE:-1}"
 VIZ_RATE="${VIZ_RATE:-0}"
 PLOT="${PLOT:-0}"
+# 1 = 从 thirdparty/opencv 子模块构建 OpenCV（默认用系统包）
+OPENCV_BUNDLED="${OPENCV_BUNDLED:-0}"
 DO_BUILD=1
 
 usage() {
-    sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     cat <<'EOF'
 
 可选参数:
@@ -118,6 +121,9 @@ if [ "$DO_BUILD" -eq 1 ]; then
     )
     if [ "$BUILD_TYPE" = "Release" ]; then
         configure_flags+=(-DMYSLAM_SANITIZE=OFF)
+    fi
+    if [ "$OPENCV_BUNDLED" = "1" ]; then
+        configure_flags+=(-DMYSLAM_USE_BUNDLED_OPENCV=ON)
     fi
     cmake "${configure_flags[@]}"
 

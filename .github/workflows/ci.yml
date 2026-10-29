@@ -15,10 +15,14 @@ jobs:
     name: Build & Test (Ubuntu / C++26)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code (with submodules)
+      - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # Only the submodules this job compiles are fetched. thirdparty/opencv is
+      # ~220 MB and only needed with MYSLAM_USE_BUNDLED_OPENCV=ON, and
+      # thirdparty/mast3r is a Python stack that is never built here.
+      - name: Init build submodules
+        run: git submodule update --init thirdparty/gtsam thirdparty/mylog
 
       - name: Install System Dependencies
         run: |

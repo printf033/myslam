@@ -45,6 +45,8 @@ option(MYSLAM_BUILD_EXAMPLES "Build example programs" ${MYSLAM_IS_TOP_LEVEL})
 option(MYSLAM_BUILD_TESTS    "Build tests"            ${MYSLAM_IS_TOP_LEVEL})
 option(MYSLAM_BUILD_DATASET_TOOLS
     "Build OpenCV-based dataset replay tools (requires OpenCV)" OFF)
+option(MYSLAM_USE_BUNDLED_OPENCV
+    "Build OpenCV from the thirdparty/opencv submodule instead of system packages" OFF)
 
 # -----------------------------------------------------------------------------
 # Targets
