@@ -14,19 +14,17 @@ or stdout, and parsed by ``examples/2_subt_dataset.cpp``:
 
     model = pinhole
     source = mast3r
-    fx = 460.2
-    fy = 460.2
-    cx = 320.0
-    cy = 240.0
+    focal = 408.02
     width = 640
     height = 480
 
-Escaping from the MEI case: MASt3R predicts a pinhole model, so the returned
-numbers describe the *raw* image. Feeding them back to myslam therefore means
-``xi = 0`` and no distortion, which is only equivalent to a calibrated MEI
-sequence when the lens is close to pinhole. For a calibrated fisheye sequence
-keep using the yaml intrinsics; this backend exists for sequences that ship no
-calibration at all.
+``focal`` is the **virtual pinhole focal length** the backend consumes, not the
+MEI projection parameter: MASt3R fits a pinhole model to the predicted point
+maps, so what it recovers is the effective pinhole ``f``. The replay tool turns
+it into ``pinholeScale = focal / fx`` against the calibrated ``fx`` and inherits
+``xi`` / distortion from the calibration, so the fisheye geometry is preserved.
+Writing ``fx`` here instead would mislabel a pinhole focal as a MEI parameter and
+degrade the distortion inversion.
 """
 
 from __future__ import annotations
@@ -230,12 +228,13 @@ def main(argv: list[str]) -> int:
     # A single shared focal (square pixels) is what MASt3R's own optimiser uses.
     focal = statistics.median(estimates)
     lines = [
-        "# MASt3R pinhole intrinsics (image centre as principal point)",
+        "# MASt3R pinhole focal (image centre as principal point)",
+        "# This is the *virtual pinhole focal length*, consumed as focal = fx * pinholeScale.",
+        "# Distortion (xi / k1 / k2 / p1 / p2) is inherited from the calibration, not written here.",
         f"# pairs={len(estimates)} device={device} checkpoint={weights.name}",
         "model = pinhole",
         "source = mast3r",
-        f"fx = {focal:.6f}",
-        f"fy = {focal:.6f}",
+        f"focal = {focal:.6f}",
         f"cx = {width / 2.0:.6f}",
         f"cy = {height / 2.0:.6f}",
         f"width = {width}",

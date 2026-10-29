@@ -464,8 +464,21 @@ How it works:
    `estimate_focal_knowing_depth`, the principal point is taken as the image centre;
 2. the result is written to `<cam_0>/../mast3r_intrinsics.txt` and cached, so later replays skip the
    inference; `--force-estimate` recomputes it and `--mast3r-cache` relocates it;
-3. the parser zeroes the MEI `xi` and distortion terms and sets `pinholeScale` to one, so the
-   undistortion path degenerates to identity.
+3. the parser uses it for the **virtual pinhole focal** only: `pinholeScale = focal / fx` so the
+   backend's `pinholeFx()` equals the estimate. `xi` and `k1/k2/p1/p2` are **inherited from the
+   configured calibration**, so the fisheye unprojection still runs.
+
+#### Why the estimate must not be written as `fx`
+
+The estimate is an *effective pinhole focal length* fitted under a pinhole assumption, while the MEI
+`fx` is a projection parameter: Handheld1 has `fx = 758.3` with `xi = 1.583`, whose paraxial
+pinhole focal is only `fx / (1 + xi) ≈ 294`. An earlier revision stored `focal = 408` into `fx`
+and zeroed `xi`, which is equivalent to treating the raw fisheye frame as a pinhole image:
+`mx/mz = x` degenerates the pixel mapping to identity and bypasses distortion inversion, moving
+the valid-field mask from 54.7% to 99.8%. The **circular mechanical rim** of a fisheye lens is a
+high-contrast corner magnet, so GFTT piled features onto the rim, optical flow spent its tracking
+budget on edges that cannot be triangulated, and the trajectory scale came out more than 2× too
+large. Keeping `xi` lets `meiToPinhole`'s `mz <= 1e-6` and bounds checks reject the rim again.
 
 Inference needs a PyTorch environment: point `--python`, `MYSLAM_PYTHON` or the script's
 `MAST3R_PYTHON` at it (the conda `mast3r` env works), and pass the checkpoint with
@@ -475,10 +488,11 @@ Inference needs a PyTorch environment: point `--python`, `MYSLAM_PYTHON` or the 
 Two limits worth knowing:
 
 - MASt3R predicts a **pinhole** model, so on a >180° MEI fisheye it only yields an approximate
-  focal (Handheld1 lands anywhere in 380–460 px), and accuracy evaluation still needs the yaml
-  calibration;
-- estimation covers intrinsics only. The camera-IMU extrinsic `Tic` still comes from the built-in
-  value or a calibration file — MASt3R cannot provide it.
+  focal (Handheld1 lands anywhere in 400–500 px). It cannot recover `xi` or the distortion terms,
+  so a new sequence's lens characteristics still belong in `dataset.intrinsics`, and accuracy
+  evaluation still needs the yaml calibration;
+- estimation covers the focal length only. The camera-IMU extrinsic `Tic` likewise still comes from
+  the built-in value or a calibration file.
 
 Machines that already have an estimate can skip inference with `--intrinsics-file result.txt`
 (format documented in `src/dataset/intrinsics_file.hpp`):
@@ -486,13 +500,16 @@ Machines that already have an estimate can skip inference with `--intrinsics-fil
 ```
 model = pinhole
 source = mast3r
-fx = 461.81
-fy = 461.81
+focal = 495.90
 cx = 320.0
 cy = 240.0
 width = 640
 height = 480
 ```
+
+`focal` is the backend's virtual pinhole focal length, not the MEI `fx`. Any `xi`/`k1`/`k2`/`p1`/`p2`
+missing from the file is inherited from the configuration; writing `fx`/`fy` is rejected outright,
+which also invalidates caches produced by the earlier revision so they get recomputed.
 
 ### Visualization
 
@@ -559,7 +576,7 @@ ctest --test-dir build --output-on-failure
 | :--- | :--- |
 | `myslam_test` | Public API usable, keyframes produced, RMSE within threshold, derived step valid |
 | `myslam_config_test` | Parsing, clamping, cross-validation, unknown keys, quaternion normalization, failure paths, logging section effect, default-config self-consistency |
-| `myslam_intrinsics_test` | MASt3R intrinsics file: happy path, principal-point fallback, and rejection of missing fields, malformed numbers, non-pinhole models and out-of-frame principal points |
+| `myslam_intrinsics_test` | Intrinsics file: focal lands on the virtual pinhole, distortion inherited from the baseline, legacy `fx` fields rejected, principal-point fallback and malformed input rejected |
 
 CI (`.github/workflows/ci.yml`) runs format checking, a build, and the suite on Ubuntu with
 `g++-14`, pinning `clang-format` 23.1.3.

@@ -153,10 +153,12 @@ namespace
      *
      * @param dataDir 帧图像目录（cam_0）
      * @param options 估计参数
+     * @param baseline 基线标定；其 xi 与畸变系数会被继承
      * @return 估计结果；失败时给出可操作的说明
      */
     std::expected<myslam::dataset::IntrinsicsEstimate, std::string>
-    estimateIntrinsicsWithMast3r(const std::string &dataDir, const Mast3rOptions &options)
+    estimateIntrinsicsWithMast3r(const std::string &dataDir, const Mast3rOptions &options,
+                                 const myslam::dataset::MeiIntrinsics &baseline)
     {
         const std::filesystem::path frames(dataDir);
         std::filesystem::path cache = options.cache;
@@ -167,7 +169,7 @@ namespace
 
         if (!options.force && std::filesystem::is_regular_file(cache))
         {
-            auto cached = myslam::dataset::loadIntrinsicsFile(cache);
+            auto cached = myslam::dataset::loadIntrinsicsFile(cache, baseline);
             if (cached)
             {
                 std::fprintf(stderr, "[info] 复用 MASt3R 内参缓存: %s（--force-estimate 可重算）\n",
@@ -211,7 +213,7 @@ namespace
                             "git submodule update --init --recursive thirdparty/mast3r",
                             exitCode));
         }
-        return myslam::dataset::loadIntrinsicsFile(cache);
+        return myslam::dataset::loadIntrinsicsFile(cache, baseline);
     }
 
 } // namespace
@@ -553,8 +555,8 @@ int main(int argc, char **argv)
             return 2;
         }
         const std::expected<myslam::dataset::IntrinsicsEstimate, std::string> estimate =
-            intrinsicsFile.has_value() ? myslam::dataset::loadIntrinsicsFile(*intrinsicsFile)
-                                       : estimateIntrinsicsWithMast3r(dataDir, mast3rOptions);
+            intrinsicsFile.has_value() ? myslam::dataset::loadIntrinsicsFile(*intrinsicsFile, project.intrinsics)
+                                       : estimateIntrinsicsWithMast3r(dataDir, mast3rOptions, project.intrinsics);
         if (!estimate)
         {
             std::fprintf(stderr, "[error] %s\n", estimate.error().c_str());
@@ -565,10 +567,20 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "[warning] %s\n", warning.c_str());
         }
         intrinsics = estimate->intrinsics;
-        mylog::info("内参来源: {}（模型 {}），fx={:.2f} fy={:.2f} cx={:.2f} cy={:.2f}，画幅 {}x{}", estimate->source,
-                    estimate->model, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, intrinsics.imageWidth,
-                    intrinsics.imageHeight);
-        mylog::info("注意: 自动估计只覆盖内参，相机-IMU 外参 Tic 仍用内置/配置值");
+        mylog::info("内参来源: {}（模型 {}），虚拟针孔焦距 {:.2f} px，主点 ({:.2f}, {:.2f})，画幅 {}x{}",
+                    estimate->source, estimate->model, intrinsics.pinholeFx(), intrinsics.cx, intrinsics.cy,
+                    intrinsics.imageWidth, intrinsics.imageHeight);
+        if (estimate->inheritedDistortion)
+        {
+            mylog::info("畸变参数继承自配置: xi={:.4f}, k1={:.5f}, k2={:.5f}, 虚拟针孔缩放={:.4f}", intrinsics.xi,
+                        intrinsics.k1, intrinsics.k2, intrinsics.pinholeScale);
+        }
+        else
+        {
+            mylog::info("畸变参数取自估计文件: xi={:.4f}, k1={:.5f}, k2={:.5f}, 虚拟针孔缩放={:.4f}", intrinsics.xi,
+                        intrinsics.k1, intrinsics.k2, intrinsics.pinholeScale);
+        }
+        mylog::info("注意: 自动估计只覆盖焦距，相机-IMU 外参 Tic 仍用内置/配置值");
     }
 
     if (!intrinsics.isValid())

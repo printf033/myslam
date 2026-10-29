@@ -429,7 +429,20 @@ scripts/run_subt.sh --init mast3r          # 或 2_subt_dataset ... --init mast3
    用 `estimate_focal_knowing_depth` 从预测点图恢复焦距，主点取图像中心；
 2. 结果写成 `<cam_0>/../mast3r_intrinsics.txt` 并缓存，后续回放直接复用；
    `--force-estimate` 强制重算，`--mast3r-cache` 可改缓存位置；
-3. 解析后把 MEI 的 `xi` 与畸变置零、`pinholeScale` 置一，使去畸变路径退化为恒等映射。
+3. 解析后只把结果用于**虚拟针孔焦距**：`pinholeScale = focal / fx`，使后端的
+   `pinholeFx()` 等于估计值。`xi` 与 `k1/k2/p1/p2` **从配置的内参继承**，
+   鱼眼反投影照常进行——这一点很关键。
+
+#### 为什么不能直接把估计值当 fx 用
+
+估计值是从针孔假设下拟合出的**有效针孔焦距**，而 MEI 的 `fx` 是投影参数：
+Handheld1 的 `fx = 758.3`、`xi = 1.583`，其近轴等效针孔焦距只有
+`fx / (1 + xi) ≈ 294`。早期实现把 `focal = 408` 写进 `fx` 并把 `xi` 清零，
+等价于“把鱼眼原图当针孔图用”：`mx/mz = x` 使像素映射退化为恒等，畸变反解被旁路，
+有效视场掩码从 54.7% 变成 99.8%。鱼眼镜头的**圆形机械边框**是高对比度强角点，
+GFTT 于是把特征全堆在边框上，光流把跟踪预算花在无法三角化的边缘，轨迹尺度
+偏大一倍以上。保留 `xi` 后，`meiToPinhole` 的 `mz <= 1e-6` 与越界判据会把边框
+自动挡在掩码外。
 
 推理需要 PyTorch 环境：用 `--python`、`MYSLAM_PYTHON` 或 `scripts/run_subt.sh` 的
 `MAST3R_PYTHON` 指向它（例如 conda 的 `mast3r` 环境），权重用 `--mast3r-weights` 或
@@ -438,8 +451,9 @@ scripts/run_subt.sh --init mast3r          # 或 2_subt_dataset ... --init mast3
 两点限制：
 
 - MASt3R 输出的是**针孔模型**，对 >180° 视场的 MEI 鱼眼图只能给出近似焦距（实测 Handheld1
-  在 380–460 px 之间波动），需要准确内外参的精度评估仍应使用 yaml 标定值；
-- 自动估计只覆盖内参。相机-IMU 外参 `Tic` 仍需内置值或标定文件，MASt3R 无法给出。
+  在 400–500 px 之间波动）。它无法恢复 `xi` 或畸变系数，因此新序列的镜头特性仍需在
+  `dataset.intrinsics` 中说明；需要准确内外参的精度评估仍应使用 yaml 标定值；
+- 自动估计只覆盖焦距。相机-IMU 外参 `Tic` 同样仍需内置值或标定文件。
 
 已有估计结果的机器可以跳过推理，直接 `--intrinsics-file result.txt`（格式见
 `src/dataset/intrinsics_file.hpp`）：
@@ -447,13 +461,15 @@ scripts/run_subt.sh --init mast3r          # 或 2_subt_dataset ... --init mast3
 ```
 model = pinhole
 source = mast3r
-fx = 461.81
-fy = 461.81
+focal = 495.90
 cx = 320.0
 cy = 240.0
 width = 640
 height = 480
 ```
+
+`focal` 是后端虚拟针孔焦距，不是 MEI 的 `fx`。文件中未出现的 `xi`/`k1`/`k2`/`p1`/`p2`
+一律从配置继承；写了 `fx`/`fy` 会被拒绝（旧版缓存因此会自动失效并重算）。
 
 ### 可视化
 
@@ -518,7 +534,7 @@ ctest --test-dir build --output-on-failure
 | :--- | :--- |
 | `myslam_test` | 公开 API 可用、关键帧非空、RMSE 在门限内、派生步长有效 |
 | `myslam_config_test` | 解析、钳位、交叉校验、未知键、四元数单位化、失败路径、日志节生效、默认配置自洽 |
-| `myslam_intrinsics_test` | MASt3R 内参文件解析：正常路径、缺失主点回退、缺字段/非法数值/非针孔模型/主点越界的拒绝 |
+| `myslam_intrinsics_test` | 内参估计文件：focal 落到虚拟针孔、畸变从基线继承、旧版 fx 字段被拒、主点回退与各类非法输入 |
 
 CI（`.github/workflows/ci.yml`）在 Ubuntu 上使用 `g++-14` 执行格式检查、构建与测试，
 `clang-format` 固定为 23.1.3。
