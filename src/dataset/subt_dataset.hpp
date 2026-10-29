@@ -19,7 +19,7 @@
  */
 
 #include "logger.hpp"
-#include "vio/params.hpp"
+#include "vio/configHolder.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cmath>

@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * @file types.hpp
+ * @file configHolder.hpp
  * @brief 数据集回放的纯数据配置与统计结构（不含 OpenCV 依赖）。
  *
  * 这些结构之所以从各自实现文件中抽离，是为了让不依赖 OpenCV 的代码
@@ -91,9 +91,19 @@ namespace myslam::dataset
         std::size_t keyframes{0};
         std::size_t imuSamples{0};
         std::size_t resets{0};
+        /// 后端在求解失败后完成局部恢复（重建平滑器但保留坐标系）的关键帧数。
+        /// 这些帧不产出新位姿，但轨迹坐标保持连续 —— 与 @c resets 有本质区别：
+        /// @c resets 会让坐标系归零，本字段代表的失败不会。
+        std::size_t recoveredFrames{0};
         bool initialized{false};
         double elapsedSeconds{0.0};
+        /// 实际回放到的时间跨度 (s)。中途退出时是已处理进度，不是序列总长。
         double durationSeconds{0.0};
+        /// 视觉观测中断（图像变暗/遮挡/无纹理）期间的关键帧数。这些帧不重建
+        /// 流水线，坐标系保持连续，仅靠 IMU 维持轨迹 —— 与 @c resets 无关。
+        std::size_t visualOutageFrames{0};
+        /// 视觉中断告警是否已上报（只在首次中断时打一条，避免刷屏）
+        bool visualOutageReported{false};
         /// 处理过的流水线段数。每段因 IMU 断档或优化失败而重建，各自从局部
         /// 原点重新初始化，坐标系互不相同，轨迹不可跨段直接拼接。
         std::size_t segments{0};

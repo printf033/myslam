@@ -24,9 +24,16 @@ endif()
 # optional Lua configuration layer requires LuaJIT. Exposing the include path
 # through an INTERFACE target keeps dependants free of raw include paths and
 # lets a future toolchain switch replace this wrapper with mylog::mylog.
+#
+# Both thirdparty/ itself and mylog's src/ directory are on the include path:
+# mylog headers include each other by bare file name ("fileManager.hpp"),
+# while consumers spell mylog-owned headers with the `mylog/` prefix
+# (#include <mylog/src/lua_config.hpp>) so they cannot be shadowed by
+# same-named myslam headers such as src/lua_config.hpp.
 add_library(myslam_mylog INTERFACE)
 add_library(myslam::mylog ALIAS myslam_mylog)
 
 target_include_directories(myslam_mylog INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/mylog/src>
 )

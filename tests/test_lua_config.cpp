@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <unistd.h>
 
@@ -74,6 +75,45 @@ namespace
     }
 
     /**
+     * @brief 在加载期间把 stderr 重定向到文件，返回捕获到的文本
+     *
+     * 配置层用 stderr 输出诊断，而“不该有告警”这类断言必须看到真实的
+     * 输出才能成立——只断言数值生效会漏掉“值生效了但同时在报假警”。
+     */
+    template <typename Fn>
+    std::string captureStderr(Fn &&fn)
+    {
+        const std::filesystem::path logPath =
+            std::filesystem::temp_directory_path() / ("myslam_cfg_stderr_" + std::to_string(::getpid()) + ".txt");
+        std::fflush(stderr);
+        const int savedFd = ::dup(::fileno(stderr));
+
+        if (std::freopen(logPath.string().c_str(), "w", stderr) == nullptr)
+        {
+            if (savedFd >= 0)
+            {
+                ::close(savedFd);
+            }
+            return {};
+        }
+
+        fn();
+
+        std::fflush(stderr);
+        if (savedFd >= 0)
+        {
+            ::dup2(savedFd, ::fileno(stderr));
+            ::close(savedFd);
+        }
+
+        std::ifstream in(logPath);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        std::filesystem::remove(logPath);
+        return text;
+    }
+
+    /**
      * @brief 合法脚本应覆盖对应字段，未出现的字段保持默认
      */
     void checkOverrides()
@@ -107,31 +147,65 @@ system = { totalDuration = 1.25, cameraDt = 0.05 }
     }
 
     /**
-     * @brief 越界与非法类型不应让配置失败，而是钳位或忽略
+     * @brief 数值越界应钳位（意图清楚，只是量级错）；类型错误必须判失败
+     *
+     * 两者性质不同：@c minTrackingRatio = 3.5 的意图是“要求更严的留存率”，
+     * 钳到 1.0 不会误导；而 @c cameraDt = "0.05"（从 YAML 拷来的带引号数字）
+     * 如果静默保留默认值，用户会以为参数已生效，排障时直接走错方向。
      */
     void checkClampingAndTypes()
     {
-        const auto path = writeLua("clamp", R"(
+        // 纯越界：钳位，配置仍然有效
+        const auto clampPath = writeLua("clamp", R"(
 vio = {
     minTrackingRatio = 3.5,
     maxSlidingWindowSize = 0,
-    fx = "not a number",
-    fy = 0 / 0,
     gravityMagnitude = -1.0,
 }
 system = { cameraDt = 0.05 }
 )");
 
-        myslam::config::ProjectConfig config;
-        const auto report = loadFrom(path, config);
-        std::filesystem::remove(path);
+        myslam::config::ProjectConfig clampConfig;
+        const auto clampReport = loadFrom(clampPath, clampConfig);
+        std::filesystem::remove(clampPath);
 
-        expectTrue(succeeded(report), "越界值钳位后配置仍然有效");
-        expectNear(config.vio.minTrackingRatio, 1.0, "minTrackingRatio 钳位到上界 1.0");
-        expectTrue(config.vio.maxSlidingWindowSize == 1, "maxSlidingWindowSize 钳位到下界 1");
-        expectNear(config.vio.fx, 460.0, "字符串字段被忽略并保持默认");
-        expectNear(config.vio.fy, 460.0, "NaN 字段被忽略并保持默认");
-        expectNear(config.vio.gravityMagnitude, 1e-3, "负重力钳位到下界");
+        expectTrue(succeeded(clampReport), "越界值钳位后配置仍然有效");
+        expectNear(clampConfig.vio.minTrackingRatio, 1.0, "minTrackingRatio 钳位到上界 1.0");
+        expectTrue(clampConfig.vio.maxSlidingWindowSize == 1, "maxSlidingWindowSize 钳位到下界 1");
+        expectNear(clampConfig.vio.gravityMagnitude, 1e-3, "负重力钳位到下界");
+
+        // 类型错误：必须失败（钳位族字段也一样）
+        const auto stringPath = writeLua("type-string", R"(
+vio = { fx = "not a number" }
+)");
+        myslam::config::ProjectConfig stringConfig;
+        const auto stringReport = loadFrom(stringPath, stringConfig);
+        std::filesystem::remove(stringPath);
+        expectTrue(!succeeded(stringReport), "字符串类型的数值字段被判失败（不得静默保持默认）");
+
+        const auto nanPath = writeLua("type-nan", R"(
+vio = { fy = 0 / 0 }
+)");
+        myslam::config::ProjectConfig nanConfig;
+        const auto nanReport = loadFrom(nanPath, nanConfig);
+        std::filesystem::remove(nanPath);
+        expectTrue(!succeeded(nanReport), "NaN 数值字段被判失败");
+
+        const auto boolPath = writeLua("type-bool", R"(
+vio = { postOptOutlierMarking = "yes" }
+)");
+        myslam::config::ProjectConfig boolConfig;
+        const auto boolReport = loadFrom(boolPath, boolConfig);
+        std::filesystem::remove(boolPath);
+        expectTrue(!succeeded(boolReport), "非布尔的布尔字段被判失败");
+
+        const auto sysPath = writeLua("type-system", R"(
+system = { cameraDt = "0.05" }
+)");
+        myslam::config::ProjectConfig sysConfig;
+        const auto sysReport = loadFrom(sysPath, sysConfig);
+        std::filesystem::remove(sysPath);
+        expectTrue(!succeeded(sysReport), "system 节的类型错误同样判失败");
     }
 
     /**
@@ -329,7 +403,7 @@ vio = { minKeyframeInterval = 0.5, maxKeyframeInterval = 0.2 }
      */
     void checkShippedConfig()
     {
-        const std::filesystem::path candidates[] = {"config/myslam.lua", "../config/myslam.lua"};
+        const std::filesystem::path candidates[] = {"config/config.lua", "../config/config.lua"};
         std::filesystem::path found;
         for (const auto &candidate : candidates)
         {
@@ -339,7 +413,7 @@ vio = { minKeyframeInterval = 0.5, maxKeyframeInterval = 0.2 }
                 break;
             }
         }
-        expectTrue(!found.empty(), "找到仓库自带的 config/myslam.lua");
+        expectTrue(!found.empty(), "找到仓库自带的 config/config.lua");
         if (found.empty())
         {
             return;
@@ -421,6 +495,355 @@ dataset = { intrinsics = { fx = 0.0 } }
 
 } // namespace
 
+/* =============================================================================
+ * 以下是针对已修复缺陷的回归用例。每个用例都对应一个曾经真实发生过的
+ * 故障（崩溃、静默劣化、假成功或假告警），失败即意味着缺陷回流。
+ * ========================================================================== */
+namespace
+{
+    /**
+     * @brief 回归：零噪声配置必须被拒（不得静默钳位）
+     *
+     * 0 不是“无噪声”：仿真器会把 0 传给 std::normal_distribution（σ 必须 > 0，
+     * libstdc++ 断言 abort）；因子图侧 Isotropic::Sigma(…, 0) 给出无穷信息矩阵，
+     * gtsam 抛 IndeterminateSystemException。两者都能直接杀死进程。
+     *
+     * 即使钳到 1e-12 也不够：信息矩阵会到 1e18 量级，Cholesky 仍然失败
+     * （实测会产生大量 “Partial Cholesky on HessianFactor failed”）。
+     * 因此与 fx = 0 一样按“不允许自动纠正”处理，而不是洗成一个魔法数值。
+     */
+    void checkZeroNoiseRejected()
+    {
+        const char *const fields[] = {"accelNoiseSigma", "gyroNoiseSigma", "accelBiasRw", "gyroBiasRw",
+                                      "pixelNoiseSigma"};
+        for (const char *field : fields)
+        {
+            const auto path =
+                writeLua(std::string("zero-noise-") + field, std::string("vio = { ") + field + " = 0.0 }\n");
+            myslam::config::ProjectConfig config;
+            const auto report = loadFrom(path, config);
+            std::filesystem::remove(path);
+            expectTrue(!succeeded(report), (std::string("零值被拒绝: ") + field).c_str());
+        }
+
+        // 极小但物理上合理的噪声仍应被接受，否则会误伤正常配置
+        const auto tiny = writeLua("tiny-noise", R"(
+vio = { pixelNoiseSigma = 0.01, accelNoiseSigma = 0.001 }
+)");
+        myslam::config::ProjectConfig tinyConfig;
+        const auto tinyReport = loadFrom(tiny, tinyConfig);
+        std::filesystem::remove(tiny);
+        expectTrue(succeeded(tinyReport), "小但合理的噪声值被接受");
+        expectNear(tinyConfig.vio.pixelNoiseSigma, 0.01, "pixelNoiseSigma 小值原样生效");
+    }
+
+    /**
+     * @brief 回归：超大整数必须钳到上界，不能因转换 UB 反转成下界
+     *
+     * 旧实现先 static_cast<long long>(1e300) 再钳位，转换本身是 UB，
+     * x86-64 上得到 INT64_MIN，于是 maxFrames 被钳到 0 = “不限”，
+     * 与“极大上限”的意图正好相反。
+     */
+    void checkHugeIntegerClampsUp()
+    {
+        const auto path = writeLua("huge-int", R"(
+dataset = { replay = { maxFrames = 1e300, startFrame = 1e300 } }
+)");
+
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+
+        expectTrue(succeeded(report), "超大整数被钳位后配置仍然有效");
+        expectTrue(config.replay.maxFrames > 0, "maxFrames 钳到上界而不是反转成 0（0 意为不限）");
+        expectTrue(config.replay.maxFrames == 10'000'000, "maxFrames 钳到上界 1e7");
+        expectTrue(config.replay.startFrame == 10'000'000, "startFrame 钳到上界 1e7");
+
+        // 下方向同样要正确：负值应钳到 0，而不是乱七八糟的极值
+        const auto negPath = writeLua("neg-int", R"(
+dataset = { replay = { maxFrames = -1e300 } }
+)");
+        myslam::config::ProjectConfig negConfig;
+        const auto negReport = loadFrom(negPath, negConfig);
+        std::filesystem::remove(negPath);
+        expectTrue(succeeded(negReport), "极小整数被钳位后配置仍然有效");
+        expectTrue(negConfig.replay.maxFrames == 0, "负无穷钳到上界 0");
+    }
+
+    /**
+     * @brief 回归：固定滞后窗口小于关键帧间隔必须判非法
+     *
+     * 窗口为 0 时每帧进来就立即边缘化，活跃关键帧恒为 1，实测 RMSE
+     * 从 0.04 m 恶化到 0.18 m，而旧实现完全静默。
+     */
+    void checkSlidingWindowLagGuarded()
+    {
+        const auto zeroPath = writeLua("lag-zero", R"(
+vio = { slidingWindowLag = 0.0 }
+)");
+        myslam::config::ProjectConfig zeroConfig;
+        const auto zeroReport = loadFrom(zeroPath, zeroConfig);
+        std::filesystem::remove(zeroPath);
+        // 0 先被钳到 1e-3，再因小于 maxKeyframeInterval(0.45) 被交叉校验拒绝
+        expectTrue(!succeeded(zeroReport), "slidingWindowLag = 0 被拒绝（不允许静默退化为单帧）");
+
+        const auto tooShort = writeLua("lag-short", R"(
+vio = { slidingWindowLag = 0.2, maxKeyframeInterval = 0.45 }
+)");
+        myslam::config::ProjectConfig shortConfig;
+        const auto shortReport = loadFrom(tooShort, shortConfig);
+        std::filesystem::remove(tooShort);
+        expectTrue(!succeeded(shortReport), "窗口短于关键帧间隔被拒绝");
+
+        const auto ok = writeLua("lag-ok", R"(
+vio = { slidingWindowLag = 1.6, maxKeyframeInterval = 0.45 }
+)");
+        myslam::config::ProjectConfig okConfig;
+        const auto okReport = loadFrom(ok, okConfig);
+        std::filesystem::remove(ok);
+        expectTrue(succeeded(okReport), "合理的窗口配置被接受");
+    }
+
+    /**
+     * @brief 回归：状态栏高度为 0、画幅过大、主点越界都必须拦住
+     */
+    void checkVisualAndGeometryGuards()
+    {
+        const auto panel = writeLua("panel-zero", R"(
+dataset = { viz = { showWindow = true, panelHeight = 0 } }
+)");
+        myslam::config::ProjectConfig panelConfig;
+        const auto panelReport = loadFrom(panel, panelConfig);
+        std::filesystem::remove(panel);
+        expectTrue(succeeded(panelReport), "panelHeight = 0 钳位后配置仍然有效");
+        expectTrue(panelConfig.replay.viz.panelHeight >= 1, "panelHeight 钳到下界 1（0 行的 Mat 会断言失败）");
+
+        // 逐维合法但像素总数失控：1e10 像素会让 cv::Mat::zeros 直接 bad_alloc
+        const auto huge = writeLua("huge-frame", R"(
+dataset = { intrinsics = { imageWidth = 100000, imageHeight = 100000 } }
+)");
+        myslam::config::ProjectConfig hugeConfig;
+        const auto hugeReport = loadFrom(huge, hugeConfig);
+        std::filesystem::remove(huge);
+        expectTrue(!succeeded(hugeReport), "画幅像素总数超过上限被拒绝");
+
+        // 主点落在画幅外：全部重投影都会越界
+        const auto principal = writeLua("principal-out", R"(
+vio = { imageWidth = 640.0, imageHeight = 480.0, cx = 900.0 }
+)");
+        myslam::config::ProjectConfig principalConfig;
+        const auto principalReport = loadFrom(principal, principalConfig);
+        std::filesystem::remove(principal);
+        expectTrue(!succeeded(principalReport), "主点越出画幅被拒绝");
+    }
+
+    /**
+     * @brief 路标深度有效区间：默认值、可配置性，以及反转区间必须被拒绝
+     *
+     * 深度区间是几何有效性判据（见 VioBackend 预优化门控）。它一旦被配反，
+     * 后端会静默丢弃全部视觉观测，退化成纯 IMU 积分而不报任何错误——正是
+     * 那种“跑得通但结果全错”的失效模式，因此必须在这里拦住。
+     */
+    void checkLandmarkDepthConfig()
+    {
+        const myslam::vio::VioConfig defaults;
+        expectNear(defaults.minLandmarkDepth, 0.3, "默认深度下限为 0.3 m");
+        expectNear(defaults.maxLandmarkDepth, 20.0, "默认深度上限为 20.0 m");
+        expectTrue(defaults.minLandmarkDepth < defaults.maxLandmarkDepth, "默认深度区间非空");
+
+        const auto path = writeLua("depth-override", R"(
+vio = { minLandmarkDepth = 0.5, maxLandmarkDepth = 12.5 }
+)");
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+        expectTrue(succeeded(report), "合法的深度区间配置解析成功");
+        expectNear(config.vio.minLandmarkDepth, 0.5, "vio.minLandmarkDepth 覆盖生效");
+        expectNear(config.vio.maxLandmarkDepth, 12.5, "vio.maxLandmarkDepth 覆盖生效");
+
+        // 反转：max <= min 时区间为空，全部观测都会被判几何无效
+        const auto reversed = writeLua("depth-reversed", R"(
+vio = { minLandmarkDepth = 5.0, maxLandmarkDepth = 2.0 }
+)");
+        myslam::config::ProjectConfig reversedConfig;
+        const auto reversedReport = loadFrom(reversed, reversedConfig);
+        std::filesystem::remove(reversed);
+        expectTrue(!succeeded(reversedReport), "深度区间反转时配置被拒绝");
+
+        // 相等同样使区间为空：这是边界，不能因为“不小于”就放行
+        const auto equal = writeLua("depth-equal", R"(
+vio = { minLandmarkDepth = 3.0, maxLandmarkDepth = 3.0 }
+)");
+        myslam::config::ProjectConfig equalConfig;
+        const auto equalReport = loadFrom(equal, equalConfig);
+        std::filesystem::remove(equal);
+        expectTrue(!succeeded(equalReport), "深度上下限相等时配置被拒绝");
+    }
+
+    /**
+     * @brief 回归：strict 字段的类型错误不能被当成“字段缺失”而静默放行
+     *
+     * 旧实现下 dataset.intrinsics.fx = "758.3"（YAML 拷来的带引号数字）会静默
+     * 保留默认值并通过加载，与 fx = 0 被判非法的行为不一致。
+     */
+    void checkStrictTypeErrors()
+    {
+        const auto str = writeLua("strict-str", R"(
+dataset = { intrinsics = { fx = "758.3" } }
+)");
+        myslam::config::ProjectConfig strConfig;
+        const auto strReport = loadFrom(str, strConfig);
+        std::filesystem::remove(str);
+        expectTrue(!succeeded(strReport), "strict 字段的字符串类型被拒绝");
+
+        const auto nan = writeLua("strict-nan", R"(
+dataset = { intrinsics = { fy = 0 / 0 } }
+)");
+        myslam::config::ProjectConfig nanConfig;
+        const auto nanReport = loadFrom(nan, nanConfig);
+        std::filesystem::remove(nan);
+        expectTrue(!succeeded(nanReport), "strict 字段的 NaN 被拒绝");
+
+        // 字段真的缺失时必须仍然放行（保留默认值）
+        const auto missing = writeLua("strict-missing", R"(
+dataset = { intrinsics = { cx = 318.0 } }
+)");
+        myslam::config::ProjectConfig missingConfig;
+        const auto missingReport = loadFrom(missing, missingConfig);
+        std::filesystem::remove(missing);
+        expectTrue(succeeded(missingReport), "strict 字段缺失时保留默认值并放行");
+    }
+
+    /**
+     * @brief 回归：字节码配置必须被拒（沙箱前提）
+     *
+     * luaL_loadfile 默认 mode 为 "bt"，会执行 LuaJIT 预编译字节码；
+     * 字节码不做任何校验，是官方明示的内存不安全入口。这里用伪造的
+     * "\x1bLJ" 头验证 loader 已限制为仅文本。
+     */
+    void checkBytecodeRejected()
+    {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / ("myslam_cfg_bytecode_" + std::to_string(::getpid()) + ".lua");
+        {
+            std::ofstream out(path, std::ios::binary);
+            // LuaJIT 字节码魔数：ESC 'L' 'J' 加版本号
+            const unsigned char header[] = {0x1b, 0x4c, 0x4a, 0x01, 0x00};
+            out.write(reinterpret_cast<const char *>(header), sizeof(header));
+            out << "\x01\x00\x00\x00";
+        }
+
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+
+        expectTrue(!succeeded(report), "预编译字节码配置被拒绝");
+        if (!report)
+        {
+            expectTrue(report.error().kind == myslam::config::ConfigErrorKind::LuaRuntime,
+                       "字节码被拒时归类为 LuaRuntime");
+            // 关键区分：只看“加载失败”不够——一个截断的垃圾 chunk 在任何 mode
+            // 下都会失败，那样测试在修复前后都成立，等于没测。必须验证失败原因
+            // 是 loader 的“模式不被接受”，而不是“字节码内容坏”。
+            const std::string what = report.error().message;
+            const bool rejectedByMode = what.find("mode") != std::string::npos;
+            expectTrue(rejectedByMode, "拒绝原因必须是 loader mode 限制，而非字节码内容错");
+            if (!rejectedByMode)
+            {
+                std::fprintf(stderr, "  实际错误信息: %s\n", what.c_str());
+            }
+        }
+
+        // 对照：纯文本源码必须正常接受，证明 loader 本身没被改坏
+        const auto textPath = writeLua("bytecode-control", R"(
+vio = { fx = 500.0 }
+)");
+        myslam::config::ProjectConfig textConfig;
+        const auto textReport = loadFrom(textPath, textConfig);
+        std::filesystem::remove(textPath);
+        expectTrue(succeeded(textReport), "文本源码仍被正常接受（对照）");
+        expectNear(textConfig.vio.fx, 500.0, "文本源码的值生效（对照）");
+    }
+
+    /**
+     * @brief 回归：仓库自带配置不得产生任何诊断告警
+     *
+     * maxImuGapFactor 曾经被解析但漏登记到 known 列表，导致每次启动都打印
+     * “未知字段（拼写错误？）”——而该值实际生效。这类假告警会训练用户
+     * 忽略真告警，比不报警更危险。
+     */
+    void checkShippedConfigIsSilent()
+    {
+        std::filesystem::path shipped;
+        for (const char *candidate : {"config/config.lua", "../config/config.lua", "../../config/config.lua"})
+        {
+            if (std::filesystem::is_regular_file(candidate))
+            {
+                shipped = candidate;
+                break;
+            }
+        }
+        if (shipped.empty())
+        {
+            std::printf("SKIP: 未找到仓库自带配置，跳过零告警检查\n");
+            return;
+        }
+
+        myslam::config::ProjectConfig config;
+        myslam::config::LoadResult report =
+            std::unexpected(myslam::config::ConfigError{myslam::config::ConfigErrorKind::FileNotFound, "not loaded"});
+        const std::string captured = captureStderr([&] { report = loadFrom(shipped, config); });
+
+        expectTrue(succeeded(report), "仓库自带配置能被正确加载");
+        expectTrue(captured.empty(), "仓库自带配置加载时不产生任何 stderr 诊断");
+        if (!captured.empty())
+        {
+            std::fprintf(stderr, "  实际 stderr 输出:\n%s\n", captured.c_str());
+        }
+    }
+
+    /**
+     * @brief 回归：无日志节的脚本不得把 logging 报成 true
+     *
+     * mylog::reloadConfig 对“两个节都不存在”的脚本也返回 true，旧实现据此
+     * 把 LoadReport::logging 置为 true 并静默把输出后端换成文件——配置里根本
+     * 没有日志配置，stdout 上的日志却消失了。
+     */
+    void checkLoggingFlagRequiresSection()
+    {
+        const auto noLog = writeLua("no-logging", R"(
+vio = { fx = 460.0 }
+)");
+        myslam::config::ProjectConfig config;
+        const auto report = myslam::config::load(noLog, config, /*applyLogging=*/true);
+        std::filesystem::remove(noLog);
+
+        expectTrue(succeeded(report), "无日志节的配置加载成功");
+        if (report)
+        {
+            expectTrue(!report->logging, "脚本没有日志节时 logging 必须为 false");
+        }
+    }
+
+    /**
+     * @brief 回归：system.initTimeout 可配置且有合法默认值
+     */
+    void checkInitTimeout()
+    {
+        expectTrue(myslam::vio::SystemConfig{}.initTimeout > 0.0, "初始化超时默认为正数");
+
+        const auto path = writeLua("init-timeout", R"(
+system = { initTimeout = 3.5 }
+)");
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+        expectTrue(succeeded(report), "initTimeout 可配置");
+        expectNear(config.system.initTimeout, 3.5, "system.initTimeout 覆盖生效");
+    }
+
+} // namespace
+
 int main()
 {
     myslam::LogConfig logConfig;
@@ -437,6 +860,18 @@ int main()
     checkLoggingSection();
     checkShippedConfig();
     checkDatasetSection();
+
+    // 针对已修复缺陷的回归用例
+    checkZeroNoiseRejected();
+    checkHugeIntegerClampsUp();
+    checkSlidingWindowLagGuarded();
+    checkVisualAndGeometryGuards();
+    checkLandmarkDepthConfig();
+    checkStrictTypeErrors();
+    checkBytecodeRejected();
+    checkShippedConfigIsSilent();
+    checkLoggingFlagRequiresSection();
+    checkInitTimeout();
 
     if (g_failures == 0)
     {

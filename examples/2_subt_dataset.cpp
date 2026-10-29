@@ -19,7 +19,7 @@
 #include "log_config.hpp"
 #include "logger.hpp"
 #include "lua_config.hpp"
-#include "vio/params.hpp"
+#include "vio/configHolder.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +29,7 @@
 #include <format>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
+#include <optional>
 #include <string>
 
 #if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
@@ -51,10 +52,10 @@ namespace
                      "                     [--cy F] [--xi F] [--k1 F] [--k2 F] [--p1 F] [--p2 F]\n"
                      "                     [--width W] [--height H] [--ply cloud.ply]\n"
                      "                     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R]\n"
-                     "                     [--config config/myslam.lua]\n"
+                     "                     [--config config/config.lua]\n"
                      "\n"
                      "--config 指定的文件作为默认值基线，命令行参数优先；未指定时尝试读取\n"
-                     "当前目录的 config/myslam.lua（不存在则全部用内置默认值）。\n");
+                     "当前目录的 config/config.lua（不存在则全部用内置默认值）。\n");
     }
 
     bool parseDouble(const char *value, double &out)
@@ -80,9 +81,9 @@ namespace
 
 int main(int argc, char **argv)
 {
-    // 配置文件先行解析：--config 显式指定，否则尝试读当前目录的 config/myslam.lua。
+    // 配置文件先行解析：--config 显式指定，否则尝试读当前目录的 config/config.lua。
     // 必须在 main 开头扫描一遍，因为配置是 CLI 参数的基线默认值。
-    std::filesystem::path configPath = "config/myslam.lua";
+    std::filesystem::path configPath = "config/config.lua";
     bool explicitConfig = false;
     for (int i = 1; i + 1 < argc; ++i)
     {
@@ -134,7 +135,10 @@ int main(int argc, char **argv)
     std::string dataDir;
     std::string imuPath;
     std::string stampPath;
-    std::string outputPath;
+    // 输出路径以配置为基线；命令行显式给出时才能覆盖。原先无条件赋给
+    // runConfig.outputTum，未传 --output 时会把配置里的值静默清空。
+    const std::string outputFromConfig = project.replay.outputTum.string();
+    std::optional<std::string> outputOverride;
     // 配置作为基线，下面的命令行分支逐项覆盖
     myslam::dataset::MeiIntrinsics intrinsics = project.intrinsics;
     myslam::dataset::DatasetRunConfig runConfig = project.replay;
@@ -183,7 +187,7 @@ int main(int argc, char **argv)
         }
         else if (arg == "--output")
         {
-            outputPath = value;
+            outputOverride = value;
         }
         else if (arg == "--start-frame")
         {
@@ -284,6 +288,45 @@ int main(int argc, char **argv)
         ++i;
     }
 
+    // 范围校验：parseInt/parseDouble 只保证“可解析”，不保证语义合法。
+    // 例如 --max-features 0 会变成 OpenCV 的“不限制”，与本程序的“每帧上限”
+    // 语义相反，必须在这里拦住。
+    auto failRange = [](const char *what, long long value, long long lo, long long hi)
+    {
+        std::fprintf(stderr, "参数 %s 的取值 %lld 超出区间 [%lld, %lld]\n", what, value, lo, hi);
+        return 2;
+    };
+    if (runConfig.startFrame < 0)
+    {
+        return failRange("--start-frame", runConfig.startFrame, 0, 10'000'000);
+    }
+    if (runConfig.maxFrames < 0)
+    {
+        return failRange("--max-frames", runConfig.maxFrames, 0, 10'000'000);
+    }
+    if (runConfig.stride < 1)
+    {
+        return failRange("--stride", runConfig.stride, 1, 10'000);
+    }
+    if (runConfig.maxFeatures < 1)
+    {
+        return failRange("--max-features", runConfig.maxFeatures, 1, 1'000'000);
+    }
+    if (runConfig.viz.displayStride < 1)
+    {
+        return failRange("--viz-stride", runConfig.viz.displayStride, 1, 10'000);
+    }
+    if (!(runConfig.maxDuration >= 0.0) || runConfig.maxDuration > 86'400.0)
+    {
+        std::fprintf(stderr, "参数 --max-duration 的取值 %f 超出区间 [0, 86400]\n", runConfig.maxDuration);
+        return 2;
+    }
+    if (!(runConfig.viz.playbackRate >= 0.0) || runConfig.viz.playbackRate > 100.0)
+    {
+        std::fprintf(stderr, "参数 --viz-rate 的取值 %f 超出区间 [0, 100]\n", runConfig.viz.playbackRate);
+        return 2;
+    }
+
     if (dataDir.empty() || imuPath.empty() || stampPath.empty())
     {
         std::fprintf(stderr, "--data、--imu、--stamps 均为必填参数\n");
@@ -296,7 +339,9 @@ int main(int argc, char **argv)
                      intrinsics.imageWidth, intrinsics.imageHeight);
         return 2;
     }
-    runConfig.outputTum = outputPath;
+    // 命令行覆盖优先，否则沿用配置值
+    runConfig.outputTum =
+        outputOverride.has_value() ? std::filesystem::path(*outputOverride) : std::filesystem::path(outputFromConfig);
 
     myslam::dataset::SubtSequence sequence(dataDir, imuPath, stampPath);
     if (const auto loadedSequence = sequence.load(); !loadedSequence)
@@ -306,8 +351,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // 后端使用针孔模型重投影，内参必须与去畸变后的虚拟针孔像素坐标一致
-    myslam::vio::VioConfig vioConfig;
+    // 后端使用针孔模型重投影，内参必须与去畸变后的虚拟针孔像素坐标一致。
+    // 以配置文件的 vio 节为基线再覆盖——原先直接 default 构造 VioConfig，
+    // 导致 config/config.lua 里所有 vio.* 参数（门限、窗口、噪声、Huber…）
+    // 在这条回放路径上全部静默失效。
+    myslam::vio::VioConfig vioConfig = project.vio;
     vioConfig.fx = intrinsics.pinholeFx();
     vioConfig.fy = intrinsics.pinholeFy();
     vioConfig.cx = intrinsics.pinholeCx();
@@ -323,6 +371,15 @@ int main(int argc, char **argv)
     {
         runConfig.viz.videoFps = static_cast<int>(std::lround(cameraRate));
     }
+
+    // IMU 实际采样率以序列为准：它同时决定噪声离散化与断档判定周期。
+    // （回放不用 SystemConfig：主循环由相机时间戳驱动，不由定时器驱动。）
+
+    mylog::info("[回放配置] 外点门限 软/硬/预优化 = {:.1f}/{:.1f}/{:.1f} px, 关键帧视差 {:.1f} px, "
+                "固定滞后窗口 {:.2f}s, Huber delta {:.3f}",
+                vioConfig.maxReprojectionError, vioConfig.maxReprojectionErrorHard,
+                vioConfig.maxReprojectionErrorPreopt, vioConfig.minParallaxPx, vioConfig.slidingWindowLag,
+                vioConfig.huberLossDelta);
 
     // SubT Handheld1 的 T_imu_cam（相机在 IMU 系下的位姿）
     vioConfig.bodyPSensor = gtsam::Pose3(gtsam::Rot3(-0.04279531, -0.00237969, 0.99908103, -0.99880330, -0.02359508,

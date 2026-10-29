@@ -8,7 +8,7 @@
  *
  * 用法：
  * @code
- * 1_visual_inertial_odometry                  # 读取 config/myslam.lua，缺失则用内置默认值
+ * 1_visual_inertial_odometry                  # 读取 config/config.lua，缺失则用内置默认值
  * 1_visual_inertial_odometry my_config.lua    # 显式指定配置，加载或校验失败即退出
  * @endcode
  */
@@ -40,7 +40,7 @@ int main(int argc, char **argv)
 {
     const bool explicitConfig = argc > 1;
     const std::filesystem::path configPath =
-        explicitConfig ? std::filesystem::path(argv[1]) : std::filesystem::path("config/myslam.lua");
+        explicitConfig ? std::filesystem::path(argv[1]) : std::filesystem::path("config/config.lua");
 
     myslam::config::ProjectConfig project;
     const bool configFileExists = std::filesystem::is_regular_file(configPath);
@@ -82,6 +82,14 @@ int main(int argc, char **argv)
     const myslam::vio::RunReport runReport = system.run();
 
     mylog::info("================================================================================");
+    if (!runReport.initialized)
+    {
+        mylog::error("❌ VIO 最小系统未能完成初始化，本次运行没有可评估的轨迹。");
+        mylog::info("================================================================================");
+        myslam::flushLogging();
+        return 1;
+    }
+
     mylog::info("✅ VIO 最小系统全流程示例演示完毕。");
     mylog::info("   关键帧样本 {} 帧, 平移 RMSE {:.4f} m, 最大偏差 {:.4f} m", runReport.keyframeCount, runReport.rmse,
                 runReport.maxError);
@@ -89,5 +97,7 @@ int main(int argc, char **argv)
 
     myslam::flushLogging();
 
-    return runReport.rmse < project.system.rmseThreshold ? 0 : 1;
+    // 未初始化时 rmse 保持 0，会把“没有任何结果”误判为“完美精度”，
+    // 因此判定统一走 isAcceptable（同时检查 initialized 与关键帧数）。
+    return myslam::vio::isAcceptable(runReport, project.system.rmseThreshold) ? 0 : 1;
 }

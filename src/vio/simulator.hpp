@@ -5,7 +5,7 @@
  * @brief 自包含 3D 轨迹与 IMU / 相机传感器仿真器（示例与测试基准）。
  */
 
-#include "vio/params.hpp"
+#include "vio/configHolder.hpp"
 #include <algorithm>
 #include <cmath>
 #include <gtsam/geometry/Cal3_S2.h>

@@ -12,9 +12,10 @@
  * 下方为状态栏：左侧是轨迹小地图（世界系 XY），右侧是运行状态文字。
  */
 
-#include "dataset/types.hpp"
-#include "vio/params.hpp"
+#include "dataset/configHolder.hpp"
+#include "vio/configHolder.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -25,6 +26,9 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 #include <string>
+// std::this_thread::sleep_for 用于按时间戳节流；不可依赖 OpenCV 头间接引入。
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace myslam::dataset
@@ -183,8 +187,12 @@ namespace myslam::dataset
             {
                 candidates.emplace_back(path, cv::VideoWriter::fourcc('m', 'p', '4', 'v'));
                 candidates.emplace_back(path, cv::VideoWriter::fourcc('a', 'v', 'c', '1'));
-                candidates.emplace_back(config_.videoPath.replace_extension(".avi").string(),
-                                        cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+                // 注意：不能对 config_.videoPath 调 replace_extension——
+                // 那是破坏性修改成员，回退一次之后配置里的路径就被永久改成 .avi，
+                // 后续日志与报告都会指向错误文件名。
+                std::filesystem::path fallback = config_.videoPath;
+                fallback.replace_extension(".avi");
+                candidates.emplace_back(fallback.string(), cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
             }
 
             // 编码器探测会产生大量 OpenCV 内部报错，临时静音
@@ -232,7 +240,10 @@ namespace myslam::dataset
                 cv::circle(bgr, pt, 3, color, 1, cv::LINE_AA);
             }
 
-            cv::Mat panel = cv::Mat::zeros(config_.panelHeight, bgr.cols, CV_8UC3);
+            // panelHeight 为 0 时 panel 是空 Mat，后续 rectangle/vconcat 会断言失败。
+            // 配置层已把下界提到 1，这里对直接构造 VisualizationConfig 的调用方兜底。
+            const int panelHeight = std::max(1, config_.panelHeight);
+            cv::Mat panel = cv::Mat::zeros(panelHeight, bgr.cols, CV_8UC3);
             drawTrail(panel, trail);
             drawStatus(panel, statusLines);
 

@@ -10,8 +10,8 @@
 # Debug/ASan 下每次关键帧优化需要数十秒，不适合完整回放。
 #
 # 示例：
-#   scripts/run_subt.sh                              # 前 500 帧（从 2300 帧起）
-#   scripts/run_subt.sh --max-frames 0               # 跑完剩余全部帧
+#   scripts/run_subt.sh                              # 从 2300 帧起跑完剩余全部帧
+#   scripts/run_subt.sh --max-frames 500             # 只跑前 500 帧（快速预览）
 #   scripts/run_subt.sh --start-frame 0 --max-frames 300
 #   scripts/run_subt.sh --root /path/Handheld2_Folder
 #   scripts/run_subt.sh --viz                        # 实时窗口（ESC/q 退出）
@@ -26,7 +26,7 @@ BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$(nproc)}"
 DATA_ROOT="${SUBT_ROOT:-$ROOT/../MASt3R-Fusion/dataset/Handheld1_Folder}"
 START_FRAME="${START_FRAME:-2300}"
-MAX_FRAMES="${MAX_FRAMES:-500000}"
+MAX_FRAMES="${MAX_FRAMES:-0}"
 STRIDE="${STRIDE:-1}"
 MAX_FEATURES="${MAX_FEATURES:-200}"
 OUTPUT="${OUTPUT:-}"
@@ -45,7 +45,7 @@ usage() {
 可选参数:
   --root DIR         序列目录（含 cam_0/ 与 imu/），默认 Handheld1_Folder
   --start-frame N    从第 N 帧开始（默认 2300）
-  --max-frames N     最多处理帧数，0 表示全部（默认 500）
+  --max-frames N     最多处理帧数，0 表示全部（默认 0）
   --stride N         每隔 N 帧取一帧（默认 1）
   --max-features N   每帧特征数上限（默认 200）
   --output FILE      轨迹输出路径（TUM），默认 build-release/subt_轨迹名.tum

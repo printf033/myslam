@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * @file params.hpp
+ * @file configHolder.hpp
  * @brief 传感器数据结构（IMU 测量、相机帧、特征观测）与系统参数 `VioConfig`。
  */
 
@@ -91,9 +91,11 @@ namespace myslam::vio
         double maxReprojectionErrorHard{15.0};
         /// 预优化预门控宽门限 (像素)：优化前只有预积分预测位姿可用，早期零偏未收敛时
         /// 预测误差可达 20+px，因此这里仅拦截灾难性误匹配，精确门控留到优化之后。
+        /// 该值是预优化阶段实际生效的拒绝门限（不是仅供日志的参考值）。
         double maxReprojectionErrorPreopt{50.0};
         bool postOptOutlierMarking{true};    ///< 诊断开关：优化后是否永久标记外点
         bool preoptTemporaryRejection{true}; ///< 诊断开关：预优化是否临时拒绝超限观测
+                                             ///< （关闭后仅告警，观测仍送入优化，用于离线对比）
 
         // 关键帧选取策略参数
         double minParallaxPx{20.0};       // 触发关键帧的平均视差阈值 (像素)
@@ -106,14 +108,38 @@ namespace myslam::vio
         /// 新路标门控保护期 (观测次数)：三角化初期位置未收敛，残差大属正常，
         /// 先让它参与优化若干轮再接受外点检验，避免误杀真实特征。
         int landmarkGateWarmupObs{4};
+        /// 有效路标的相机系深度下限 (m)。
+        ///
+        /// 低于该深度（含落在相机后方）的路标，其投影因子对路标坐标的雅可比
+        /// 随 1/z 发散，单条这样的观测就足以把 Hessian 推向病态——实测表现为
+        /// iSAM2 抛 IndeterminateSystemException 并使整条轨迹作废。
+        /// 因此该区间是「几何有效性」判据，不受 landmarkGateWarmupObs 保护期豁免。
+        double minLandmarkDepth{0.3};
+        /// 有效路标的相机系深度上限 (m)。超过该距离的三角化结果深度不确定度
+        /// 远超其自身尺度，意义与噪声无异。
+        double maxLandmarkDepth{20.0};
+        /// 视觉因子低于该值时判定视觉已失去约束能力（图像变暗、遮挡、无纹理）。
+        /// 此时纯 IMU 外推会把速度积分到发散：实测视觉中断 7 s 后轨迹速度从
+        /// 0.2 m/s 涨到 18 m/s，而原始 IMU 数据显示设备其实静止不动。
+        int minVisualFactorsForHealth{5};
+        /// ZUPT（零速更新）的静止检测窗口 (s)：在该窗口内加速度与角速度方差
+        /// 都很小时判为静止，并按下面速度先验把速度钉住。
+        double zuptWindowSeconds{0.5};
+        /// ZUPT 速度先验标准差 (m/s)。这是强约束（静止时速度确实为 0），
+        /// 但只在「视觉已失明 + IMU 判静止」双重条件成立时才施加，
+        /// 正常跟踪与运动中都不会触发，因此不会拖慢真实运动。
+        double zuptVelocitySigma{0.02};
         /// 每个关键帧的额外平滑迭代次数：iSAM2 单次 update 只做一轮增量线性化，
         /// 新增视觉因子后视觉残差尚未收敛；工业 VIO 每关键帧多轮迭代 (VINS 为 8 轮)。
         int extraSmootherIterations{1};
 
         // 滑动窗口大小
-        size_t maxSlidingWindowSize{8}; ///< 滑动窗口内最大关键帧数 (日志/位姿统计)
+        size_t maxSlidingWindowSize{8}; ///< 期望的关键帧数上限：仅用于诊断告警。
+                                        ///< 真正的窗口边界由 slidingWindowLag 的时间戳决定；
+                                        ///< 实际窗口持续超过该值时会输出排查提示。
         /// 固定滞后平滑窗口时长 (秒)：工业固定滞后平滑的滑动窗口以时间定义，
-        /// 覆盖 maxSlidingWindowSize 个关键帧 (关键帧间隔约 0.2s)
+        /// 覆盖 maxSlidingWindowSize 个关键帧 (关键帧间隔约 0.2s)。
+        /// 必须不小于 maxKeyframeInterval，否则每帧进来就会被边缘化。
         double slidingWindowLag{1.6};
     };
 

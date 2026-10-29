@@ -37,9 +37,13 @@ in a single factor graph, marginalizing states that leave the time window.
 The system has five parts, listed in call order:
 
 1. **Initializer** `VioInitializer` — state machine `UNINITIALIZED → STATIONARY_COLLECTING →
-   GRAVITY_ALIGNED → TRACKING_OK`, with `LOST_DEGRADED` on anomaly. Stationarity is decided from
-   both accelerometer and gyro standard deviation; gyro bias calibration runs after gravity
-   alignment, producing the initial pose, velocity, and bias.
+   GRAVITY_ALIGNED → TRACKING_OK`, with `LOST_DEGRADED` on anomaly (which rebuilds the pipeline).
+   Stationarity is decided from both accelerometer and gyro standard deviation with thresholds
+   scaled by the configured noise density and sample rate; gyro bias calibration runs after gravity
+   alignment, producing the initial pose, velocity, and bias. If `system.initTimeout` elapses without
+   meeting the stationarity test, alignment relaxes to the non-stationary path, where the mean
+   angular rate contains real motion and is therefore not used as a gyro bias prior (it is zeroed
+   and left to the backend's online estimation).
 2. **Keyframe decision** `KeyframeSelector` — decides whether the current camera frame becomes a
    keyframe, using average parallax, feature retention, and a time-based fallback. The fallback
    additionally requires a minimum triangulation parallax.
@@ -70,7 +74,7 @@ and a keyframe triggers backend optimization followed by a propagator reset.
 
 | Module | Responsibility |
 | :--- | :--- |
-| `vio/params.hpp` | Sensor structs (`ImuMeasurement` / `CameraFrame` / `FeatureObservation`) and `VioConfig` |
+| `vio/configHolder.hpp` | Sensor structs (`ImuMeasurement` / `CameraFrame` / `FeatureObservation`) and `VioConfig` |
 | `vio/initializer.hpp` | `SystemState` state machine, stationarity detection, gravity alignment, bias calibration |
 | `vio/keyframe_selector.hpp` | Keyframe decision returning `DecisionResult` (flag, reason, parallax, retention) |
 | `vio/backend.hpp` | Factor graph construction, triangulation, layered outlier gating, marginalization, `latestNavState()` |
@@ -81,14 +85,14 @@ and a keyframe triggers backend optimization followed by a propagator reset.
 | `vio/vio.hpp` | Umbrella header including all of the above |
 | `lua_config.hpp` | Lua configuration loading producing `ProjectConfig` |
 | `log_config.hpp` | Thin wrapper over the mylog C++ API (level + file output) |
-| `dataset/types.hpp` | Replay configuration and statistics structs; standard library only, no OpenCV |
+| `dataset/configHolder.hpp` | Replay configuration and statistics structs; standard library only, no OpenCV |
 | `dataset/subt_dataset.hpp` | SubT sequence reader: IMU CSV, camera timestamps, image index |
 | `dataset/mei_tracker.hpp` | MEI model distortion correction and GFTT + LK optical-flow tracking |
 | `dataset/dataset_runner.hpp` | Recorded-sequence replay orchestration reusing the VIO components |
 | `dataset/visualizer.hpp` | OpenCV window and video output |
 | `dataset/ply_export.hpp` | Export landmarks and trajectory as PLY |
 
-`vio/*` and `dataset/types.hpp` include no OpenCV headers, so the project still builds and parses
+`vio/*` and `dataset/configHolder.hpp` include no OpenCV headers, so the project still builds and parses
 its configuration when the dataset tools are disabled.
 
 ## Execution flow
@@ -106,15 +110,28 @@ prior and sets the state to `TRACKING_OK`.
 When a keyframe is accepted, `VioBackend::processKeyframe()` performs:
 
 1. Triangulates new landmarks from feature correspondences between the previous and current
-   keyframe, skipping points below `minTriangulationParallaxPx`;
+   keyframe, skipping points below `minTriangulationParallaxPx`, and rejects triangulations whose
+   depth falls outside `[minLandmarkDepth, maxLandmarkDepth]`;
 2. Computes reprojection residuals against the preintegrated predicted pose, temporarily rejecting
-   observations above `maxReprojectionErrorPreopt`;
-3. Inserts `ProjectionFactor`s and runs the smoother update, with `extraSmootherIterations`
-   additional iterations;
-4. Recomputes residuals against the optimized pose: observations above `maxReprojectionError` are
+   observations above `maxReprojectionErrorPreopt`. The depth interval is enforced here for every
+   landmark, unconditionally — it is a geometric-validity test, not an outlier test, so it is not
+   exempted by the `landmarkGateWarmupObs` grace period. A single landmark behind the camera has a
+   projection Jacobian that diverges as 1/z and is enough to make the Hessian singular;
+3. If fewer than `minVisualFactorsForHealth` visual factors survive **and** the recent IMU window
+   indicates the device is stationary, injects a zero-velocity prior (ZUPT, `zuptWindowSeconds`,
+   `zuptVelocitySigma`). Visual loss leaves only the IMU chain, which constrains how velocity
+   *changes* but not velocity itself, so integration error accumulates and position grows
+   quadratically;
+4. Inserts `ProjectionFactor`s and runs the smoother update, with `extraSmootherIterations`
+   additional iterations. If the solve throws `IndeterminateSystemException`, the backend rebuilds
+   the smoother around the last successful keyframe instead of propagating the failure: the
+   coordinate frame is preserved and only that keyframe is skipped;
+5. Recomputes residuals against the optimized pose: observations above `maxReprojectionError` are
    marked as outliers after a multi-frame streak, and those above `maxReprojectionErrorHard` are
    rejected on a single frame;
-5. Runs `HealthMonitor` and records any alert.
+6. Runs `HealthMonitor` and records any alert. A `VISUAL` degradation (observation starvation, e.g.
+   the image going dark) does **not** rebuild the pipeline — the next frame would be just as dark,
+   and rebuilding only resets the coordinate frame repeatedly. Inertial degradations do rebuild.
 
 Keyframe data also maintains sliding-window size statistics and the fixed-lag duration
 `slidingWindowLag`.
@@ -131,7 +148,7 @@ reports RMSE and maximum error. RMSE below `rmseThreshold` is reported as passin
 ```
 myslam/
 ├── CMakeLists.txt            # top-level build, single version source, format targets
-├── config/myslam.lua         # default runtime configuration (copied into build/config/)
+├── config/config.lua         # default runtime configuration (copied into build/config/)
 ├── src/
 │   ├── CMakeLists.txt        # INTERFACE targets myslam / myslam_lua / myslam_sanitized
 │   ├── myslam.hpp.in         # version template expanded by configure_file
@@ -267,7 +284,7 @@ Logs are written to a `.log` file in the **current working directory** (managed 
 ### Explicit configuration
 
 ```bash
-./bin/1_visual_inertial_odometry                  # reads config/myslam.lua, else built-in defaults
+./bin/1_visual_inertial_odometry                  # reads config/config.lua, else built-in defaults
 ./bin/1_visual_inertial_odometry my_config.lua    # explicit; exit code 1 on load or validation failure
 ```
 
@@ -275,7 +292,7 @@ Logs are written to a `.log` file in the **current working directory** (managed 
 
 ## Configuration
 
-Runtime parameters come from a Lua script, by default `config/myslam.lua`, copied into
+Runtime parameters come from a Lua script, by default `config/config.lua`, copied into
 `build/config/` at configure time.
 
 ### Sections
@@ -319,7 +336,7 @@ A leftover `system.imuDt` in an older config produces a migration message.
 #include "lua_config.hpp"
 
 myslam::config::ProjectConfig project;
-const auto result = myslam::config::load("config/myslam.lua", project, /*applyLogging=*/true);
+const auto result = myslam::config::load("config/config.lua", project, /*applyLogging=*/true);
 
 if (!result) { /* keep built-in defaults; result.error().message explains why */ }
 else if (!result->logging) { /* fall back to the mylog C++ API */ }
@@ -380,11 +397,11 @@ build-release/bin/2_subt_dataset \
     [--output traj.tum] [--start-frame N] [--max-frames N] [--stride N] \
     [--max-features N] [--max-duration S] [--ply cloud.ply] \
     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R] \
-    [--config config/myslam.lua]
+    [--config config/config.lua]
 ```
 
 `--config` supplies baseline defaults; command-line arguments take precedence. When omitted, it
-reads `config/myslam.lua` in the current directory, else uses built-in defaults.
+reads `config/config.lua` in the current directory, else uses built-in defaults.
 
 `--fx/--fy/--cx/--cy/--xi/--k1/--k2/--p1/--p2/--width/--height/--pinhole-scale` override MEI
 intrinsics individually.

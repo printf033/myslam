@@ -65,12 +65,12 @@ endif()
 # Runtime configuration assets
 #
 # config/ 下的 Lua 配置文件随构建树同步一份，示例程序从构建目录运行时可直接
-# 用相对路径 config/myslam.lua 找到。COPYONLY 仍会跟踪源文件变化：改完 lua
+# 用相对路径 config/config.lua 找到。COPYONLY 仍会跟踪源文件变化：改完 lua
 # 后构建会自动重新配置并刷新副本。
 # -----------------------------------------------------------------------------
 configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/config/myslam.lua"
-    "${CMAKE_CURRENT_BINARY_DIR}/config/myslam.lua"
+    "${CMAKE_CURRENT_SOURCE_DIR}/config/config.lua"
+    "${CMAKE_CURRENT_BINARY_DIR}/config/config.lua"
     COPYONLY
 )
 

@@ -1,6 +1,6 @@
 -- myslam 运行期配置
 --
--- 由 myslam::config::load("config/myslam.lua", cfg) 载入：
+-- 由 myslam::config::load("config/config.lua", cfg) 载入：
 --   * vio / system 两节 -> myslam::vio::VioConfig / SystemConfig
 --   * logger / fileManager 两节 -> 交给子库 mylog 应用
 --
@@ -58,6 +58,13 @@ vio = {
     maxKeyframeInterval = 0.45,        -- 强制插入关键帧的最大时间间隔 (s)
     minTriangulationParallaxPx = 3.0,  -- 三角化所需最小视差 (像素)
     landmarkGateWarmupObs = 4,         -- 新路标门控保护期（观测次数）
+    -- 有效路标的相机系深度区间 (m)。超出该区间的路标投影因子雅可比随 1/z 发散，
+    -- 单条观测即可让线性系统病态（iSAM2 抛 IndeterminateSystemException）。
+    minLandmarkDepth = 0.3,            -- 深度下限，低于此值（含相机后方）视为几何无效
+    maxLandmarkDepth = 20.0,           -- 深度上限
+    minVisualFactorsForHealth = 5,     -- 视觉因子低于此值视为视觉失去约束能力
+    zuptWindowSeconds = 0.5,           -- 零速更新的静止检测窗口 (s)
+    zuptVelocitySigma = 0.02,          -- 零速更新的速度先验标准差 (m/s)
     extraSmootherIterations = 1,       -- 每个关键帧的额外平滑迭代次数
 
     -- 滑动窗口
@@ -73,6 +80,7 @@ system = {
     cameraDt = 0.050,     -- 相机采样步长 (s)，对应 20 Hz，须不小于 IMU 采样步长
     totalDuration = 5.0,  -- 仿真/运行时长 (s)
     rmseThreshold = 0.20, -- 平移 RMSE 验收门限 (m)
+    initTimeout = 2.0,    -- 初始化超时 (s)：超时后放宽静止检测，避免从运动状态开始时卡死
 }
 
 -- =============================================================================

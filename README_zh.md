@@ -36,8 +36,10 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 系统由五部分组成，按调用顺序排列：
 
 1. **初始化器** `VioInitializer` — 状态机 `UNINITIALIZED → STATIONARY_COLLECTING →
-   GRAVITY_ALIGNED → TRACKING_OK`，异常时进入 `LOST_DEGRADED`。静止判定同时使用加速度与
-   陀螺标准差；重力对齐后执行陀螺零偏标定，输出初始位姿、速度与零偏。
+   GRAVITY_ALIGNED → TRACKING_OK`，异常时进入 `LOST_DEGRADED` 并重建流水线。静止判定同时使用加速度与
+   陀螺标准差（阈值随噪声配置与采样率缩放）；重力对齐后执行陀螺零偏标定，输出初始位姿、速度与零偏。
+   超过 `system.initTimeout` 仍未满足静止条件时自动放宽为非静止对齐，此时角速度均值混入真实运动，
+   不再用作陀螺零偏先验（置零交由后端在线估计）。
 2. **关键帧决策** `KeyframeSelector` — 按平均视差、特征留存率、时间保底三项判据决定当前
    相机帧是否作为关键帧进入后端。时间保底判据附加最小三角化视差条件。
 3. **后端** `VioBackend` — 组合 `CombinedImuFactor`（IMU 预积分）与 `ProjectionFactor`
@@ -63,7 +65,7 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 
 | 模块 | 职责 |
 | :--- | :--- |
-| `vio/params.hpp` | 传感器数据结构（`ImuMeasurement` / `CameraFrame` / `FeatureObservation`）与配置结构 `VioConfig` |
+| `vio/configHolder.hpp` | 传感器数据结构（`ImuMeasurement` / `CameraFrame` / `FeatureObservation`）与配置结构 `VioConfig` |
 | `vio/initializer.hpp` | 初始化状态机 `SystemState` 与静止检测、重力对齐、零偏标定 |
 | `vio/keyframe_selector.hpp` | 关键帧决策，返回 `DecisionResult`（是否关键帧、原因、视差、留存率） |
 | `vio/backend.hpp` | 因子图构建、三角化、分层外点门控、边缘化、`latestNavState()` |
@@ -74,14 +76,14 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 | `vio/vio.hpp` | 聚合头，包含上述全部组件 |
 | `lua_config.hpp` | Lua 配置加载，产出 `ProjectConfig` |
 | `log_config.hpp` | mylog C++ API 封装（级别 + 文件输出） |
-| `dataset/types.hpp` | 回放配置与统计结构；只含标准库，不含 OpenCV |
+| `dataset/configHolder.hpp` | 回放配置与统计结构；只含标准库，不含 OpenCV |
 | `dataset/subt_dataset.hpp` | SubT 序列读取：IMU CSV、相机时间戳、图像索引 |
 | `dataset/mei_tracker.hpp` | MEI 模型畸变校正与 GFTT + LK 光流跟踪 |
 | `dataset/dataset_runner.hpp` | 真实序列回放编排，复用 VIO 组件 |
 | `dataset/visualizer.hpp` | OpenCV 窗口与视频输出 |
 | `dataset/ply_export.hpp` | 路标与轨迹导出为 PLY |
 
-`vio/*` 与 `dataset/types.hpp` 不包含 OpenCV 头文件，因此关闭数据集工具时仍可构建并解析配置。
+`vio/*` 与 `dataset/configHolder.hpp` 不包含 OpenCV 头文件，因此关闭数据集工具时仍可构建并解析配置。
 
 ## 运行流程
 
@@ -97,12 +99,22 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 关键帧判定通过后，`VioBackend::processKeyframe()` 依次执行：
 
 1. 用上一关键帧与本关键帧的特征对应关系三角化新路标，视差低于
-   `minTriangulationParallaxPx` 的点跳过；
-2. 以预积分预测位姿计算重投影残差，超过 `maxReprojectionErrorPreopt` 的观测临时拒绝；
-3. 插入 `ProjectionFactor` 并调用 smoother 更新，按 `extraSmootherIterations` 追加迭代；
-4. 以优化后位姿重算残差，超过 `maxReprojectionError` 且连续多帧超限者永久标记外点，
+   `minTriangulationParallaxPx` 的点跳过，深度落在 `[minLandmarkDepth, maxLandmarkDepth]`
+   之外的结果丢弃；
+2. 以预积分预测位姿计算重投影残差，超过 `maxReprojectionErrorPreopt` 的观测临时拒绝。
+   深度区间在这里对**所有**路标无条件生效：它是几何有效性判据而非外点判据，因此不受
+   `landmarkGateWarmupObs` 保护期豁免。落在相机后方的路标，其投影雅可比随 1/z 发散，
+   单条这样的观测就足以让 Hessian 奇异；
+3. 若视觉因子少于 `minVisualFactorsForHealth` **且**近期 IMU 窗口判定设备静止，注入
+   零速先验（ZUPT，`zuptWindowSeconds`、`zuptVelocitySigma`）。视觉失明后因子图只剩
+   IMU 链，它约束速度的**变化**而不约束速度本身，积分误差因此单调累积、位置按时间平方增长；
+4. 插入 `ProjectionFactor` 并调用 smoother 更新，按 `extraSmootherIterations` 追加迭代。
+   求解抛 `IndeterminateSystemException` 时，后端以最近一次成功的关键帧为锚点重建平滑器，
+   而不是把失败上交：坐标系保持不变，仅该帧不产出位姿；
+5. 以优化后位姿重算残差，超过 `maxReprojectionError` 且连续多帧超限者永久标记外点，
    单帧超过 `maxReprojectionErrorHard` 者直接剔除；
-5. 检查 `HealthMonitor`，记录告警。
+6. 检查 `HealthMonitor`，记录告警。`VISUAL` 类降级（观测枯竭，例如图像变暗）**不**重建
+   流水线——下一帧图像同样是黑的，重建只会让坐标系反复归零；只有惯性类降级才重建。
 
 关键帧数据同时维护滑动窗口规模统计与固定滞后窗口时长 `slidingWindowLag`。
 
@@ -118,7 +130,7 @@ RMSE 低于 `rmseThreshold` 时判定通过。
 ```
 myslam/
 ├── CMakeLists.txt            # 顶层构建、版本号唯一来源、format 目标
-├── config/myslam.lua         # 默认运行配置（构建时复制到 build/config/）
+├── config/config.lua         # 默认运行配置（构建时复制到 build/config/）
 ├── src/
 │   ├── CMakeLists.txt        # INTERFACE 目标 myslam / myslam_lua / myslam_sanitized
 │   ├── myslam.hpp.in         # 版本号模板，configure_file 生成
@@ -254,7 +266,7 @@ cd build
 ### 指定配置文件
 
 ```bash
-./bin/1_visual_inertial_odometry                        # 读 config/myslam.lua，缺失则用内置默认值
+./bin/1_visual_inertial_odometry                        # 读 config/config.lua，缺失则用内置默认值
 ./bin/1_visual_inertial_odometry my_config.lua          # 显式指定；加载或校验失败退出码 1
 ```
 
@@ -262,7 +274,7 @@ cd build
 
 ## 配置系统
 
-运行期参数由 Lua 脚本提供，默认文件 `config/myslam.lua`，构建时复制到 `build/config/`。
+运行期参数由 Lua 脚本提供，默认文件 `config/config.lua`，构建时复制到 `build/config/`。
 
 ### 配置节
 
@@ -301,7 +313,7 @@ const double imuDt = vio::SystemConfig::imuDtFrom(config_.imuRateHz);  // 1 / im
 #include "lua_config.hpp"
 
 myslam::config::ProjectConfig project;
-const auto result = myslam::config::load("config/myslam.lua", project, /*applyLogging=*/true);
+const auto result = myslam::config::load("config/config.lua", project, /*applyLogging=*/true);
 
 if (!result) { /* 沿用内置默认值；result.error().message 说明原因 */ }
 else if (!result->logging) { /* 回退到 mylog C++ API */ }
@@ -355,10 +367,10 @@ build-release/bin/2_subt_dataset \
     [--output traj.tum] [--start-frame N] [--max-frames N] [--stride N] \
     [--max-features N] [--max-duration S] [--ply cloud.ply] \
     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R] \
-    [--config config/myslam.lua]
+    [--config config/config.lua]
 ```
 
-`--config` 提供基线默认值，命令行参数优先。未指定时读取当前目录的 `config/myslam.lua`，
+`--config` 提供基线默认值，命令行参数优先。未指定时读取当前目录的 `config/config.lua`，
 不存在则使用内置默认值。
 
 `--fx/--fy/--cx/--cy/--xi/--k1/--k2/--p1/--p2/--width/--height/--pinhole-scale` 可逐项覆盖

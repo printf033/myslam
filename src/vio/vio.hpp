@@ -16,10 +16,10 @@
  */
 
 #include "vio/backend.hpp"
+#include "vio/configHolder.hpp"
 #include "vio/health_monitor.hpp"
 #include "vio/initializer.hpp"
 #include "vio/keyframe_selector.hpp"
-#include "vio/params.hpp"
 #include "vio/propagator.hpp"
 #include "vio/simulator.hpp"
 #include "vio/system.hpp"

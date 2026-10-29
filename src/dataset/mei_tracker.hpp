@@ -19,9 +19,9 @@
  * 建立不同关键帧之间的共视关系并三角化。
  */
 
-#include "dataset/types.hpp"
+#include "dataset/configHolder.hpp"
 #include "logger.hpp"
-#include "vio/params.hpp"
+#include "vio/configHolder.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -74,8 +74,12 @@ namespace myslam::dataset
     public:
         explicit MeiFeatureTracker(const MeiIntrinsics &intr, int maxFeatures = 400, int minFeatures = 90)
             : intr_(intr),
-              maxFeatures_(maxFeatures),
-              minFeatures_(minFeatures),
+              // maxFeatures 必须为正：它直接作为 goodFeaturesToTrack 的 maxCorners，
+              // 而 OpenCV 对 maxCorners <= 0 的语义是“不限制”，会把全图强角点
+              // 全部返回，导致特征数与耗时失控。minFeatures 不能超过上限，
+              // 否则补测条件恒真、每帧都会尝试补点。
+              maxFeatures_(std::max(1, maxFeatures)),
+              minFeatures_(std::clamp(minFeatures, 0, std::max(1, maxFeatures))),
               K_((cv::Mat_<double>(3, 3) << intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0)),
               D_((cv::Mat_<double>(1, 5) << intr.k1, intr.k2, intr.p1, intr.p2, 0.0))
         {
@@ -164,8 +168,11 @@ namespace myslam::dataset
                     cv::circle(mask, pt, 8, cv::Scalar(0), cv::FILLED);
                 }
                 std::vector<cv::Point2f> fresh;
-                cv::goodFeaturesToTrack(gray, fresh, maxFeatures_ - static_cast<int>(validRaw.size()), 0.01, 10.0,
-                                        mask);
+                const int budget = maxFeatures_ - static_cast<int>(validRaw.size());
+                if (budget > 0)
+                {
+                    cv::goodFeaturesToTrack(gray, fresh, budget, 0.01, 10.0, mask);
+                }
                 if (!fresh.empty())
                 {
                     std::vector<int> freshIds;
@@ -240,9 +247,10 @@ namespace myslam::dataset
                 const auto row = static_cast<int>(pixels[i].y);
                 validMask_.at<uchar>(row, col) = 255;
             }
+            const auto totalPixels = static_cast<double>(intr_.imageWidth) * static_cast<double>(intr_.imageHeight);
+            const auto available = static_cast<double>(cv::countNonZero(validMask_));
             mylog::info("[特征跟踪] MEI 有效视场掩码: {}/{} 像素可用 ({:.1f}%)", cv::countNonZero(validMask_),
-                        intr_.imageWidth * intr_.imageHeight,
-                        100.0 * cv::countNonZero(validMask_) / (intr_.imageWidth * intr_.imageHeight));
+                        static_cast<long long>(totalPixels), totalPixels > 0.0 ? 100.0 * available / totalPixels : 0.0);
         }
 
         bool inBounds(cv::Point2f pt) const
