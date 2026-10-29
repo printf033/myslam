@@ -15,6 +15,7 @@
  */
 
 #include "dataset/dataset_runner.hpp"
+#include "dataset/intrinsics_file.hpp"
 #include "dataset/subt_dataset.hpp"
 #include "log_config.hpp"
 #include "logger.hpp"
@@ -30,7 +31,11 @@
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
 #include <optional>
+#include <spawn.h>
 #include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 #if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
 extern "C" const char *__lsan_default_suppressions()
@@ -38,6 +43,10 @@ extern "C" const char *__lsan_default_suppressions()
     return "leak:gtsam::guardedIsDebug\n";
 }
 #endif
+
+// environ 必须声明在全局作用域：放进匿名命名空间会得到内部链接，
+// posix_spawn 拿到的就不是 libc 的环境表了。
+extern char **environ;
 
 namespace
 {
@@ -53,9 +62,14 @@ namespace
                      "                     [--width W] [--height H] [--ply cloud.ply]\n"
                      "                     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R]\n"
                      "                     [--config config/config.lua]\n"
+                     "                     [--init manual|mast3r] [--intrinsics-file FILE]\n"
+                     "                     [--mast3r-weights PATH] [--mast3r-pairs N] [--mast3r-device auto|cpu|cuda]\n"
+                     "                     [--mast3r-cache FILE] [--force-estimate] [--python PATH]\n"
                      "\n"
                      "--config 指定的文件作为默认值基线，命令行参数优先；未指定时尝试读取\n"
-                     "当前目录的 config/config.lua（不存在则全部用内置默认值）。\n");
+                     "当前目录的 config/config.lua（不存在则全部用内置默认值）。\n"
+                     "--init mast3r 用 MASt3R 从图像估计内参，可不填 --fx/--fy/--cx/--cy；\n"
+                     "估计结果缓存到 <cam_0>/../mast3r_intrinsics.txt，可用 --force-estimate 重算。\n");
     }
 
     bool parseDouble(const char *value, double &out)
@@ -75,6 +89,129 @@ namespace
         }
         out = static_cast<int>(parsed);
         return true;
+    }
+
+    /// MASt3R 内参估计的可选参数
+    struct Mast3rOptions
+    {
+        int pairs{6};                ///< 参与估计的图像对数
+        std::string device{"auto"};  ///< auto / cpu / cuda
+        std::string weights;         ///< 权重路径（空则用脚本默认候选）
+        std::string python;          ///< Python 解释器（空则用 MYSLAM_PYTHON 或 python3）
+        std::filesystem::path cache; ///< 结果缓存路径（空则用 <cam_0>/../mast3r_intrinsics.txt）
+        bool force{false};           ///< 忽略已有缓存，强制重算
+    };
+
+    /// 用 posix_spawn 直接执行，不经过 shell：路径里的空格与引号不会被解释
+    int runProcess(const std::vector<std::string> &args)
+    {
+        if (args.empty())
+        {
+            return -1;
+        }
+        std::vector<char *> argv;
+        argv.reserve(args.size() + 1);
+        for (const auto &arg : args)
+        {
+            argv.push_back(const_cast<char *>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        pid_t pid = 0;
+        const int spawnError = posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), environ);
+        if (spawnError != 0)
+        {
+            return -1;
+        }
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0)
+        {
+            return -1;
+        }
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+
+    /// 解析 Python 解释器：--python > MYSLAM_PYTHON > python3
+    std::string resolvePython(const Mast3rOptions &options)
+    {
+        if (!options.python.empty())
+        {
+            return options.python;
+        }
+        if (const char *env = std::getenv("MYSLAM_PYTHON"); env != nullptr && *env != '\0')
+        {
+            return env;
+        }
+        return "python3";
+    }
+
+    /**
+     * @brief 用 MASt3R 估计内参
+     *
+     * 优先复用缓存文件：同一序列重复回放不必重跑 ViT-Large 推理。缓存缺失或
+     * 用 `--force-estimate` 指定重算时调用 scripts/mast3r_intrinsics.py。
+     *
+     * @param dataDir 帧图像目录（cam_0）
+     * @param options 估计参数
+     * @return 估计结果；失败时给出可操作的说明
+     */
+    std::expected<myslam::dataset::IntrinsicsEstimate, std::string>
+    estimateIntrinsicsWithMast3r(const std::string &dataDir, const Mast3rOptions &options)
+    {
+        const std::filesystem::path frames(dataDir);
+        std::filesystem::path cache = options.cache;
+        if (cache.empty())
+        {
+            cache = frames.parent_path() / "mast3r_intrinsics.txt";
+        }
+
+        if (!options.force && std::filesystem::is_regular_file(cache))
+        {
+            auto cached = myslam::dataset::loadIntrinsicsFile(cache);
+            if (cached)
+            {
+                std::fprintf(stderr, "[info] 复用 MASt3R 内参缓存: %s（--force-estimate 可重算）\n",
+                             cache.string().c_str());
+                return cached;
+            }
+            std::fprintf(stderr, "[warning] 缓存 %s 无法解析（%s），重新估计\n", cache.string().c_str(),
+                         cached.error().c_str());
+        }
+
+#ifdef MYSLAM_MAST3R_SCRIPT
+        const std::string script = MYSLAM_MAST3R_SCRIPT;
+#else
+        const std::string script = "scripts/mast3r_intrinsics.py";
+#endif
+        if (!std::filesystem::is_regular_file(script))
+        {
+            return std::unexpected(
+                std::format("找不到 MASt3R 估计脚本: {}（可用 --intrinsics-file 指定已有结果）", script));
+        }
+
+        const std::string python = resolvePython(options);
+        std::vector<std::string> args{
+            python,     script,         "--images", dataDir,       "--pairs", std::to_string(options.pairs),
+            "--device", options.device, "--output", cache.string()};
+        if (!options.weights.empty())
+        {
+            args.insert(args.end(), {"--weights", options.weights});
+        }
+
+        mylog::info("用 MASt3R 估计内参: {}（pairs={}, device={}）", python, options.pairs, options.device);
+        const int exitCode = runProcess(args);
+        if (exitCode != 0)
+        {
+            return std::unexpected(
+                std::format("MASt3R 估计失败（退出码 {}）。请确认：\n"
+                            "  1) Python 环境装了 torch/dust3r（可用 --python 或 MYSLAM_PYTHON 指向它，"
+                            "例如 conda 的 mast3r 环境）；\n"
+                            "  2) 权重可用（--mast3r-weights 或 MAST3R_WEIGHTS）；\n"
+                            "  3) thirdparty/mast3r 已含嵌套子模块："
+                            "git submodule update --init --recursive thirdparty/mast3r",
+                            exitCode));
+        }
+        return myslam::dataset::loadIntrinsicsFile(cache);
     }
 
 } // namespace
@@ -143,6 +280,13 @@ int main(int argc, char **argv)
     myslam::dataset::MeiIntrinsics intrinsics = project.intrinsics;
     myslam::dataset::DatasetRunConfig runConfig = project.replay;
 
+    // 内参来源：manual = 配置/命令行；mast3r = 从图像估计
+    std::string initMode = "manual";
+    std::optional<std::string> intrinsicsFile;
+    Mast3rOptions mast3rOptions;
+    // 记录命令行是否显式给过内参，避免与 --init mast3r 静默打架
+    bool explicitIntrinsics = false;
+
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg(argv[i]);
@@ -151,6 +295,11 @@ int main(int argc, char **argv)
         if (arg == "--viz")
         {
             runConfig.viz.showWindow = true;
+            continue;
+        }
+        if (arg == "--force-estimate")
+        {
+            mast3rOptions.force = true;
             continue;
         }
         if (arg == "--help" || arg == "-h")
@@ -228,50 +377,90 @@ int main(int argc, char **argv)
         else if (arg == "--pinhole-scale")
         {
             consumed = parseDouble(value, intrinsics.pinholeScale);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--fx")
         {
             consumed = parseDouble(value, intrinsics.fx);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--fy")
         {
             consumed = parseDouble(value, intrinsics.fy);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--cx")
         {
             consumed = parseDouble(value, intrinsics.cx);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--cy")
         {
             consumed = parseDouble(value, intrinsics.cy);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--xi")
         {
             consumed = parseDouble(value, intrinsics.xi);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--k1")
         {
             consumed = parseDouble(value, intrinsics.k1);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--k2")
         {
             consumed = parseDouble(value, intrinsics.k2);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--p1")
         {
             consumed = parseDouble(value, intrinsics.p1);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--p2")
         {
             consumed = parseDouble(value, intrinsics.p2);
+            explicitIntrinsics = explicitIntrinsics || consumed;
+        }
+        else if (arg == "--init")
+        {
+            initMode = value;
+        }
+        else if (arg == "--intrinsics-file")
+        {
+            intrinsicsFile = value;
+        }
+        else if (arg == "--mast3r-weights")
+        {
+            mast3rOptions.weights = value;
+        }
+        else if (arg == "--mast3r-pairs")
+        {
+            consumed = parseInt(value, mast3rOptions.pairs);
+        }
+        else if (arg == "--mast3r-device")
+        {
+            mast3rOptions.device = value;
+        }
+        else if (arg == "--mast3r-cache")
+        {
+            mast3rOptions.cache = value;
+        }
+        else if (arg == "--python")
+        {
+            mast3rOptions.python = value;
         }
         else if (arg == "--width")
         {
             consumed = parseInt(value, intrinsics.imageWidth);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else if (arg == "--height")
         {
             consumed = parseInt(value, intrinsics.imageHeight);
+            explicitIntrinsics = explicitIntrinsics || consumed;
         }
         else
         {
@@ -333,6 +522,55 @@ int main(int argc, char **argv)
         printUsage();
         return 2;
     }
+    if (initMode != "manual" && initMode != "mast3r")
+    {
+        std::fprintf(stderr, "--init 的取值非法: %s（可选 manual、mast3r）\n", initMode.c_str());
+        return 2;
+    }
+    if (initMode == "mast3r" && intrinsicsFile.has_value())
+    {
+        std::fprintf(stderr, "--init mast3r 与 --intrinsics-file 只能二选一\n");
+        return 2;
+    }
+    if (mast3rOptions.pairs < 1 || mast3rOptions.pairs > 128)
+    {
+        return failRange("--mast3r-pairs", mast3rOptions.pairs, 1, 128);
+    }
+    if (mast3rOptions.device != "auto" && mast3rOptions.device != "cpu" && mast3rOptions.device != "cuda")
+    {
+        std::fprintf(stderr, "--mast3r-device 的取值非法: %s（可选 auto、cpu、cuda）\n", mast3rOptions.device.c_str());
+        return 2;
+    }
+
+    // 内参来源：--intrinsics-file 直接读数；--init mast3r 从图像估计。
+    // 两者都不需要用户填 --fx/--fy/--cx/--cy。
+    if (intrinsicsFile.has_value() || initMode == "mast3r")
+    {
+        if (initMode == "mast3r" && explicitIntrinsics)
+        {
+            std::fprintf(stderr, "--init mast3r 与显式内参参数（--fx/--fy/--cx/--cy/--xi/--k*/--p*/--width/"
+                                 "--height/--pinhole-scale）不能同时使用\n");
+            return 2;
+        }
+        const std::expected<myslam::dataset::IntrinsicsEstimate, std::string> estimate =
+            intrinsicsFile.has_value() ? myslam::dataset::loadIntrinsicsFile(*intrinsicsFile)
+                                       : estimateIntrinsicsWithMast3r(dataDir, mast3rOptions);
+        if (!estimate)
+        {
+            std::fprintf(stderr, "[error] %s\n", estimate.error().c_str());
+            return 2;
+        }
+        for (const std::string &warning : estimate->warnings)
+        {
+            std::fprintf(stderr, "[warning] %s\n", warning.c_str());
+        }
+        intrinsics = estimate->intrinsics;
+        mylog::info("内参来源: {}（模型 {}），fx={:.2f} fy={:.2f} cx={:.2f} cy={:.2f}，画幅 {}x{}", estimate->source,
+                    estimate->model, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, intrinsics.imageWidth,
+                    intrinsics.imageHeight);
+        mylog::info("注意: 自动估计只覆盖内参，相机-IMU 外参 Tic 仍用内置/配置值");
+    }
+
     if (!intrinsics.isValid())
     {
         std::fprintf(stderr, "相机内参非法: fx=%f fy=%f size=%dx%d\n", intrinsics.fx, intrinsics.fy,

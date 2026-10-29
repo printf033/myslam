@@ -78,6 +78,7 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 | `lua_config.hpp` | Lua 配置加载，产出 `ProjectConfig` |
 | `log_config.hpp` | mylog C++ API 封装（级别 + 文件输出） |
 | `dataset/configHolder.hpp` | 回放配置与统计结构；只含标准库，不含 OpenCV |
+| `dataset/intrinsics_file.hpp` | 解析 MASt3R 等外部工具估计的内参文件（纯标准库） |
 | `dataset/subt_dataset.hpp` | SubT 序列读取：IMU CSV、相机时间戳、图像索引 |
 | `dataset/mei_tracker.hpp` | MEI 模型畸变校正与 GFTT + LK 光流跟踪 |
 | `dataset/dataset_runner.hpp` | 真实序列回放编排，复用 VIO 组件 |
@@ -167,6 +168,7 @@ myslam/
 | 构建工具 | Ninja 或 Make |
 | 系统库 | TBB、Boost、Eigen3、Threads |
 | LuaJIT | 2.1+ 且可被 `pkg-config` 发现；缺失时 Lua 支持自动关闭，其余功能不受影响 |
+| MASt3R | 仅 `--init mast3r` 需要：PyTorch 环境 + 权重；否则完全不需要 |
 | OpenCV | 4.x，仅 `MYSLAM_BUILD_DATASET_TOOLS=ON` 时需要；默认用系统包，`MYSLAM_USE_BUNDLED_OPENCV=ON` 时改用 `thirdparty/opencv` 子模块 |
 | clang-format | 23.1.3（提交钩子与 CI 按此版本校验） |
 
@@ -254,9 +256,12 @@ cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
 ### MASt3R
 
 `thirdparty/mast3r` 钉住 [naver/mast3r](https://github.com/naver/mast3r) —— SubT 序列背后的三维重建工具链。
-它是 Python/PyTorch 项目，不参与 C++ 构建：仓库只跟踪其版本，使 `MeiFeatureTracker` 对齐的数据集
-布局与 MEI 内参 / 针孔缩放预处理，能跟随产出这些数据的模型一同演进。更新：
-`git submodule update --remote thirdparty/mast3r`。
+它是 Python/PyTorch 项目，不参与 C++ 编译；但在**运行期**是可选依赖：`2_subt_dataset --init mast3r`
+会调用 `scripts/mast3r_intrinsics.py`，从图像估计内参（见[内参来源](#内参来源)）。不开启时
+完全不受影响。
+
+跟随上游更新：`git submodule update --remote thirdparty/mast3r`。跑估计前需要先拉取嵌套的
+dust3r：`git submodule update --init --recursive thirdparty/mast3r`。
 
 ### 版本号
 
@@ -400,7 +405,8 @@ build-release/bin/2_subt_dataset \
     [--output traj.tum] [--start-frame N] [--max-frames N] [--stride N] \
     [--max-features N] [--max-duration S] [--ply cloud.ply] \
     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R] \
-    [--config config/config.lua]
+    [--config config/config.lua] \
+    [--init manual|mast3r] [--intrinsics-file FILE]
 ```
 
 `--config` 提供基线默认值，命令行参数优先。未指定时读取当前目录的 `config/config.lua`，
@@ -408,6 +414,46 @@ build-release/bin/2_subt_dataset \
 
 `--fx/--fy/--cx/--cy/--xi/--k1/--k2/--p1/--p2/--width/--height/--pinhole-scale` 可逐项覆盖
 MEI 内参。
+
+### 内参来源
+
+没有标定文件的序列可以不填任何相机参数，让 MASt3R 从图像估计：
+
+```bash
+scripts/run_subt.sh --init mast3r          # 或 2_subt_dataset ... --init mast3r
+```
+
+流程：
+
+1. 默认采样 6 对图像（`--mast3r-pairs`）送入 `thirdparty/mast3r` 的 MASt3R 模型，
+   用 `estimate_focal_knowing_depth` 从预测点图恢复焦距，主点取图像中心；
+2. 结果写成 `<cam_0>/../mast3r_intrinsics.txt` 并缓存，后续回放直接复用；
+   `--force-estimate` 强制重算，`--mast3r-cache` 可改缓存位置；
+3. 解析后把 MEI 的 `xi` 与畸变置零、`pinholeScale` 置一，使去畸变路径退化为恒等映射。
+
+推理需要 PyTorch 环境：用 `--python`、`MYSLAM_PYTHON` 或 `scripts/run_subt.sh` 的
+`MAST3R_PYTHON` 指向它（例如 conda 的 `mast3r` 环境），权重用 `--mast3r-weights` 或
+`MAST3R_WEIGHTS` 指定，默认在 `thirdparty/mast3r/checkpoints/` 下查找。
+
+两点限制：
+
+- MASt3R 输出的是**针孔模型**，对 >180° 视场的 MEI 鱼眼图只能给出近似焦距（实测 Handheld1
+  在 380–460 px 之间波动），需要准确内外参的精度评估仍应使用 yaml 标定值；
+- 自动估计只覆盖内参。相机-IMU 外参 `Tic` 仍需内置值或标定文件，MASt3R 无法给出。
+
+已有估计结果的机器可以跳过推理，直接 `--intrinsics-file result.txt`（格式见
+`src/dataset/intrinsics_file.hpp`）：
+
+```
+model = pinhole
+source = mast3r
+fx = 461.81
+fy = 461.81
+cx = 320.0
+cy = 240.0
+width = 640
+height = 480
+```
 
 ### 可视化
 
@@ -441,11 +487,15 @@ scripts/run_subt.sh --viz                    # 实时窗口
 scripts/run_subt.sh --video out.avi --ply cloud.ply
 scripts/run_subt.sh --plot                   # 回放后绘图
 scripts/run_subt.sh --no-build               # 跳过编译
+scripts/run_subt.sh --init mast3r            # 用 MASt3R 估计内参
 ```
 
 默认序列路径为 `../MASt3R-Fusion/dataset/Handheld1_Folder`，可用 `--root` 或 `SUBT_ROOT` 覆盖。
 默认从第 2300 帧开始（该序列前段存在曝光跳变与 IMU 断档）。未指定 `--max-frames` 时脚本使用
 `500000`。
+
+`--init mast3r` 会透传给回放工具，并把 `MAST3R_PYTHON` 导出为 `MYSLAM_PYTHON`，
+让 MASt3R 推理在你指定的解释器里运行。
 
 ### `scripts/plot_tum.py`
 
@@ -468,6 +518,7 @@ ctest --test-dir build --output-on-failure
 | :--- | :--- |
 | `myslam_test` | 公开 API 可用、关键帧非空、RMSE 在门限内、派生步长有效 |
 | `myslam_config_test` | 解析、钳位、交叉校验、未知键、四元数单位化、失败路径、日志节生效、默认配置自洽 |
+| `myslam_intrinsics_test` | MASt3R 内参文件解析：正常路径、缺失主点回退、缺字段/非法数值/非针孔模型/主点越界的拒绝 |
 
 CI（`.github/workflows/ci.yml`）在 Ubuntu 上使用 `g++-14` 执行格式检查、构建与测试，
 `clang-format` 固定为 23.1.3。

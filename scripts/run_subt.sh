@@ -18,6 +18,7 @@
 #   scripts/run_subt.sh --video out.avi --ply cloud.ply
 #   scripts/run_subt.sh --max-frames 0 --viz --viz-rate 1   # 全程实时播放
 #   OPENCV_BUNDLED=1 scripts/run_subt.sh            # 用 thirdparty/opencv 子模块构建 OpenCV
+#   scripts/run_subt.sh --init mast3r               # 用 MASt3R 估计内参，无需手填相机参数
 #
 set -euo pipefail
 
@@ -39,10 +40,15 @@ VIZ_RATE="${VIZ_RATE:-0}"
 PLOT="${PLOT:-0}"
 # 1 = 从 thirdparty/opencv 子模块构建 OpenCV（默认用系统包）
 OPENCV_BUNDLED="${OPENCV_BUNDLED:-0}"
+# 内参来源：空 = 用配置/内置默认值；mast3r = 从图像自动估计
+INIT_MODE="${INIT_MODE:-}"
+# 跑 MASt3R 估计的 Python 解释器（需装 torch/dust3r）
+MAST3R_PYTHON="${MAST3R_PYTHON:-${MYSLAM_PYTHON:-}}"
+FORCE_ESTIMATE="0"
 DO_BUILD=1
 
 usage() {
-    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     cat <<'EOF'
 
 可选参数:
@@ -60,6 +66,8 @@ usage() {
   --plot             回放结束后用 matplotlib 画出轨迹 PNG
   --build-dir DIR    CMake 构建目录（默认 ./build-release）
   --build-type T     Release（默认）或 Debug
+  --init MODE        manual（默认，用配置/内置参数）或 mast3r（从图像估计内参）
+  --force-estimate   忽略 MASt3R 内参缓存，重新估计
   --no-build         跳过配置与编译，直接运行已有二进制
   -h, --help         显示本帮助
 EOF
@@ -81,6 +89,8 @@ while [ $# -gt 0 ]; do
         --plot)         PLOT=1; shift ;;
         --build-dir)    BUILD_DIR="$2"; shift 2 ;;
         --build-type)   BUILD_TYPE="$2"; shift 2 ;;
+        --init)         INIT_MODE="$2"; shift 2 ;;
+        --force-estimate) FORCE_ESTIMATE=1; shift ;;
         --no-build)     DO_BUILD=0; shift ;;
         -h|--help)      usage; exit 0 ;;
         *) echo "未知参数: $1" >&2; usage >&2; exit 2 ;;
@@ -142,6 +152,7 @@ echo "    起始帧: $START_FRAME, 帧上限: $MAX_FRAMES (0=全部), stride: $S
 echo "    轨迹输出: $OUTPUT"
 [ -n "$VIDEO" ] && echo "    可视化视频: $VIDEO"
 [ -n "$PLY" ] && echo "    点云输出:   $PLY"
+[ -n "$INIT_MODE" ] && echo "    内参来源:   $INIT_MODE"
 [ "$VIZ" -eq 1 ] && echo "    实时窗口:   开启（ESC/q 退出），倍速 ${VIZ_RATE}（0=全速）"
 
 cd "$ROOT"
@@ -159,6 +170,10 @@ run_args=(
 [ "$VIZ" -eq 1 ] && run_args+=(--viz-rate "$VIZ_RATE")
 [ -n "$PLY" ] && run_args+=(--ply "$PLY")
 [ "$VIZ" -eq 1 ] && run_args+=(--viz)
+[ -n "$INIT_MODE" ] && run_args+=(--init "$INIT_MODE")
+[ "$FORCE_ESTIMATE" -eq 1 ] && run_args+=(--force-estimate)
+# MASt3R 推理用的解释器：C++ 侧读 MYSLAM_PYTHON
+[ -n "$MAST3R_PYTHON" ] && export MYSLAM_PYTHON="$MAST3R_PYTHON"
 "$BIN" "${run_args[@]}"
 
 if [ "$PLOT" -eq 1 ]; then

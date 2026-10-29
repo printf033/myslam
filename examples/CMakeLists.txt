@@ -23,4 +23,9 @@ if(MYSLAM_BUILD_DATASET_TOOLS)
     if(TARGET myslam::myslam_lua)
         target_link_libraries(2_subt_dataset PRIVATE myslam::myslam_lua)
     endif()
+
+    # --init mast3r 需要调用仓库内的内参估计脚本。把绝对路径编进去，
+    # 避免二进制在其它工作目录下运行时找不到 scripts/。
+    target_compile_definitions(2_subt_dataset PRIVATE
+        MYSLAM_MAST3R_SCRIPT="${PROJECT_SOURCE_DIR}/scripts/mast3r_intrinsics.py")
 endif()

@@ -87,6 +87,7 @@ and a keyframe triggers backend optimization followed by a propagator reset.
 | `lua_config.hpp` | Lua configuration loading producing `ProjectConfig` |
 | `log_config.hpp` | Thin wrapper over the mylog C++ API (level + file output) |
 | `dataset/configHolder.hpp` | Replay configuration and statistics structs; standard library only, no OpenCV |
+| `dataset/intrinsics_file.hpp` | Parser for intrinsics estimated by external tools such as MASt3R (standard library only) |
 | `dataset/subt_dataset.hpp` | SubT sequence reader: IMU CSV, camera timestamps, image index |
 | `dataset/mei_tracker.hpp` | MEI model distortion correction and GFTT + LK optical-flow tracking |
 | `dataset/dataset_runner.hpp` | Recorded-sequence replay orchestration reusing the VIO components |
@@ -185,6 +186,7 @@ myslam/
 | Build tool | Ninja or Make |
 | System libraries | TBB, Boost, Eigen3, Threads |
 | LuaJIT | 2.1+, discoverable via `pkg-config`; when missing, Lua support is turned off automatically |
+| MASt3R | Only for `--init mast3r`: a PyTorch environment plus the checkpoint; otherwise unused |
 | OpenCV | 4.x, only when `MYSLAM_BUILD_DATASET_TOOLS=ON`; taken from the system by default, or built from `thirdparty/opencv` with `MYSLAM_USE_BUNDLED_OPENCV=ON` |
 | clang-format | 23.1.3 (commit hook and CI both check against this version) |
 
@@ -273,10 +275,14 @@ active. Follow upstream with `git submodule update --remote thirdparty/opencv`.
 ### MASt3R
 
 `thirdparty/mast3r` pins [naver/mast3r](https://github.com/naver/mast3r), the reconstruction stack
-behind the SubT sequences. It is a Python/PyTorch project, so it takes no part in the C++ build: the
-repository only tracks the version so the dataset layout and the MEI intrinsics / pinhole-scale
-preprocessing that `MeiFeatureTracker` mirrors stay in sync with the model that produced them.
-Update it with `git submodule update --remote thirdparty/mast3r`.
+behind the SubT sequences. It is a Python/PyTorch project, so it takes no part in the C++ build — but
+it is an optional **runtime** dependency: `2_subt_dataset --init mast3r` calls
+`scripts/mast3r_intrinsics.py` to estimate intrinsics from the images (see
+[Where the intrinsics come from](#where-the-intrinsics-come-from)). Without that flag it is never
+touched.
+
+Update it with `git submodule update --remote thirdparty/mast3r`. Estimation also needs the nested
+dust3r checkout: `git submodule update --init --recursive thirdparty/mast3r`.
 
 ### Version
 
@@ -432,7 +438,8 @@ build-release/bin/2_subt_dataset \
     [--output traj.tum] [--start-frame N] [--max-frames N] [--stride N] \
     [--max-features N] [--max-duration S] [--ply cloud.ply] \
     [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R] \
-    [--config config/config.lua]
+    [--config config/config.lua] \
+    [--init manual|mast3r] [--intrinsics-file FILE]
 ```
 
 `--config` supplies baseline defaults; command-line arguments take precedence. When omitted, it
@@ -440,6 +447,52 @@ reads `config/config.lua` in the current directory, else uses built-in defaults.
 
 `--fx/--fy/--cx/--cy/--xi/--k1/--k2/--p1/--p2/--width/--height/--pinhole-scale` override MEI
 intrinsics individually.
+
+### Where the intrinsics come from
+
+Sequences that ship no calibration file can skip the camera parameters entirely and let MASt3R
+estimate them from the images:
+
+```bash
+scripts/run_subt.sh --init mast3r          # or 2_subt_dataset ... --init mast3r
+```
+
+How it works:
+
+1. Six image pairs by default (`--mast3r-pairs`) are fed to the MASt3R model in
+   `thirdparty/mast3r`; a focal length is recovered from the predicted point maps with
+   `estimate_focal_knowing_depth`, the principal point is taken as the image centre;
+2. the result is written to `<cam_0>/../mast3r_intrinsics.txt` and cached, so later replays skip the
+   inference; `--force-estimate` recomputes it and `--mast3r-cache` relocates it;
+3. the parser zeroes the MEI `xi` and distortion terms and sets `pinholeScale` to one, so the
+   undistortion path degenerates to identity.
+
+Inference needs a PyTorch environment: point `--python`, `MYSLAM_PYTHON` or the script's
+`MAST3R_PYTHON` at it (the conda `mast3r` env works), and pass the checkpoint with
+`--mast3r-weights` or `MAST3R_WEIGHTS`; by default it is looked up under
+`thirdparty/mast3r/checkpoints/`.
+
+Two limits worth knowing:
+
+- MASt3R predicts a **pinhole** model, so on a >180° MEI fisheye it only yields an approximate
+  focal (Handheld1 lands anywhere in 380–460 px), and accuracy evaluation still needs the yaml
+  calibration;
+- estimation covers intrinsics only. The camera-IMU extrinsic `Tic` still comes from the built-in
+  value or a calibration file — MASt3R cannot provide it.
+
+Machines that already have an estimate can skip inference with `--intrinsics-file result.txt`
+(format documented in `src/dataset/intrinsics_file.hpp`):
+
+```
+model = pinhole
+source = mast3r
+fx = 461.81
+fy = 461.81
+cx = 320.0
+cy = 240.0
+width = 640
+height = 480
+```
 
 ### Visualization
 
@@ -474,11 +527,15 @@ scripts/run_subt.sh --viz                    # live window
 scripts/run_subt.sh --video out.avi --ply cloud.ply
 scripts/run_subt.sh --plot                   # plot the trajectory afterwards
 scripts/run_subt.sh --no-build               # skip the build
+scripts/run_subt.sh --init mast3r            # estimate intrinsics with MASt3R
 ```
 
 The default sequence path is `../MASt3R-Fusion/dataset/Handheld1_Folder`, overridable with
 `--root` or `SUBT_ROOT`. It starts at frame 2300 (that sequence has exposure jumps and an IMU gap
 early on). When `--max-frames` is not given, the script uses `500000`.
+
+`--init mast3r` forwards to the replay tool and sets `MYSLAM_PYTHON` from `MAST3R_PYTHON`, so
+the MASt3R inference runs in the interpreter you name.
 
 ### `scripts/plot_tum.py`
 
@@ -502,6 +559,7 @@ ctest --test-dir build --output-on-failure
 | :--- | :--- |
 | `myslam_test` | Public API usable, keyframes produced, RMSE within threshold, derived step valid |
 | `myslam_config_test` | Parsing, clamping, cross-validation, unknown keys, quaternion normalization, failure paths, logging section effect, default-config self-consistency |
+| `myslam_intrinsics_test` | MASt3R intrinsics file: happy path, principal-point fallback, and rejection of missing fields, malformed numbers, non-pinhole models and out-of-frame principal points |
 
 CI (`.github/workflows/ci.yml`) runs format checking, a build, and the suite on Ubuntu with
 `g++-14`, pinning `clang-format` 23.1.3.
