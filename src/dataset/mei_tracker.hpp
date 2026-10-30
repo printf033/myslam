@@ -88,12 +88,24 @@ namespace myslam::dataset
 
         /**
          * @brief 处理一帧灰度图，返回带跨帧 featureId 的特征集合
+         *
+         * @param gray 原始鱼眼灰度图
+         * @param frameId 图像帧编号，写入返回的 CameraFrame
+         * @param timestamp 曝光时刻 (s)
+         * @param[out] rawPixels 可选：与返回的 features 一一对应的原始鱼眼像素坐标。
+         *             @c features 里的 uv 是虚拟针孔坐标，叠加在原图上会错位；
+         *             可视化需要这份原始坐标才能把点画在鱼眼图上。
          */
-        vio::CameraFrame track(const cv::Mat &gray, int frameId, double timestamp)
+        vio::CameraFrame track(const cv::Mat &gray, int frameId, double timestamp,
+                               std::vector<cv::Point2f> *rawPixels = nullptr)
         {
             vio::CameraFrame frame;
             frame.frameId = frameId;
             frame.timestamp = timestamp;
+            if (rawPixels != nullptr)
+            {
+                rawPixels->clear();
+            }
 
             std::vector<cv::Point2f> candidates; // 原始像素坐标
             std::vector<int> candidateIds;
@@ -191,6 +203,10 @@ namespace myslam::dataset
             prevGray_ = gray.clone();
             prevPoints_ = validRaw;
             prevIds_ = validIds;
+            if (rawPixels != nullptr)
+            {
+                *rawPixels = validRaw;
+            }
 
             frame.features.reserve(validRaw.size());
             for (std::size_t i = 0; i < validRaw.size(); ++i)
@@ -207,6 +223,9 @@ namespace myslam::dataset
                          trackedCount, prevCount, newCount, rejectedByMei, rejectedByBounds, frame.features.size());
             return frame;
         }
+
+        /// 有效视场掩码（CV_8U，255 = 该原始像素能映射进虚拟针孔画幅）
+        const cv::Mat &validMask() const { return validMask_; }
 
     private:
         /**

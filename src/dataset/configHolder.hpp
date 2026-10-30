@@ -54,10 +54,13 @@ namespace myslam::dataset
     {
         bool showWindow{false};          ///< 打开实时窗口
         std::filesystem::path videoPath; ///< 视频输出路径，空则不写
-        int displayStride{1};            ///< 每多少帧渲染一次（1=每帧）
-        int panelHeight{180};            ///< 底部状态栏高度（像素）
-        int trailMaxPoints{20000};       ///< 轨迹小地图保留的最大点数
-        int videoFps{20};                ///< 视频帧率
+        /// 是否在画面右侧并排显示 MEI 去畸变后的虚拟针孔图像。
+        /// 该图与跟踪器输出的特征像素坐标同源，能直观看出鱼眼畸变被拉直的效果。
+        bool showUndistorted{true};
+        int displayStride{1};      ///< 每多少帧渲染一次（1=每帧）
+        int panelHeight{180};      ///< 底部状态栏高度（像素）
+        int trailMaxPoints{20000}; ///< 轨迹小地图保留的最大点数
+        int videoFps{20};          ///< 视频帧率
         /// 播放倍速：0 = 不限速（离线全速，约 100+ 帧/秒）；
         /// 1 = 按相机时间戳实时播放；2 = 两倍速。仅作用于实时窗口。
         double playbackRate{0.0};

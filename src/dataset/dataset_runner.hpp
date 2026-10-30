@@ -16,6 +16,7 @@
 
 #include "dataset/configHolder.hpp"
 #include "dataset/mei_tracker.hpp"
+#include "dataset/mei_undistort.hpp"
 #include "dataset/ply_export.hpp"
 #include "dataset/subt_dataset.hpp"
 #include "dataset/visualizer.hpp"
@@ -106,6 +107,15 @@ namespace myslam::dataset
             DatasetRunReport report;
             report.segments = 1; // 首个流水线构成第 1 段
             DatasetVisualizer visualizer(runConfig_.viz);
+            // 去畸变图只在真要渲染时生成：没开窗口/录像时每帧 remap 纯属浪费。
+            // 跟踪器自己的有效视场掩码直接拿来描边，不再重复算一遍映射。
+            std::optional<MeiUndistorter> undistorter;
+            if (visualizer.active() && runConfig_.viz.showUndistorted)
+            {
+                undistorter.emplace(intrinsics_);
+                mylog::info("[可视化] MEI 去畸变图: 虚拟针孔映射覆盖率 {:.1f}%", 100.0 * undistorter->validRatio());
+            }
+            std::vector<cv::Point2f> rawPixels;            // 与 frame.features 对齐的原始鱼眼像素
             std::vector<gtsam::Point2> trail;              // 关键帧 XY 轨迹（用于小地图）
             std::vector<gtsam::Point3> exportedLandmarks;  // 跨重置累积的路标点
             std::vector<gtsam::Point3> exportedTrajectory; // 跨重置累积的轨迹点
@@ -313,7 +323,8 @@ namespace myslam::dataset
                     return report;
                 }
 
-                const vio::CameraFrame frame = pipeline->tracker.track(gray, static_cast<int>(frameIndex), cameraTime);
+                const vio::CameraFrame frame = pipeline->tracker.track(gray, static_cast<int>(frameIndex), cameraTime,
+                                                                       visualizer.active() ? &rawPixels : nullptr);
                 ++report.framesProcessed;
                 lastProcessedTime = cameraTime;
 
@@ -327,7 +338,14 @@ namespace myslam::dataset
                                   std::string(vio::systemStateToString(pipeline->initializer.state())).c_str(),
                                   report.imuSamples, report.resets);
                     std::string line3 = "ESC/q to quit";
-                    visualizer.update(gray, frame, trail, {line1, line2, line3}, cameraTime);
+                    cv::Mat undistortedImage;
+                    if (undistorter)
+                    {
+                        undistortedImage = undistorter->apply(gray);
+                    }
+                    visualizer.update(gray, frame, trail, {line1, line2, line3}, cameraTime,
+                                      undistorter ? &undistortedImage : nullptr, undistorter ? &rawPixels : nullptr,
+                                      undistorter ? &pipeline->tracker.validMask() : nullptr);
                     if (visualizer.shouldQuit())
                     {
                         break;

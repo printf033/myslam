@@ -1003,11 +1003,12 @@ namespace myslam::config
                 const int tableIdx = lua_gettop(L);
                 constexpr std::string_view kSection = "dataset.viz";
                 checkUnknownKeys(L, tableIdx, kSection,
-                                 {"showWindow", "videoPath", "displayStride", "panelHeight", "trailMaxPoints",
-                                  "videoFps", "playbackRate"});
+                                 {"showWindow", "videoPath", "showUndistorted", "displayStride", "panelHeight",
+                                  "trailMaxPoints", "videoFps", "playbackRate"});
 
                 loadBool(L, tableIdx, kSection, "showWindow", cfg.viz.showWindow);
                 loadPath(L, tableIdx, kSection, "videoPath", cfg.viz.videoPath);
+                loadBool(L, tableIdx, kSection, "showUndistorted", cfg.viz.showUndistorted);
                 loadInteger(L, tableIdx, kSection, "displayStride", 1, 10'000, cfg.viz.displayStride);
                 // 状态栏高度为 0 时下面的面板是空 Mat，cv::rectangle / cv::vconcat
                 // 会直接断言失败并 terminate。

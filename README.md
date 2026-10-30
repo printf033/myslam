@@ -517,9 +517,17 @@ which also invalidates caches produced by the earlier revision so they get recom
 - `--video FILE`: encode to video (falls back to `.avi`/MJPG when mp4 is unavailable)
 - `--viz-rate R`: `0` full speed, `1` real time, `2` double speed
 
-Layout: the image with features on top (green = tracked from the previous frame, orange = newly
-detected); the bottom status bar holds a trajectory minimap on the left and status text on the
-right.
+Layout: the top-left panel is the raw fisheye image with features in raw pixel coordinates and a
+cyan outline of the usable MEI field of view; the top-right panel is the same frame warped into the
+virtual pinhole image the tracker works in, with features in pinhole coordinates. The bottom status
+bar holds a trajectory minimap on the left and status text on the right. Green = tracked from the
+previous frame, orange = newly detected.
+
+The undistorted view shares the virtual pinhole intrinsics used for reprojection (`pinholeScale`
+times the focal length); its black border is the part of the pinhole canvas the fisheye frame does
+not cover. It is a reference view: tracked features already live in that canvas, so drawing them on
+the raw fisheye image would shift them systematically — each panel uses its own pixel coordinates.
+Set `dataset.viz.showUndistorted = false` to drop the right panel (and the per-frame remap).
 
 ### Inspecting trajectories
 

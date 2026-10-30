@@ -121,6 +121,9 @@ dataset = {
     viz = {
         showWindow = false, -- 打开实时窗口（需要 DISPLAY）
         videoPath = "",     -- 视频输出路径，空则不写
+        -- 画面右侧并排显示 MEI 去畸变后的虚拟针孔图像（与特征点坐标系一致），
+        -- 关掉可省掉每帧一次 remap，只看原始鱼眼图
+        showUndistorted = true,
         displayStride = 1,  -- 每多少帧渲染一次
         panelHeight = 180,  -- 底部状态栏高度（像素）
         trailMaxPoints = 20000, -- 轨迹小地图保留的最大点数

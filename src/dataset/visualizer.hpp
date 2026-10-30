@@ -8,8 +8,13 @@
  *   - `showWindow`：OpenCV 窗口实时显示（需要 DISPLAY，按 q/ESC 退出）；
  *   - `videoPath`：把同样画面编码写入视频文件，便于回看与分享。
  *
- * 画面布局：上方为原图叠加特征点（绿色=跨帧跟踪成功，橙色=本帧新增），
- * 下方为状态栏：左侧是轨迹小地图（世界系 XY），右侧是运行状态文字。
+ * 画面布局：上方左半是原始鱼眼图（叠加原始像素坐标的特征点与 MEI 有效视场
+ * 轮廓），右半是同一帧经 MEI 去畸变后的虚拟针孔图像（叠加跟踪器实际使用的
+ * 针孔像素坐标）；下方为状态栏：左侧是轨迹小地图（世界系 XY），右侧是运行
+ * 状态文字。颜色约定：绿色=跨帧跟踪成功，橙色=本帧新增。
+ *
+ * 两侧必须使用各自的像素坐标：跟踪器输出的 uv 是虚拟针孔坐标，直接画在
+ * 鱼眼原图上会系统性偏移，看起来像跟踪错乱。
  */
 
 #include "dataset/configHolder.hpp"
@@ -92,13 +97,18 @@ namespace myslam::dataset
          * @brief 渲染一帧
          *
          * @param gray 原始灰度图
-         * @param frame 该帧的特征观测
+         * @param frame 该帧的特征观测（uv 为虚拟针孔坐标）
          * @param trail 世界系 XY 轨迹点（关键帧位姿）
          * @param statusLines 状态栏文字（英文，OpenCV 不支持中文渲染）
          * @param cameraTime 该帧的相机时间戳（秒），用于按真实节奏节流
+         * @param undistorted 可选：同一帧的 MEI 去畸变图像（虚拟针孔画幅）
+         * @param rawPixels 可选：与 @p frame.features 一一对应的原始鱼眼像素坐标
+         * @param rawMask 可选：原图有效视场掩码（CV_8U，非零为可用像素）
          */
         void update(const cv::Mat &gray, const vio::CameraFrame &frame, const std::vector<gtsam::Point2> &trail,
-                    const std::vector<std::string> &statusLines, double cameraTime)
+                    const std::vector<std::string> &statusLines, double cameraTime,
+                    const cv::Mat *undistorted = nullptr, const std::vector<cv::Point2f> *rawPixels = nullptr,
+                    const cv::Mat *rawMask = nullptr)
         {
             if (!active_ || quit_)
             {
@@ -109,7 +119,7 @@ namespace myslam::dataset
                 return;
             }
 
-            cv::Mat canvas = buildCanvas(gray, frame, trail, statusLines);
+            cv::Mat canvas = buildCanvas(gray, frame, trail, statusLines, undistorted, rawPixels, rawMask);
             if (canvas.empty())
             {
                 return;
@@ -130,6 +140,16 @@ namespace myslam::dataset
 
             if (config_.showWindow)
             {
+                // 并排布局后画幅变宽，构造时的固定窗口尺寸会把画面压扁。
+                // 首次拿到真实画幅后按比例缩放到目标宽度（不超过 1600 px）。
+                if (!windowSized_)
+                {
+                    windowSized_ = true;
+                    const int targetWidth = std::min(1600, canvas.cols);
+                    const double scale = static_cast<double>(targetWidth) / static_cast<double>(canvas.cols);
+                    cv::resizeWindow(kWindowName, targetWidth,
+                                     static_cast<int>(std::lround(static_cast<double>(canvas.rows) * scale)));
+                }
                 cv::imshow(kWindowName, canvas);
                 const int key = cv::waitKey(1);
                 if (key == 27 || key == 'q' || key == 'Q')
@@ -216,40 +236,112 @@ namespace myslam::dataset
         }
 
         cv::Mat buildCanvas(const cv::Mat &gray, const vio::CameraFrame &frame, const std::vector<gtsam::Point2> &trail,
-                            const std::vector<std::string> &statusLines)
+                            const std::vector<std::string> &statusLines, const cv::Mat *undistorted,
+                            const std::vector<cv::Point2f> *rawPixels, const cv::Mat *rawMask)
         {
             if (gray.empty())
             {
                 return {};
             }
-            cv::Mat bgr;
-            if (gray.channels() == 1)
+            cv::Mat left = toBgr(gray);
+            if (rawMask != nullptr && !rawMask->empty())
             {
-                cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
+                drawMaskOutline(left, *rawMask);
             }
-            else
-            {
-                bgr = gray.clone();
-            }
+            // 原图这一侧用原始鱼眼像素，坐标才对得上
+            drawFeatures(left, frame, rawPixels);
+            drawCaption(left, "raw fisheye");
 
-            for (const auto &feat : frame.features)
+            cv::Mat top = left;
+            if (undistorted != nullptr && !undistorted->empty())
             {
-                const cv::Point pt(cvRound(feat.uv.x()), cvRound(feat.uv.y()));
-                // 跟踪成功=绿色，新增=橙色
-                const cv::Scalar color = feat.isNew ? cv::Scalar(0, 165, 255) : cv::Scalar(0, 255, 0);
-                cv::circle(bgr, pt, 3, color, 1, cv::LINE_AA);
+                cv::Mat right = toBgr(*undistorted);
+                if (right.size() != left.size())
+                {
+                    cv::resize(right, right, left.size(), 0.0, 0.0, cv::INTER_LINEAR);
+                }
+                // 矫正图这一侧用虚拟针孔像素（即跟踪器输出的 uv）
+                drawFeatures(right, frame, nullptr);
+                drawCaption(right, "MEI undistorted (virtual pinhole)");
+                cv::hconcat(left, right, top);
+                // 中缝分隔线
+                cv::line(top, cv::Point(left.cols, 0), cv::Point(left.cols, top.rows - 1), cv::Scalar(70, 70, 70), 2);
             }
 
             // panelHeight 为 0 时 panel 是空 Mat，后续 rectangle/vconcat 会断言失败。
             // 配置层已把下界提到 1，这里对直接构造 VisualizationConfig 的调用方兜底。
             const int panelHeight = std::max(1, config_.panelHeight);
-            cv::Mat panel = cv::Mat::zeros(panelHeight, bgr.cols, CV_8UC3);
+            cv::Mat panel = cv::Mat::zeros(panelHeight, top.cols, CV_8UC3);
             drawTrail(panel, trail);
             drawStatus(panel, statusLines);
 
             cv::Mat canvas;
-            cv::vconcat(bgr, panel, canvas);
+            cv::vconcat(top, panel, canvas);
             return canvas;
+        }
+
+        static cv::Mat toBgr(const cv::Mat &image)
+        {
+            if (image.channels() == 1)
+            {
+                cv::Mat bgr;
+                cv::cvtColor(image, bgr, cv::COLOR_GRAY2BGR);
+                return bgr;
+            }
+            return image.clone();
+        }
+
+        /// 画特征点；@p rawPixels 为空时按 @c frame.features 的 uv 画
+        void drawFeatures(cv::Mat &image, const vio::CameraFrame &frame,
+                          const std::vector<cv::Point2f> *rawPixels) const
+        {
+            if (rawPixels != nullptr)
+            {
+                // 与 features 对不上时宁可不画，也不要画错位的点
+                if (rawPixels->size() != frame.features.size())
+                {
+                    return;
+                }
+                for (std::size_t i = 0; i < frame.features.size(); ++i)
+                {
+                    // 跟踪成功=绿色，新增=橙色
+                    const cv::Scalar color = frame.features[i].isNew ? cv::Scalar(0, 165, 255) : cv::Scalar(0, 255, 0);
+                    cv::circle(image, cv::Point(cvRound((*rawPixels)[i].x), cvRound((*rawPixels)[i].y)), 3, color, 1,
+                               cv::LINE_AA);
+                }
+                return;
+            }
+            for (const auto &feat : frame.features)
+            {
+                const cv::Scalar color = feat.isNew ? cv::Scalar(0, 165, 255) : cv::Scalar(0, 255, 0);
+                cv::circle(image, cv::Point(cvRound(feat.uv.x()), cvRound(feat.uv.y())), 3, color, 1, cv::LINE_AA);
+            }
+        }
+
+        /// 描出 MEI 有效视场边界：原图外围无法映射进虚拟针孔画幅的部分都是废像素
+        void drawMaskOutline(cv::Mat &image, const cv::Mat &mask)
+        {
+            if (mask.size() != image.size() || mask.type() != CV_8UC1)
+            {
+                return;
+            }
+            // 掩码在一次回放里是恒定的，轮廓只算一次；每帧 findContours 纯属浪费。
+            if (!maskContoursReady_ || maskContoursSize_ != mask.size())
+            {
+                maskContours_.clear();
+                cv::findContours(mask.clone(), maskContours_, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                maskContoursSize_ = mask.size();
+                maskContoursReady_ = true;
+            }
+            cv::drawContours(image, maskContours_, -1, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+        }
+
+        static void drawCaption(cv::Mat &image, const std::string &text)
+        {
+            // 先黑底描边再写白字：图像亮暗都能看清，且不遮住下方特征点
+            const cv::Point origin(8, 20);
+            cv::putText(image, text, origin, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+            cv::putText(image, text, origin, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(235, 235, 235), 1, cv::LINE_AA);
         }
 
         void drawTrail(cv::Mat &panel, const std::vector<gtsam::Point2> &trail) const
@@ -324,6 +416,10 @@ namespace myslam::dataset
         bool quit_{false};
         std::size_t skipCounter_{0};
         bool writerTried_{false};
+        bool windowSized_{false};
+        bool maskContoursReady_{false};
+        cv::Size maskContoursSize_{};
+        std::vector<std::vector<cv::Point>> maskContours_;
         bool timingStarted_{false};
         double baseCameraTime_{0.0};
         std::chrono::steady_clock::time_point baseWallTime_{};
