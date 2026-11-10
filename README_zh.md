@@ -2,8 +2,10 @@
 
 [English](README.md) | 简体中文
 
-C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `IncrementalFixedLagSmoother`，
-将 IMU 预积分因子与视觉重投影因子放进同一个因子图，按时间窗口边缘化。
+C++26 实现的视觉惯性里程计（VIO）。**契约由项目自己持有，而不是由求解器持有**：
+`src/domain/` 定义位姿、观测、关键帧、相机模型与估计器端口，不包含任何第三方估计器或视觉库。
+GTSAM 的 `IncrementalFixedLagSmoother` 是参考后端，位于 `src/adapters/`，与第二个非 GTSAM 后端
+一起藏在该端口之后。运行哪一个由配置键决定。
 
 - **语言标准**：C++26（由 CMake 强制）
 - **依赖**：[GTSAM](https://github.com/borglab/gtsam) 4.3、[mylog](https://github.com/printf033/mylog)、
@@ -28,77 +30,165 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 - [脚本](#脚本)
 - [测试](#测试)
 - [工程规范](#工程规范)
+- [设计决策](#设计决策)
 - [当前限制](#当前限制)
 
 ---
 
 ## 系统架构
 
-系统由五部分组成，按调用顺序排列：
+设计是**端口 + 适配器，契约自持**：编排核心只依赖 `src/domain/`，每一种可替换的技术都藏在
+领域层定义的接口之后。
 
-1. **初始化器** `VioInitializer` — 状态机 `UNINITIALIZED → STATIONARY_COLLECTING →
-   GRAVITY_ALIGNED → TRACKING_OK`，异常时进入 `LOST_DEGRADED` 并重建流水线。静止判定同时使用加速度与
-   陀螺标准差（阈值随噪声配置与采样率缩放）；重力对齐后执行陀螺零偏标定，输出初始位姿、速度与零偏。
-   超过 `system.initTimeout` 仍未满足静止条件时自动放宽为非静止对齐，此时角速度均值混入真实运动，
-   不再用作陀螺零偏先验（置零交由后端在线估计）。
-2. **关键帧决策** `KeyframeSelector` — 按平均视差、特征留存率、时间保底三项判据决定当前
-   相机帧是否作为关键帧进入后端。时间保底判据附加最小三角化视差条件。
-3. **后端** `VioBackend` — 组合 `CombinedImuFactor`（IMU 预积分）与 `ProjectionFactor`
-   （视觉重投影），由 `IncrementalFixedLagSmoother` 在 `slidingWindowLag` 时间窗口内求解并
-   边缘化窗口外状态。视觉残差使用 Huber 核。
-4. **外推器** `HighRatePropagator` — 在两次优化之间按 IMU 采样递推状态，并在每次优化后以
-   优化结果重置递推基线。
-5. **健康监测** `HealthMonitor` — 检查零偏模长、速度模长与活跃观测数，超阈值时返回告警文本。
+```
+domain/            契约与值类型      （仅 Eigen + 日志）
+  ↓
+adapters/          估计器实现        （GTSAM、纯 IMU 积分）
+frontend/          图像 → 观测       （OpenCV 光流）
+sensor/            数据来源          （仿真器、数据集读取）
+pipeline/          编排核心          （只依赖 domain/）
+app/               基准与回放        （+ adapters、sensor、frontend）
+viz/               显示              （+ OpenCV）
+```
 
-仿真与真实数据集两条输入路径复用上述全部组件，仅替换传感器来源。
+`myslam::pipeline` 既不链接 GTSAM 也不链接 OpenCV。这一点有两重保证：`scripts/check_layers.py`
+拒绝越层 include；只链接 `myslam::pipeline` 的独立程序能在干净工程里编译链接（本次重构已实测）。
+
+五个可替换端口：
+
+- **`domain::IEstimator`** — 后端。接收一个关键帧**以及覆盖它的那段 IMU**，因此实现自行决定是
+  预积分、批量积分还是别的做法。它返回带 `StepStatus` 与 `RecoveryAction` 的 `StepResult`，
+  恢复策略由此由估计器表达，而不是由编排层猜。实现：`adapters::FixedLagEstimator`
+  （`gtsam_fixed_lag`）与 `adapters::ImuOnlyEstimator`（`imu_only`）。
+- **`domain::IObservationExtractor`** — 图像 → 带跨帧 ID 的观测。OpenCV 实现为
+  `vio::MeiFeatureTracker`；稠密前端或学习型前端实现同一个方法即可。
+- **`domain::ICameraModel`** — 像素 ↔ 射线。`PinholeCameraModel`（也用作 MEI 相机的虚拟针孔）与
+  `MeiCameraModel`（真实全向）。需要针孔标定的估计器会在装配期拒绝不提供该能力的模型。
+- **`domain::IStatePropagator`** — 可选：优化之间的 IMU 频率输出。
+- **`domain::ISensorSource`** — 查询式来源（仿真器、批处理回放）。
+
+估计器选择是 `vio.estimator` 上的注册表查找，**没有静默回退**：未知名字在装配期失败并列出已注册项。
+换后端是一次配置改动：
+
+```lua
+vio = { estimator = "imu_only" }
+```
+
+### 流水线各阶段
+
+1. **初始化器** `domain::Initializer` — 状态机 `UNINITIALIZED → STATIONARY_COLLECTING →
+   GRAVITY_ALIGNED → TRACKING_OK`。降级是一次事件（`StepResult::recovery`）而不是状态：
+   没有会"卡住"的 `LOST_DEGRADED` 节点。静止判定同时使用加速度与陀螺标准差，
+   门限随噪声密度与采样率缩放；重力对齐之后做陀螺零偏标定。若
+   `vio.initialization.timeoutSeconds`（Lua 键 `system.initTimeout`）到期仍未满足静止条件，
+   对齐放宽为非静止路径，此时角速度均值混有真实运动，故不作为零偏先验。设
+   `vio.gravityAlignment = false` 可整体跳过作为消融；`vio.initialTiltDeg` 在此基础上注入倾斜。
+2. **关键帧决策** `domain::KeyframeSelector` — 平均视差、特征留存率与时间保底；保底判据额外要求
+   最小三角化视差。视差取像素距离，而观测本身就产生在估计器声明的模型下，因此配置里的像素阈值
+   与观测像素同源。
+3. **估计器** — 组合 IMU 预积分因子与视觉重投影因子，在固定滞后窗口上求解并边缘化离开窗口的状态。
+   GTSAM 适配器只是这个位置的一个实现。
+4. **外推器** `domain::StatePropagator` — 优化之间按 IMU 频率递推，每次优化后重置基线。
+5. **健康监控** `domain::HealthMonitor` — 零偏模长、速度模长、活跃观测数，带连续异常计数。
+   结论类型在 `domain/status.hpp`。
+
+仿真与数据集回放复用上述全部组件，只有数据供给不同。
 
 ## 数据流
 
 ![系统架构](docs/architecture_zh.svg)
 
 图中两列对应两个采样速率。每列分为初始化与追踪两个阶段：同一列内两个阶段由当前
-`SystemState` 决定，互斥执行。蓝色框为同一个 `VioBackend` 实例在两个速率路径上的调用。
+`SystemState` 决定，互斥执行。蓝色框为同一个估计器实例在两个速率路径上的调用。
 
-主循环由 `VioSystem::run()` 驱动：以 IMU 采样步长推进时间，每次 IMU 到达时更新预积分或外推；
+主循环由 `VioBenchmark::run()` 驱动：以 IMU 采样步长推进时间，每次 IMU 到达时更新预积分或外推；
 相机帧到达时执行初始化或关键帧决策，关键帧触发后端优化并重置外推基线。
 
 ## 模块职责
 
 | 模块 | 职责 |
 | :--- | :--- |
-| `vio/configHolder.hpp` | 传感器数据结构（`ImuMeasurement` / `CameraFrame` / `FeatureObservation`）与配置结构 `VioConfig` |
-| `vio/initializer.hpp` | 初始化状态机 `SystemState` 与静止检测、重力对齐、零偏标定 |
-| `vio/keyframe_selector.hpp` | 关键帧决策，返回 `DecisionResult`（是否关键帧、原因、视差、留存率） |
-| `vio/backend.hpp` | 因子图构建、三角化、分层外点门控、边缘化、`latestNavState()` |
-| `vio/propagator.hpp` | IMU 频率状态递推与基线重置 |
-| `vio/health_monitor.hpp` | 零偏、速度、观测数检查，返回 `HealthReport` |
-| `vio/simulator.hpp` | 3D 轨迹与 IMU / 相机观测生成，附解析真值 |
-| `vio/system.hpp` | 双速率主循环编排、`SystemConfig`、精度评估 |
-| `vio/vio.hpp` | 聚合头，包含上述全部组件 |
-| `lua_config.hpp` | Lua 配置加载，产出 `ProjectConfig` |
-| `log_config.hpp` | mylog C++ API 封装（级别 + 文件输出） |
-| `dataset/configHolder.hpp` | 回放配置与统计结构；只含标准库，不含 OpenCV |
-| `dataset/intrinsics_file.hpp` | 解析 MASt3R 等外部工具估计的内参文件（纯标准库） |
-| `dataset/subt_dataset.hpp` | SubT 序列读取：IMU CSV、相机时间戳、图像索引 |
-| `dataset/mei_tracker.hpp` | MEI 模型畸变校正与 GFTT + LK 光流跟踪 |
-| `dataset/dataset_runner.hpp` | 真实序列回放编排，复用 VIO 组件 |
-| `dataset/visualizer.hpp` | OpenCV 窗口与视频输出 |
-| `dataset/ply_export.hpp` | 路标与轨迹导出为 PLY |
+| **`domain/`** — 契约与值类型；不含求解器、不含视觉库 ||
+| `domain/types.hpp` | `Pose` / `Bias` / `KinematicState` / `ImuSample` / `ImuSlice` / `Observation` / `Keyframe` / `EstimateSnapshot` |
+| `domain/status.hpp` | `SystemState` / `Degradation` / `HealthReport` / `StepStatus` / `RecoveryAction` |
+| `domain/ports.hpp` | 五个端口，以及 `EstimatorBundle`、`EstimatorFactory` |
+| `domain/registry.hpp` | 按名字索引的估计器注册表；未知名字失败并列出已注册项 |
+| `domain/config.hpp` | 分组 `PipelineConfig`（camera / imu / vision / initialization / estimator / health）、`SystemConfig`、`RunReport`、`isAcceptable` |
+| `domain/camera_intrinsics.hpp` | 针孔与 MEI 共用的统一内参 |
+| `domain/camera_model.hpp` | `ICameraModel` 端口 + 针孔 / MEI 实现 + `IPinholeCalibration` 能力 |
+| `domain/initializer.hpp` | 状态机、静止检测、重力对齐、零偏标定 |
+| `domain/keyframe_selector.hpp` | 关键帧决策与视差→角度换算 |
+| `domain/health_monitor.hpp` | 零偏 / 速度 / 观测诊断，带滞回 |
+| `domain/propagator.hpp` | IMU 频率状态递推 |
+| `domain/time_synchronizer.hpp` | IMU 缓冲、零阶保持、断档检测、时间偏移、乱序丢弃 |
+| **`adapters/`** — 唯一出现求解器的地方 ||
+| `adapters/gtsam/fixed_lag_estimator.hpp` | 因子图、三角化、分层外点门控、iSAM2 固定滞后平滑 |
+| `adapters/gtsam/types.hpp` | 领域类型 ↔ GTSAM 类型 |
+| `adapters/simple/imu_only_estimator.hpp` | 纯 IMU 航位推算；可替换性验证与 A/B 基线 |
+| `adapters/register_builtin.hpp` | 内置估计器的编译期注册 |
+| **`common/`** — 非算法数据 ||
+| `common/dataset_config.hpp` | 回放配置与统计结构 |
+| `common/ply_export.hpp` | 路标/轨迹导出为 PLY |
+| **`config/`** — 配置加载 ||
+| `config/project_config.hpp` | `ProjectConfig` 与 `LoadResult`：纯数据类型，不依赖 Lua |
+| `config/lua_primitives.hpp` | Lua 字段取值原语：类型检查、越界钳位、未知键点名 |
+| `config/lua_sections.hpp` | 各配置节的字段解析与交叉校验 |
+| `config/lua_config.hpp` | Lua 沙箱加载入口 |
+| **`sensor/`** — 数据从哪来 ||
+| `sensor/simulator.hpp` | 合成轨迹与 IMU / 帧生成；实现 `ISensorSource` |
+| `sensor/subt_dataset.hpp` | SubT 序列读取：IMU CSV、相机时间戳、图像索引 |
+| `sensor/intrinsics_file.hpp` | 解析外部工具估计的内参文件 |
+| **`frontend/`** — 图像变成观测 ||
+| `frontend/mei_tracker.hpp` | GFTT + 金字塔 LK；实现 `IObservationExtractor` |
+| **`pipeline/`** — 编排核心 ||
+| `pipeline/pipeline.hpp` | 状态机、关键帧决策、IMU 窗口归属、估计器调用、恢复动作执行 |
+| **`app/`** — 两个入口 ||
+| `app/benchmark.hpp` | `VioBenchmark`：喂入任意 `ISensorSource`，与真值比对打分 |
+| `app/replay.hpp` | `ReplayRunner`：经 `TimeSynchronizer` 回放真实序列；不评分 |
+| `app/run_observer.hpp` | `IRunObserver` 端口，把回放与显示解耦 |
+| **`viz/`** — 输出与显示 ||
+| `viz/visualizer.hpp` | OpenCV 窗口与视频输出 |
+| `viz/mei_undistort.hpp` | 由与跟踪器相同的 `ICameraModel` 对驱动重映射 |
+| `viz/replay_observer.hpp` | `IRunObserver` 实现 |
+| **根目录** ||
+| `vio.hpp` | 聚合头 |
+| `log_config.hpp` | mylog C++ API 封装 |
 
-`vio/*` 与 `dataset/configHolder.hpp` 不包含 OpenCV 头文件，因此关闭数据集工具时仍可构建并解析配置。
+依赖方向由 CMake 分层 target 与 `scripts/check_layers.py` 共同强制（`cmake --build build --target check-layers`）：
+
+```
+domain ← common/config/sensor/frontend/adapters ← pipeline ← app ← viz
+```
+
+只有四个头文件涉及 OpenCV：`frontend/mei_tracker.hpp`、`app/replay.hpp`、`app/run_observer.hpp`
+与 `viz/` 下的实现。`myslam::pipeline` 既不链接它们，也不链接任何求解器。
+
+### 替换某个部件
+
+- **换估计器** — 实现 `domain::IEstimator`，在 `adapters/register_builtin.hpp` 注册工厂，然后设
+  `vio.estimator`。流水线与编排层一行不改。`imu_only` 后端的存在就是为了让这句话可被验证，
+  同时提供 A/B 基线。
+- **换传感器来源** — 实现 `domain::ISensorSource`，用
+  `VioBenchmark(config, system, std::move(source))` 构造。
+- **换观测前端** — 实现 `domain::IObservationExtractor`；观测携带 `uv`、可选相机系射线、
+  可选原始像素、单观测 sigma，以及“跟踪点 / 新增点”标记。
+- **换相机模型** — 实现 `domain::ICameraModel`。需要针孔标定的估计器会查询
+  `IPinholeCalibration` 能力，并在装配期拒绝不符合的模型。
+- **换配置格式** — `ProjectConfig` 是形状；另写一个解析器产出它。
+- **换输出** — 实现 `IRunObserver`。
 
 ## 运行流程
 
 ### 初始化
 
-`VioInitializer::feedImu()` 累积静止样本，同时统计加速度与陀螺标准差。`tryGravityAlignment()`
-在样本满足条件后执行：由平均比力方向求 roll/pitch，由陀螺均值估计零偏，输出 `Rot3` 与
-`ConstantBias`。`VioSystem` 收到成功后调用 `VioBackend::initializeSystem()` 写入首帧先验，
-并将状态置为 `TRACKING_OK`。
+`domain::Initializer::feedImu()` 累积静止样本，同时统计加速度与陀螺标准差。
+`tryGravityAlignment()` 在样本满足条件后执行：由平均比力方向求 roll/pitch，由陀螺均值估计零偏，
+输出 `Pose` 与 `Bias`。成功后流水线调用 `IEstimator::initialize()`，同时传入初始状态
+**与首个关键帧的观测**——那组观测是第一次三角化的基线，丢掉它会明显拉差轨迹起步段。
 
 ### 关键帧与后端
 
-关键帧判定通过后，`VioBackend::processKeyframe()` 依次执行：
+关键帧判定通过后，`IEstimator::addKeyframe()` 收到关键帧与覆盖它的 IMU 切片。GTSAM 适配器随后执行：
 
 1. 用上一关键帧与本关键帧的特征对应关系三角化新路标，视差低于
    `minTriangulationParallaxPx` 的点跳过，深度落在 `[minLandmarkDepth, maxLandmarkDepth]`
@@ -122,7 +212,7 @@ C++26 实现的视觉惯性里程计（VIO）。后端使用 GTSAM 的 `Incremen
 
 ### 精度评估
 
-`VioSystem::evaluate()` 对关键帧位姿与仿真真值逐帧求平移误差，输出 RMSE 与最大偏差；
+`VioBenchmark::evaluate()` 对关键帧位姿与仿真真值逐帧求平移误差，输出 RMSE 与最大偏差；
 RMSE 低于 `rmseThreshold` 时判定通过。
 
 ---
@@ -134,12 +224,19 @@ myslam/
 ├── CMakeLists.txt            # 顶层构建、版本号唯一来源、format 目标
 ├── config/config.lua         # 默认运行配置（构建时复制到 build/config/）
 ├── src/
-│   ├── CMakeLists.txt        # INTERFACE 目标 myslam / myslam_lua / myslam_sanitized
+│   ├── CMakeLists.txt        # 分层 INTERFACE 目标（domain/common/config/sensor/frontend/adapters/pipeline/app/viz）
 │   ├── myslam.hpp.in         # 版本号模板，configure_file 生成
-│   ├── lua_config.hpp        # Lua 配置加载
+│   ├── vio.hpp               # 聚合头，引入整条算法链路
 │   ├── log_config.hpp        # 日志配置
-│   ├── vio/                  # VIO 核心，无 OpenCV 依赖
-│   └── dataset/              # 数据集回放，OpenCV 仅存在于本层
+│   ├── domain/               # 契约：值类型、端口、注册表、分组配置、相机模型、初始化、时间同步
+│   ├── adapters/             # 估计器实现：gtsam 固定滞后、纯 IMU
+│   ├── common/               # 非算法数据：数据集配置、PLY 导出
+│   ├── config/               # 配置加载：项目配置、Lua 原语、逐节解析
+│   ├── sensor/               # 数据来源：仿真 / 数据集 / 标定
+│   ├── frontend/             # 图像 → 观测：实现 IObservationExtractor 的 GFTT + LK
+│   ├── pipeline/             # 编排核心（只依赖 domain/）
+│   ├── app/                  # 两个入口：VioBenchmark（打分）、ReplayRunner（只统计）
+│   └── viz/                  # 输出与显示：窗口、去畸变图、IRunObserver 实现
 ├── examples/
 │   ├── 1_visual_inertial_odometry.cpp   # 仿真运行示例
 │   └── 2_subt_dataset.cpp               # 真实数据集回放
@@ -168,7 +265,7 @@ myslam/
 | 构建工具 | Ninja 或 Make |
 | 系统库 | TBB、Boost、Eigen3、Threads |
 | LuaJIT | 2.1+ 且可被 `pkg-config` 发现；缺失时 Lua 支持自动关闭，其余功能不受影响 |
-| MASt3R | 仅 `--init mast3r` 需要：PyTorch 环境 + 权重；否则完全不需要 |
+| MASt3R | 仅 `dataset.intrinsics.source = "mast3r"` 需要：PyTorch 环境 + 权重；否则完全不需要 |
 | OpenCV | 4.x，仅 `MYSLAM_BUILD_DATASET_TOOLS=ON` 时需要；默认用系统包，`MYSLAM_USE_BUNDLED_OPENCV=ON` 时改用 `thirdparty/opencv` 子模块 |
 | clang-format | 23.1.3（提交钩子与 CI 按此版本校验） |
 
@@ -256,7 +353,7 @@ cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
 ### MASt3R
 
 `thirdparty/mast3r` 钉住 [naver/mast3r](https://github.com/naver/mast3r) —— SubT 序列背后的三维重建工具链。
-它是 Python/PyTorch 项目，不参与 C++ 编译；但在**运行期**是可选依赖：`2_subt_dataset --init mast3r`
+它是 Python/PyTorch 项目，不参与 C++ 编译；但在**运行期**是可选依赖：把 `dataset.intrinsics.source` 设为 `"mast3r"` 后，回放会
 会调用 `scripts/mast3r_intrinsics.py`，从图像估计内参（见[内参来源](#内参来源)）。不开启时
 完全不受影响。
 
@@ -292,8 +389,8 @@ cd build
 
 ```
 评估关键帧样本数 : 24
-整体平移 RMSE 误差: 0.0365 米
-最大轨迹偏差       : 0.0778 米
+整体平移 RMSE 误差: 0.0913 米
+最大轨迹偏差       : 0.1541 米
 ```
 
 退出码 `0` 表示 RMSE 低于 `system.rmseThreshold`（默认 0.20 m）。
@@ -318,9 +415,9 @@ cd build
 
 | 节 | 消费方 | 内容 |
 | :--- | :--- | :--- |
-| `vio` | `VioConfig` | 相机内参、外参、IMU 噪声、Huber 核阈值、关键帧策略、滑动窗口 |
+| `vio` | `domain::PipelineConfig` | 相机模型（`pinhole` / `mei`）与内参、外参、IMU 噪声、Huber 核阈值、关键帧策略、滑动窗口、初始化判据（`initializerMinSamples` / `initializerWindowSeconds`）、健康阈值（`health*`）、先验强度（`initial*` / `landmarkPriorSigma` / `recovery*`） |
 | `system` | `SystemConfig` | 相机步长、运行时长、RMSE 门限 |
-| `dataset` | `MeiIntrinsics` / `DatasetRunConfig` | 数据集内参、回放范围、可视化开关 |
+| `dataset` | `CameraIntrinsics` / `DatasetRunConfig` | 数据集相机内参（针孔或 MEI）、回放范围、可视化开关 |
 | `logger` / `fileManager` | mylog | 日志级别、缓冲、滚动与保留策略 |
 
 字段均可省略，省略时保留代码内置默认值。
@@ -379,7 +476,7 @@ Handheld1_Folder/
 
 **MEI 相机模型**：后端以 `gtsam::Cal3_S2` 做重投影，而该序列使用 MEI 模型。`MeiFeatureTracker`
 先用 radtan 模型反解畸变，再按 MEI 模型反投影为射线，最后以 `pinholeScale` 缩放的虚拟针孔
-内参投回像素平面。虚拟内参同步写入 `VioConfig`。
+内参投回像素平面。虚拟内参同步写入相机配置。
 
 **IMU 时间断档**：相邻样本间隔超过 `maxImuGapFactor / imuRateHz` 时判定为断层（默认 10 倍采样
 周期，200 Hz 下为 50 ms，可在 `dataset.replay.maxImuGapFactor` 调整）。断档处理有两条规则：
@@ -397,38 +494,55 @@ Handheld1_Folder/
 
 ### 用法
 
+所有运行时配置都在 `config/config.lua` 里，程序只接受 `--config`：
+
 ```bash
-build-release/bin/2_subt_dataset \
-    --data  /path/Handheld1_Folder/cam_0 \
-    --imu   /path/Handheld1_Folder/imu/imu_data.csv \
-    --stamps /path/Handheld1_Folder/cam_0/timestamps.txt \
-    [--output traj.tum] [--start-frame N] [--max-frames N] [--stride N] \
-    [--max-features N] [--max-duration S] [--ply cloud.ply] \
-    [--viz] [--video out.mp4] [--viz-stride N] [--viz-rate R] \
-    [--config config/config.lua] \
-    [--init manual|mast3r] [--intrinsics-file FILE]
+build-release/bin/2_subt_dataset                    # 读 config/config.lua
+build-release/bin/2_subt_dataset --config alt.lua   # 用另一份配置
 ```
 
-`--config` 提供基线默认值，命令行参数优先。未指定时读取当前目录的 `config/config.lua`，
-不存在则使用内置默认值。
+回放需要的一切都在 `dataset` 节：
 
-`--fx/--fy/--cx/--cy/--xi/--k1/--k2/--p1/--p2/--width/--height/--pinhole-scale` 可逐项覆盖
-MEI 内参。
+- **`dataset.sequence.root`**：序列目录（相对仓库根，或绝对路径）
+- **`dataset.sequence.cameraDir` / `imuFile` / `stampFile`**：相对 `root` 解析的三个数据路径
+- **`dataset.intrinsics.source`**：`config` / `file` / `mast3r`
+- **`dataset.intrinsics.file`**：`source = "file"` 时使用的标定文件
+- **`dataset.extrinsic`**：回放专用相机-IMU 外参，不写则沿用 `vio.extrinsic`
+- **`dataset.mast3r.*`**：`python`、`weights`、`pairs`、`device`、`cache`、`force`
+- **`dataset.replay.*`**：`startFrame`、`maxFrames`、`stride`、`maxFeatures`、`maxDuration`、`outputTum`、`plyPath`
+- **`dataset.viz.*`**：`showWindow`、`videoPath`、`displayStride`、`playbackRate` 等
+
+`--config` 是唯一的开关：它选择加载哪份 Lua 文件，文件里的相对路径（包括
+`dataset.sequence.root`）按当前工作目录解析，因此请在仓库根目录运行。不指定时读取
+`config/config.lua`；该文件不存在则使用内置默认值——内置默认值没有序列路径，因此会立即
+失败并给出可操作的提示。
+
+消融实验用独立的 Lua 文件，而不是一串命令行覆盖项：
+
+```bash
+cp config/config.lua config/ablation_no_gravity.lua
+# 改：vio.gravityAlignment = false（可选 vio.initialTiltDeg = 30）
+build-release/bin/2_subt_dataset --config config/ablation_no_gravity.lua
+```
+
+为什么删掉这些开关：原来那套参数与 Lua 字段一一对应，每加一个字段要改三处；更糟的是漏传
+某个开关时会静默跑配置默认值。相机-IMU 外参甚至直接硬编码在示例里，在回放路径上覆盖了
+`vio.extrinsic`——改 Lua 文件根本不生效。
 
 ### 内参来源
 
 没有标定文件的序列可以不填任何相机参数，让 MASt3R 从图像估计：
 
-```bash
-scripts/run_subt.sh --init mast3r          # 或 2_subt_dataset ... --init mast3r
+```lua
+dataset.intrinsics.source = "mast3r"
 ```
 
 流程：
 
-1. 默认采样 6 对图像（`--mast3r-pairs`）送入 `thirdparty/mast3r` 的 MASt3R 模型，
+1. 默认采样 6 对图像（`dataset.mast3r.pairs`）送入 `thirdparty/mast3r` 的 MASt3R 模型，
    用 `estimate_focal_knowing_depth` 从预测点图恢复焦距，主点取图像中心；
-2. 结果写成 `<cam_0>/../mast3r_intrinsics.txt` 并缓存，后续回放直接复用；
-   `--force-estimate` 强制重算，`--mast3r-cache` 可改缓存位置；
+2. 结果写成 `<sequence.root>/mast3r_intrinsics.txt` 并缓存，后续回放直接复用；
+   `dataset.mast3r.force = true` 强制重算，`dataset.mast3r.cache` 可改缓存位置；
 3. 解析后只把结果用于**虚拟针孔焦距**：`pinholeScale = focal / fx`，使后端的
    `pinholeFx()` 等于估计值。`xi` 与 `k1/k2/p1/p2` **从配置的内参继承**，
    鱼眼反投影照常进行——这一点很关键。
@@ -444,9 +558,9 @@ GFTT 于是把特征全堆在边框上，光流把跟踪预算花在无法三角
 偏大一倍以上。保留 `xi` 后，`meiToPinhole` 的 `mz <= 1e-6` 与越界判据会把边框
 自动挡在掩码外。
 
-推理需要 PyTorch 环境：用 `--python`、`MYSLAM_PYTHON` 或 `scripts/run_subt.sh` 的
-`MAST3R_PYTHON` 指向它（例如 conda 的 `mast3r` 环境），权重用 `--mast3r-weights` 或
-`MAST3R_WEIGHTS` 指定，默认在 `thirdparty/mast3r/checkpoints/` 下查找。
+推理需要 PyTorch 环境：用 `dataset.mast3r.python` 或 `MYSLAM_PYTHON` 指向它（例如 conda 的
+`mast3r` 环境），权重用 `dataset.mast3r.weights` 或 `MAST3R_WEIGHTS` 指定，默认在
+`thirdparty/mast3r/checkpoints/` 下查找。
 
 两点限制：
 
@@ -455,8 +569,8 @@ GFTT 于是把特征全堆在边框上，光流把跟踪预算花在无法三角
   `dataset.intrinsics` 中说明；需要准确内外参的精度评估仍应使用 yaml 标定值；
 - 自动估计只覆盖焦距。相机-IMU 外参 `Tic` 同样仍需内置值或标定文件。
 
-已有估计结果的机器可以跳过推理，直接 `--intrinsics-file result.txt`（格式见
-`src/dataset/intrinsics_file.hpp`）：
+已有估计结果的机器可以跳过推理，直接把 `dataset.intrinsics.source` 设为 `"file"`、
+`dataset.intrinsics.file` 指向结果文件（格式见 `src/sensor/intrinsics_file.hpp`）：
 
 ```
 model = pinhole
@@ -473,9 +587,9 @@ height = 480
 
 ### 可视化
 
-- `--viz`：OpenCV 窗口（需要 `DISPLAY`，ESC/q 退出）
-- `--video FILE`：编码为视频（mp4 不可用时回退 `.avi`/MJPG）
-- `--viz-rate R`：`0` 全速、`1` 实时、`2` 两倍速
+- `dataset.viz.showWindow = true`：OpenCV 窗口（需要 `DISPLAY`，ESC/q 退出）
+- `dataset.viz.videoPath = "out.avi"`：编码为视频（mp4 不可用时回退 `.avi`/MJPG）
+- `dataset.viz.playbackRate`：`0` 全速、`1` 实时、`2` 两倍速
 
 画面布局：上方左侧为原始鱼眼图（叠加原始像素坐标的特征点与青色 MEI 有效视场轮廓），
 右侧为同一帧经 MEI 去畸变后的虚拟针孔图像（叠加跟踪器实际使用的针孔坐标）；下方状态栏
@@ -502,22 +616,18 @@ PLY 点云可用 MeshLab / CloudCompare / Open3D 打开。
 ### `scripts/run_subt.sh`
 
 ```bash
-scripts/run_subt.sh                          # 默认序列，从第 2300 帧起
-scripts/run_subt.sh --max-frames 0           # 跑完剩余全部帧
-scripts/run_subt.sh --root /path/Handheld2_Folder
-scripts/run_subt.sh --viz                    # 实时窗口
-scripts/run_subt.sh --video out.avi --ply cloud.ply
-scripts/run_subt.sh --plot                   # 回放后绘图
-scripts/run_subt.sh --no-build               # 跳过编译
-scripts/run_subt.sh --init mast3r            # 用 MASt3R 估计内参
+scripts/run_subt.sh                          # 构建后回放 config/config.lua
+scripts/run_subt.sh --no-build               # 跳过编译，直接运行
+scripts/run_subt.sh --plot                   # 回放后绘制轨迹
+scripts/run_subt.sh --config config/ablation_no_gravity.lua
 ```
 
-默认序列路径为 `../MASt3R-Fusion/dataset/Handheld1_Folder`，可用 `--root` 或 `SUBT_ROOT` 覆盖。
-默认从第 2300 帧开始（该序列前段存在曝光跳变与 IMU 断档）。未指定 `--max-frames` 时脚本使用
-`500000`。
+脚本只是「构建 + 一次 exec」：先配置并编译 `build-release/bin/2_subt_dataset`，再用
+`--config` 启动它。序列路径、帧范围、输出、窗口、内参来源全部来自那份 Lua 文件——改一次
+运行只需改文件，不必记一串参数。
 
-`--init mast3r` 会透传给回放工具，并把 `MAST3R_PYTHON` 导出为 `MYSLAM_PYTHON`，
-让 MASt3R 推理在你指定的解释器里运行。
+构建相关的开关留在环境变量里，因为它们描述的是构建而不是运行：`BUILD_DIR`、`BUILD_TYPE`、
+`JOBS`、`OPENCV_BUNDLED`。
 
 ### `scripts/plot_tum.py`
 
@@ -538,9 +648,10 @@ ctest --test-dir build --output-on-failure
 
 | 测试 | 覆盖内容 |
 | :--- | :--- |
-| `myslam_test` | 公开 API 可用、关键帧非空、RMSE 在门限内、派生步长有效 |
+| `myslam_test` | 公开 API 可用、关键帧非空、RMSE 在门限内、派生步长有效、健康阈值可配置；**契约自持**（注入估计器活过 reset、工厂缺失时明确失败、未知估计器名不静默回退）、**双后端 A/B**、**时间同步**（零阶保持截断、断档、乱序）、MEI 投影往返 |
 | `myslam_config_test` | 解析、钳位、交叉校验、未知键、四元数单位化、失败路径、日志节生效、默认配置自洽 |
 | `myslam_intrinsics_test` | 内参估计文件：focal 落到虚拟针孔、畸变从基线继承、旧版 fx 字段被拒、主点回退与各类非法输入 |
+| `myslam_layer_check` | 分层依赖方向：任何越层 `#include` 直接失败（`scripts/check_layers.py`） |
 
 CI（`.github/workflows/ci.yml`）在 Ubuntu 上使用 `g++-14` 执行格式检查、构建与测试，
 `clang-format` 固定为 23.1.3。
@@ -555,9 +666,16 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu 上使用 `g++-14` 执行格式检�
 - 类型 `CamelCase`；函数与局部变量 `camelBack`；成员变量 `_` 后缀
 - 常量 `k` 前缀 + `CamelCase`；枚举与宏 `UPPER_CASE`；命名空间 `lower_case`
 - 构建开关前缀 `MYSLAM_*`；测试目标 `myslam_test`
+- 分层依赖由 CMake target 与 `check-layers` 双向强制，越层 include 无法通过测试
 - Doxygen 注释；提交前通过 clang-format
 
 ---
+
+## 设计决策
+
+- [ADR 0001：端口 + 适配器，契约自持](docs/adr/0001-ports-and-adapters.md)
+  —— 为什么契约放在 `domain/`；两个端口刻意**不**承诺什么；重构暴露出的两个真实缺陷
+  （首帧三角化基线丢失、把两帧各自相机系的射线夹角当成视差）；以及刻意没有做的事。
 
 ## 当前限制
 

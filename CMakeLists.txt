@@ -49,6 +49,11 @@ option(MYSLAM_USE_BUNDLED_OPENCV
     "Build OpenCV from the thirdparty/opencv submodule instead of system packages" OFF)
 
 # -----------------------------------------------------------------------------
+# Python (用于分层依赖静态检查；缺失时不注册该检查，不影响构建)
+# -----------------------------------------------------------------------------
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+# -----------------------------------------------------------------------------
 # Targets
 # -----------------------------------------------------------------------------
 add_subdirectory(thirdparty)

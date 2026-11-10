@@ -16,8 +16,10 @@ if(MYSLAM_BUILD_DATASET_TOOLS)
     add_executable(2_subt_dataset 2_subt_dataset.cpp)
     target_link_libraries(2_subt_dataset PRIVATE
         myslam::myslam
+        myslam::replay
+        myslam::frontend_cv
+        myslam::viz
         myslam::myslam_sanitized
-        myslam::opencv
     )
     # 可选 Lua 配置支持（与 gen_bin 生成的示例一致）
     if(TARGET myslam::myslam_lua)

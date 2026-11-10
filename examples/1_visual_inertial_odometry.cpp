@@ -2,21 +2,21 @@
  * @file 1_visual_inertial_odometry.cpp
  * @brief VIO 最小系统使用示例：加载 Lua 配置、运行、读取精度报告
  *
- * 系统实现位于 @c src/vio/（见 @c vio/vio.hpp 聚合头），本文件只演示
+ * 系统实现按层分布在 @c src/ 下（见 @c src/vio.hpp 聚合头），本文件只演示
  * 公开 API 的最小用法。默认配置驱动 5 秒自包含仿真（IMU 200Hz /
  * 相机 20Hz），结束时输出与真值对齐的平移 RMSE。
  *
  * 用法：
  * @code
  * 1_visual_inertial_odometry                  # 读取 config/config.lua，缺失则用内置默认值
- * 1_visual_inertial_odometry my_config.lua    # 显式指定配置，加载或校验失败即退出
+ * 1_visual_inertial_odometry --config alt.lua # 显式指定配置，加载或校验失败即退出
  * @endcode
  */
 
+#include "config/lua_config.hpp"
 #include "log_config.hpp"
 #include "logger.hpp"
-#include "lua_config.hpp"
-#include "vio/vio.hpp"
+#include "vio.hpp"
 #include <cstdio>
 #include <expected>
 #include <filesystem>
@@ -38,9 +38,32 @@ extern "C" const char *__lsan_default_suppressions()
 
 int main(int argc, char **argv)
 {
-    const bool explicitConfig = argc > 1;
-    const std::filesystem::path configPath =
-        explicitConfig ? std::filesystem::path(argv[1]) : std::filesystem::path("config/config.lua");
+    // 唯一的命令行参数与 2_subt_dataset 一致：选哪份 Lua 配置。
+    std::filesystem::path configPath = "config/config.lua";
+    bool explicitConfig = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg(argv[i]);
+        if (arg == "--help" || arg == "-h")
+        {
+            std::fprintf(stderr, "用法: 1_visual_inertial_odometry [--config FILE]\n"
+                                 "所有算法与时序参数都在 Lua 配置里（vio.* / system.*）。\n");
+            return 0;
+        }
+        if (arg == "--config")
+        {
+            if (i + 1 >= argc)
+            {
+                std::fprintf(stderr, "--config 缺少文件路径\n");
+                return 2;
+            }
+            configPath = argv[++i];
+            explicitConfig = true;
+            continue;
+        }
+        std::fprintf(stderr, "未知参数: %s（所有算法参数都在 Lua 配置里）\n", arg.c_str());
+        return 2;
+    }
 
     myslam::config::ProjectConfig project;
     const bool configFileExists = std::filesystem::is_regular_file(configPath);
@@ -78,8 +101,8 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "[info] %s，使用内置默认配置\n", loaded.error().message.c_str());
     }
 
-    myslam::vio::VioSystem system(project.vio, project.system);
-    const myslam::vio::RunReport runReport = system.run();
+    myslam::vio::VioBenchmark system(project.vio, project.system);
+    const myslam::domain::RunReport runReport = system.run();
 
     mylog::info("================================================================================");
     if (!runReport.initialized)
@@ -99,5 +122,5 @@ int main(int argc, char **argv)
 
     // 未初始化时 rmse 保持 0，会把“没有任何结果”误判为“完美精度”，
     // 因此判定统一走 isAcceptable（同时检查 initialized 与关键帧数）。
-    return myslam::vio::isAcceptable(runReport, project.system.rmseThreshold) ? 0 : 1;
+    return myslam::domain::isAcceptable(runReport, project.system.rmseThreshold) ? 0 : 1;
 }

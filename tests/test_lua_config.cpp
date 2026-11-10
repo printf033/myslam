@@ -6,8 +6,8 @@
  * 每个用例把 Lua 脚本写到临时目录，测完即删，不污染工作区。
  */
 
+#include "config/lua_config.hpp"
 #include "log_config.hpp"
-#include "lua_config.hpp"
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -44,6 +44,14 @@ namespace
     void expectNear(double actual, double expected, const char *what)
     {
         expectTrue(std::abs(actual - expected) < 1e-12, what);
+    }
+
+    /// 默认外参旋转：机身前向 +X_b 对应相机光轴 +Z_c
+    bool defaultBodyRotation(const myslam::domain::Pose &pose)
+    {
+        Eigen::Matrix3d expected;
+        expected << 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0;
+        return pose.q.toRotationMatrix().isApprox(expected, 1e-12);
     }
 
     /**
@@ -128,6 +136,10 @@ vio = {
     maxReprojectionErrorHard = 10.0,
     maxReprojectionErrorPreopt = 20.0,
     extraSmootherIterations = 3,
+    initializerMinSamples = 60,
+    healthMaxSpeed = 5.0,
+    healthAlertStreakThreshold = 5,
+    landmarkPriorSigma = 0.5,
 }
 system = { totalDuration = 1.25, cameraDt = 0.05 }
 )");
@@ -137,12 +149,17 @@ system = { totalDuration = 1.25, cameraDt = 0.05 }
         std::filesystem::remove(path);
 
         expectTrue(succeeded(report), "合法配置解析成功");
-        expectNear(config.vio.fx, 123.0, "vio.fx 覆盖生效");
-        expectNear(config.vio.minTrackingRatio, 0.5, "vio.minTrackingRatio 覆盖生效");
-        expectTrue(config.vio.extraSmootherIterations == 3, "vio.extraSmootherIterations 覆盖生效");
+        expectNear(config.vio.camera.intrinsics.fx, 123.0, "vio.fx 覆盖生效");
+        expectNear(config.vio.vision.minTrackingRatio, 0.5, "vio.minTrackingRatio 覆盖生效");
+        expectTrue(config.vio.estimator.extraSmootherIterations == 3, "vio.extraSmootherIterations 覆盖生效");
+        expectTrue(config.vio.initialization.minSamples == 60, "vio.initializerMinSamples 覆盖生效");
+        expectNear(config.vio.health.maxSpeed, 5.0, "vio.healthMaxSpeed 覆盖生效");
+        expectTrue(config.vio.health.alertStreakThreshold == 5, "vio.healthAlertStreakThreshold 覆盖生效");
+        expectNear(config.vio.estimator.landmarkPriorSigma, 0.5, "vio.landmarkPriorSigma 覆盖生效");
         expectNear(config.system.totalDuration, 1.25, "system.totalDuration 覆盖生效");
-        expectNear(myslam::vio::SystemConfig::imuDtFrom(config.vio.imuRateHz), 0.005, "默认 200 Hz 派生的步长为 5 ms");
-        expectNear(config.vio.cy, 240.0, "未出现的字段保持默认值");
+        expectNear(myslam::domain::SystemConfig::imuDtFrom(config.vio.imu.rateHz), 0.005,
+                   "默认 200 Hz 派生的步长为 5 ms");
+        expectNear(config.vio.camera.intrinsics.cy, 240.0, "未出现的字段保持默认值");
         expectNear(config.system.rmseThreshold, 0.20, "未出现的 system 字段保持默认值");
     }
 
@@ -170,9 +187,9 @@ system = { cameraDt = 0.05 }
         std::filesystem::remove(clampPath);
 
         expectTrue(succeeded(clampReport), "越界值钳位后配置仍然有效");
-        expectNear(clampConfig.vio.minTrackingRatio, 1.0, "minTrackingRatio 钳位到上界 1.0");
-        expectTrue(clampConfig.vio.maxSlidingWindowSize == 1, "maxSlidingWindowSize 钳位到下界 1");
-        expectNear(clampConfig.vio.gravityMagnitude, 1e-3, "负重力钳位到下界");
+        expectNear(clampConfig.vio.vision.minTrackingRatio, 1.0, "minTrackingRatio 钳位到上界 1.0");
+        expectTrue(clampConfig.vio.estimator.maxSlidingWindowSize == 1, "maxSlidingWindowSize 钳位到下界 1");
+        expectNear(clampConfig.vio.imu.gravityMagnitude, 1e-3, "负重力钳位到下界");
 
         // 类型错误：必须失败（钳位族字段也一样）
         const auto stringPath = writeLua("type-string", R"(
@@ -222,9 +239,9 @@ system = { cameraDt = 0.05 }
         std::filesystem::remove(path);
 
         expectTrue(succeeded(report), "合法采样率配置解析成功");
-        expectNear(config.vio.imuRateHz, 100.0, "vio.imuRateHz 覆盖生效");
+        expectNear(config.vio.imu.rateHz, 100.0, "vio.imuRateHz 覆盖生效");
         expectNear(myslam::config::ProjectConfig{}.system.cameraDt, 0.05, "未配置的 cameraDt 保持默认");
-        expectNear(myslam::vio::SystemConfig::imuDtFrom(config.vio.imuRateHz), 0.01, "100 Hz 派生出 10 ms 步长");
+        expectNear(myslam::domain::SystemConfig::imuDtFrom(config.vio.imu.rateHz), 0.01, "100 Hz 派生出 10 ms 步长");
 
         // 旧配置残留 imuDt：应被忽略（不改变派生结果），且不致失败
         const auto legacy = writeLua("legacy-imu-dt", R"(
@@ -236,8 +253,20 @@ system = { imuDt = 0.02, cameraDt = 0.05 }
         std::filesystem::remove(legacy);
 
         expectTrue(succeeded(legacyReport), "旧配置的 imuDt 不影响加载成功");
-        expectNear(myslam::vio::SystemConfig::imuDtFrom(legacyConfig.vio.imuRateHz), 0.005,
+        expectNear(myslam::domain::SystemConfig::imuDtFrom(legacyConfig.vio.imu.rateHz), 0.005,
                    "旧 imuDt 被忽略，仍由采样率派生");
+
+        // system.initialHeightMeters 必须是已接线字段：先前它存在于
+        // SystemConfig 却在白名单里缺席，写进配置只会得到“未知键”告警并被忽略。
+        const auto height = writeLua("initial-height", R"(
+system = { cameraDt = 0.05, initialHeightMeters = 2.5 }
+)");
+        myslam::config::ProjectConfig heightConfig;
+        const auto heightReport = loadFrom(height, heightConfig);
+        std::filesystem::remove(height);
+
+        expectTrue(succeeded(heightReport), "system.initialHeightMeters 可被解析");
+        expectNear(heightConfig.vio.initialization.initialHeightMeters, 2.5, "system.initialHeightMeters 覆盖生效");
     }
 
     /**
@@ -258,7 +287,7 @@ vio = {
         std::filesystem::remove(path);
 
         expectTrue(!succeeded(report), "关键帧间隔矛盾时配置被拒绝");
-        expectNear(config.vio.fx, 460.0, "失败时不写回调用方配置");
+        expectNear(config.vio.camera.intrinsics.fx, 460.0, "失败时不写回调用方配置");
 
         const auto path2 = writeLua("camera-faster", R"(
 vio = { imuRateHz = 20.0 }
@@ -286,8 +315,8 @@ system = { totalDuration = 2.0 }
         std::filesystem::remove(path);
 
         expectTrue(succeeded(report), "未知键只告警、不失败");
-        expectNear(config.vio.fx, 460.0, "拼错的内参字段未生效");
-        expectNear(config.vio.gyroNoiseSigma, 3.6e-4, "拼错的噪声字段未生效");
+        expectNear(config.vio.camera.intrinsics.fx, 460.0, "拼错的内参字段未生效");
+        expectNear(config.vio.imu.gyroNoiseSigma, 3.6e-4, "拼错的噪声字段未生效");
         expectNear(config.system.totalDuration, 2.0, "同节内的合法字段仍生效");
     }
 
@@ -311,10 +340,11 @@ vio = {
 
         expectTrue(succeeded(report), "合法外参解析成功");
         // 四元数 (2,0,0,0) 单位化后是恒等旋转
-        expectTrue(config.vio.bodyPSensor.rotation().equals(gtsam::Rot3(), 1e-12), "外参四元数被单位化为恒等旋转");
-        expectNear(config.vio.bodyPSensor.translation().x(), 1.5, "外参平移 x 生效");
-        expectNear(config.vio.bodyPSensor.translation().y(), -2.0, "外参平移 y 生效");
-        expectNear(config.vio.bodyPSensor.translation().z(), 0.25, "外参平移 z 生效");
+        expectTrue(config.vio.camera.bodyPSensor.q.toRotationMatrix().isApprox(Eigen::Matrix3d::Identity(), 1e-12),
+                   "外参四元数被单位化为恒等旋转");
+        expectNear(config.vio.camera.bodyPSensor.t.x(), 1.5, "外参平移 x 生效");
+        expectNear(config.vio.camera.bodyPSensor.t.y(), -2.0, "外参平移 y 生效");
+        expectNear(config.vio.camera.bodyPSensor.t.z(), 0.25, "外参平移 z 生效");
 
         const auto zeroPath = writeLua("extrinsic-zero", R"(
 vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
@@ -376,8 +406,105 @@ vio = { minKeyframeInterval = 0.5, maxKeyframeInterval = 0.2 }
         std::filesystem::remove(path);
 
         expectTrue(succeeded(report), "空脚本解析成功");
-        expectNear(config.vio.fx, 460.0, "空脚本保持默认内参");
+        expectNear(config.vio.camera.intrinsics.fx, 460.0, "空脚本保持默认内参");
         expectNear(config.system.totalDuration, 5.0, "空脚本保持默认时长");
+    }
+
+    /**
+     * @brief 相机模型：针孔 / MEI 由 @c vio.model 选择，后端只吃虚拟针孔
+     */
+    void checkCameraModelSection()
+    {
+        const auto path = writeLua("camera-model-mei", R"(
+vio = {
+    model = "mei",
+    fx = 700.0,
+    fy = 650.0,
+    cx = 320.0,
+    cy = 240.0,
+    pinholeScale = 0.5,
+}
+)");
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+
+        expectTrue(succeeded(report), "MEI 相机模型配置解析成功");
+        expectTrue(config.vio.camera.intrinsics.model == myslam::camera::CameraModel::MEI, "vio.model = mei 生效");
+        expectNear(config.vio.camera.intrinsics.pinholeFx(), 350.0, "MEI 虚拟针孔焦距为 fx * pinholeScale");
+        expectNear(config.vio.camera.intrinsics.pinholeFy(), 325.0, "MEI 虚拟针孔焦距为 fy * pinholeScale");
+
+        const auto badPath = writeLua("camera-model-typo", R"(
+vio = { model = "fisheye" }
+)");
+        myslam::config::ProjectConfig badConfig;
+        const auto badReport = loadFrom(badPath, badConfig);
+        std::filesystem::remove(badPath);
+        expectTrue(!succeeded(badReport), "未知相机模型名被拒绝");
+
+        // pinholeScale 是几何硬前提，不允许钳位：1e-6 被洗成 1e-3 会得到
+        // 0.46 px 的虚拟焦距，配置“合法”但整条流水线产出垃圾。
+        const auto scalePath = writeLua("camera-model-bad-scale", R"(
+vio = { model = "mei", pinholeScale = 1e-6 }
+)");
+        myslam::config::ProjectConfig scaleConfig;
+        const auto scaleReport = loadFrom(scalePath, scaleConfig);
+        std::filesystem::remove(scalePath);
+        expectTrue(!succeeded(scaleReport), "越界的 pinholeScale 被拒绝而不是钳位");
+
+        // 默认必须是针孔：鱼眼默认会把仿真器的针孔投影当作畸变处理
+        expectTrue(myslam::domain::PipelineConfig{}.camera.intrinsics.model == myslam::camera::CameraModel::PINHOLE,
+                   "PipelineConfig 默认相机模型为 pinhole");
+    }
+
+    /**
+     * @brief 数据集内参的模型切换：针孔不得继承 MEI 的球面反投影参数
+     */
+    void checkDatasetCameraModel()
+    {
+        // 默认基线是 SubT 的 MEI（xi = 1.583）。把模型改成 pinhole 时，xi 必须
+        // 被清零：前端不按模型分支，而是靠 xi = 0 让 MEI 公式退化为针孔。
+        const auto path = writeLua("dataset-camera-pinhole", R"(
+dataset = { intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, cx = 320, cy = 240 } }
+)");
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+
+        expectTrue(succeeded(report), "dataset.intrinsics.model = pinhole 解析成功");
+        expectTrue(!config.intrinsics.isMei(), "数据集内参模型为针孔");
+        expectNear(config.intrinsics.xi, 0.0, "针孔模型下 xi 被清零");
+        expectNear(config.intrinsics.pinholeFx(), 500.0, "针孔模型不使用 pinholeScale");
+
+        // 回归：从 MEI 基线切到 pinhole、且未写 xi 时，归一化是正常结果，
+        // 不得报成配置错误——否则每个合法的针孔序列配置都会带一条假告警。
+        myslam::config::ProjectConfig silentConfig;
+        const auto silentPath = writeLua("dataset-camera-pinhole-silent", R"(
+dataset = { intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, cx = 320, cy = 240, k1 = 0.0, k2 = 0.0, p1 = 0.0, p2 = 0.0 } }
+)");
+        const std::string captured = captureStderr([&] { (void)loadFrom(silentPath, silentConfig); });
+        std::filesystem::remove(silentPath);
+        expectTrue(captured.empty(), "合法的针孔配置不产生任何诊断");
+
+        // 显式写了 xi 却选针孔时，要明确告知该字段不生效（不静默丢弃）
+        myslam::config::ProjectConfig xiConfig;
+        const auto xiPath = writeLua("dataset-camera-pinhole-xi", R"(
+dataset = { intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, xi = 1.5 } }
+)");
+        const std::string xiCaptured = captureStderr([&] { (void)loadFrom(xiPath, xiConfig); });
+        std::filesystem::remove(xiPath);
+        expectTrue(xiCaptured.find("xi") != std::string::npos, "显式给出的 xi 被提示为不生效");
+        expectNear(xiConfig.intrinsics.xi, 0.0, "显式 xi 在针孔模型下仍被归一化为 0");
+
+        const auto meiPath = writeLua("dataset-camera-mei", R"(
+dataset = { intrinsics = { model = "mei", fx = 800.0, pinholeScale = 0.5 } }
+)");
+        myslam::config::ProjectConfig meiConfig;
+        const auto meiReport = loadFrom(meiPath, meiConfig);
+        std::filesystem::remove(meiPath);
+        expectTrue(succeeded(meiReport), "dataset.intrinsics.model = mei 解析成功");
+        expectNear(meiConfig.intrinsics.pinholeFx(), 400.0, "MEI 模型应用 pinholeScale");
+        expectTrue(meiConfig.intrinsics.xi != 0.0, "MEI 模型保留 xi");
     }
 
     /**
@@ -422,11 +549,10 @@ vio = { minKeyframeInterval = 0.5, maxKeyframeInterval = 0.2 }
         myslam::config::ProjectConfig config;
         const auto report = loadFrom(found, config);
         expectTrue(succeeded(report), "仓库默认配置通过全部校验");
-        expectNear(config.vio.fx, 460.0, "默认配置的 fx 与代码默认值一致");
-        expectNear(config.vio.accelNoiseSigma, 0.0057, "默认配置的加速度噪声与代码默认值一致");
-        expectNear(config.vio.bodyPSensor.translation().x(), 0.10, "默认配置的外参平移与代码默认值一致");
-        expectTrue(config.vio.bodyPSensor.rotation().equals(gtsam::Rot3(0, 0, 1, -1, 0, 0, 0, -1, 0), 1e-12),
-                   "默认配置的外参旋转与代码默认值一致");
+        expectNear(config.vio.camera.intrinsics.fx, 460.0, "默认配置的 fx 与代码默认值一致");
+        expectNear(config.vio.imu.accelNoiseSigma, 0.0057, "默认配置的加速度噪声与代码默认值一致");
+        expectNear(config.vio.camera.bodyPSensor.t.x(), 0.10, "默认配置的外参平移与代码默认值一致");
+        expectTrue(defaultBodyRotation(config.vio.camera.bodyPSensor), "默认配置的外参旋转与代码默认值一致");
         expectTrue(config.intrinsics.isValid(), "默认配置的 dataset 内参合法");
         expectTrue(config.replay.viz.trailMaxPoints == 20000, "默认配置的可视化参数与代码默认值一致");
     }
@@ -462,8 +588,13 @@ dataset = {
         expectNear(config.replay.maxImuGapFactor, myslam::dataset::DatasetRunConfig{}.maxImuGapFactor,
                    "未配置 maxImuGapFactor 时保持默认");
         expectTrue(myslam::dataset::DatasetRunConfig{}.maxImuGapFactor > 0.0, "断档倍数默认为正数");
+        // 单一真值来源：dataset.replay.maxImuGapFactor 必须真正搬到
+        // ImuConfig::maxGapFactor（TimeSynchronizer 读的是后者）。
+        // 否则解析成功而行为不变，是最难发现的失效模式。
+        expectNear(config.vio.imu.maxGapFactor, config.replay.maxImuGapFactor,
+                   "断档倍数单一真值：dataset.replay 的值接入 ImuConfig");
         // dataset 与 vio 是独立节，前者不应污染后者
-        expectNear(config.vio.fx, 460.0, "dataset 节不影响 vio 内参");
+        expectNear(config.vio.camera.intrinsics.fx, 460.0, "dataset 节不影响 vio 内参");
 
         const auto gapPath = writeLua("dataset-gap", R"(
 dataset = { replay = { maxImuGapFactor = 4.5 } }
@@ -473,6 +604,8 @@ dataset = { replay = { maxImuGapFactor = 4.5 } }
         std::filesystem::remove(gapPath);
         expectTrue(succeeded(gapReport), "maxImuGapFactor 可配置");
         expectNear(gapConfig.replay.maxImuGapFactor, 4.5, "maxImuGapFactor 覆盖生效");
+        expectNear(gapConfig.vio.imu.maxGapFactor, 4.5,
+                   "maxImuGapFactor 真正接入 ImuConfig（TimeSynchronizer 读的是这个）");
 
         // 倍数小于 2 会把正常采样抖动误判为断档，因此钳位到下界
         const auto tooSmall = writeLua("dataset-gap-small", R"(
@@ -491,6 +624,94 @@ dataset = { intrinsics = { fx = 0.0 } }
         const auto badReport = loadFrom(badIntrinsics, badConfig);
         std::filesystem::remove(badIntrinsics);
         expectTrue(!succeeded(badReport), "非法内参（fx 被钳到 1.0 之外的 0）被拒绝");
+    }
+
+    /**
+     * @brief dataset.sequence / intrinsics.source / mast3r / extrinsic
+     *
+     * 这四个节是「回放不再依赖命令行参数」的载体：序列位置、内参来源、
+     * 估计选项与安装外参都必须能从 Lua 完整表达，否则删掉命令行只会把
+     * 功能一起删掉。
+     */
+    void checkDatasetInputSection()
+    {
+        const auto path = writeLua("dataset-input", R"(
+dataset = {
+    sequence = {
+        root = "/tmp/subt/Handheld2_Folder",
+        cameraDir = "cam_0",
+        imuFile = "imu/imu_data.csv",
+        stampFile = "cam_0/timestamps.txt",
+    },
+    intrinsics = { source = "mast3r", file = "/tmp/calib.txt" },
+    mast3r = { python = "/opt/conda/bin/python", pairs = 12, device = "cuda", force = true },
+    extrinsic = {
+        quaternion = { w = 1.0, x = 0.0, y = 0.0, z = 0.0 },
+        translation = { x = 0.2, y = 0.0, z = 0.0 },
+    },
+}
+)");
+
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+
+        expectTrue(succeeded(report), "dataset 输入节解析成功");
+        expectTrue(config.input.sequence.configured(), "sequence.root 已配置");
+        expectTrue(config.input.sequence.resolveCameraDir() ==
+                       std::filesystem::path("/tmp/subt/Handheld2_Folder/cam_0"),
+                   "cameraDir 相对 root 解析");
+        expectTrue(config.input.sequence.resolveImuFile() ==
+                       std::filesystem::path("/tmp/subt/Handheld2_Folder/imu/imu_data.csv"),
+                   "imuFile 相对 root 解析");
+        expectTrue(config.input.intrinsicsSource == myslam::dataset::IntrinsicsSource::MAST3R,
+                   "intrinsics.source = mast3r 生效");
+        expectTrue(config.input.intrinsicsFile == std::filesystem::path("/tmp/calib.txt"), "intrinsics.file 生效");
+        expectTrue(config.input.mast3r.pairs == 12, "mast3r.pairs 生效");
+        expectTrue(config.input.mast3r.device == "cuda", "mast3r.device 生效");
+        expectTrue(config.input.mast3r.force, "mast3r.force 生效");
+        expectTrue(config.input.mast3r.python == "/opt/conda/bin/python", "mast3r.python 生效");
+        expectTrue(config.input.hasExtrinsic, "dataset.extrinsic 被标记为已配置");
+        expectNear(config.input.extrinsic.t.x(), 0.2, "回放外参平移生效");
+
+        // 默认：未配置 sequence 与 extrinsic
+        const auto minimal = writeLua("dataset-input-minimal", R"(
+dataset = { intrinsics = { fx = 500.0 } }
+)");
+        myslam::config::ProjectConfig minimalConfig;
+        const auto minimalReport = loadFrom(minimal, minimalConfig);
+        std::filesystem::remove(minimal);
+        expectTrue(succeeded(minimalReport), "只有 internal 字段的 dataset 节仍合法");
+        expectTrue(!minimalConfig.input.sequence.configured(), "未配置时 sequence.root 为空");
+        expectTrue(!minimalConfig.input.hasExtrinsic, "未配置时 hasExtrinsic 为 false");
+        expectTrue(minimalConfig.input.intrinsicsSource == myslam::dataset::IntrinsicsSource::CONFIG,
+                   "默认内参来源为 config");
+
+        // source = "file" 但没有给文件：属于配置自相矛盾，必须拒绝
+        const auto missingFile = writeLua("dataset-input-missing-file", R"(
+dataset = { intrinsics = { source = "file", file = "" } }
+)");
+        myslam::config::ProjectConfig missingConfig;
+        const auto missingReport = loadFrom(missingFile, missingConfig);
+        std::filesystem::remove(missingFile);
+        expectTrue(!succeeded(missingReport), "source = file 但 file 为空时被拒绝");
+
+        // 非法枚举值不得静默退回默认
+        const auto badSource = writeLua("dataset-input-bad-source", R"(
+dataset = { intrinsics = { source = "opencv" } }
+)");
+        myslam::config::ProjectConfig badSourceConfig;
+        const auto badSourceReport = loadFrom(badSource, badSourceConfig);
+        std::filesystem::remove(badSource);
+        expectTrue(!succeeded(badSourceReport), "未知 intrinsics.source 被拒绝");
+
+        const auto badDevice = writeLua("dataset-input-bad-device", R"(
+dataset = { mast3r = { device = "tpu" } }
+)");
+        myslam::config::ProjectConfig badDeviceConfig;
+        const auto badDeviceReport = loadFrom(badDevice, badDeviceConfig);
+        std::filesystem::remove(badDevice);
+        expectTrue(!succeeded(badDeviceReport), "未知 mast3r.device 被拒绝");
     }
 
 } // namespace
@@ -534,7 +755,7 @@ vio = { pixelNoiseSigma = 0.01, accelNoiseSigma = 0.001 }
         const auto tinyReport = loadFrom(tiny, tinyConfig);
         std::filesystem::remove(tiny);
         expectTrue(succeeded(tinyReport), "小但合理的噪声值被接受");
-        expectNear(tinyConfig.vio.pixelNoiseSigma, 0.01, "pixelNoiseSigma 小值原样生效");
+        expectNear(tinyConfig.vio.vision.pixelNoiseSigma, 0.01, "pixelNoiseSigma 小值原样生效");
     }
 
     /**
@@ -640,16 +861,16 @@ vio = { imageWidth = 640.0, imageHeight = 480.0, cx = 900.0 }
     /**
      * @brief 路标深度有效区间：默认值、可配置性，以及反转区间必须被拒绝
      *
-     * 深度区间是几何有效性判据（见 VioBackend 预优化门控）。它一旦被配反，
+     * 深度区间是几何有效性判据（见 gtsam 适配器的预优化门控）。它一旦被配反，
      * 后端会静默丢弃全部视觉观测，退化成纯 IMU 积分而不报任何错误——正是
      * 那种“跑得通但结果全错”的失效模式，因此必须在这里拦住。
      */
     void checkLandmarkDepthConfig()
     {
-        const myslam::vio::VioConfig defaults;
-        expectNear(defaults.minLandmarkDepth, 0.3, "默认深度下限为 0.3 m");
-        expectNear(defaults.maxLandmarkDepth, 20.0, "默认深度上限为 20.0 m");
-        expectTrue(defaults.minLandmarkDepth < defaults.maxLandmarkDepth, "默认深度区间非空");
+        const myslam::domain::PipelineConfig defaults;
+        expectNear(defaults.vision.minLandmarkDepth, 0.3, "默认深度下限为 0.3 m");
+        expectNear(defaults.vision.maxLandmarkDepth, 20.0, "默认深度上限为 20.0 m");
+        expectTrue(defaults.vision.minLandmarkDepth < defaults.vision.maxLandmarkDepth, "默认深度区间非空");
 
         const auto path = writeLua("depth-override", R"(
 vio = { minLandmarkDepth = 0.5, maxLandmarkDepth = 12.5 }
@@ -658,8 +879,8 @@ vio = { minLandmarkDepth = 0.5, maxLandmarkDepth = 12.5 }
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
         expectTrue(succeeded(report), "合法的深度区间配置解析成功");
-        expectNear(config.vio.minLandmarkDepth, 0.5, "vio.minLandmarkDepth 覆盖生效");
-        expectNear(config.vio.maxLandmarkDepth, 12.5, "vio.maxLandmarkDepth 覆盖生效");
+        expectNear(config.vio.vision.minLandmarkDepth, 0.5, "vio.minLandmarkDepth 覆盖生效");
+        expectNear(config.vio.vision.maxLandmarkDepth, 12.5, "vio.maxLandmarkDepth 覆盖生效");
 
         // 反转：max <= min 时区间为空，全部观测都会被判几何无效
         const auto reversed = writeLua("depth-reversed", R"(
@@ -762,7 +983,7 @@ vio = { fx = 500.0 }
         const auto textReport = loadFrom(textPath, textConfig);
         std::filesystem::remove(textPath);
         expectTrue(succeeded(textReport), "文本源码仍被正常接受（对照）");
-        expectNear(textConfig.vio.fx, 500.0, "文本源码的值生效（对照）");
+        expectNear(textConfig.vio.camera.intrinsics.fx, 500.0, "文本源码的值生效（对照）");
     }
 
     /**
@@ -826,11 +1047,11 @@ vio = { fx = 460.0 }
     }
 
     /**
-     * @brief 回归：system.initTimeout 可配置且有合法默认值
+     * @brief 回归：初始化超时（原 system.initTimeout）可配置且有合法默认值
      */
     void checkInitTimeout()
     {
-        expectTrue(myslam::vio::SystemConfig{}.initTimeout > 0.0, "初始化超时默认为正数");
+        expectTrue(myslam::domain::PipelineConfig{}.initialization.timeoutSeconds > 0.0, "初始化超时默认为正数");
 
         const auto path = writeLua("init-timeout", R"(
 system = { initTimeout = 3.5 }
@@ -839,7 +1060,35 @@ system = { initTimeout = 3.5 }
         const auto report = loadFrom(path, config);
         std::filesystem::remove(path);
         expectTrue(succeeded(report), "initTimeout 可配置");
-        expectNear(config.system.initTimeout, 3.5, "system.initTimeout 覆盖生效");
+        expectNear(config.vio.initialization.timeoutSeconds, 3.5, "system.initTimeout 覆盖生效");
+    }
+
+    /**
+     * @brief 回归：估计器名字来自配置，未知名字在装配期失败
+     */
+    void checkEstimatorSelection()
+    {
+        expectTrue(!myslam::domain::PipelineConfig{}.estimator.name.empty(), "默认估计器名字非空（注册表键）");
+
+        const auto path = writeLua("estimator-name", R"(
+vio = { estimator = "imu_only" }
+)");
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+        expectTrue(succeeded(report), "vio.estimator 可被解析");
+        expectTrue(config.vio.estimator.name == "imu_only", "vio.estimator 覆盖生效");
+
+        // 类型错误必须报错而不是静默保留默认值
+        const auto badType = writeLua("estimator-bad-type", R"(
+vio = { estimator = 42 }
+)");
+        myslam::config::ProjectConfig badConfig;
+        const auto badReport = loadFrom(badType, badConfig);
+        std::filesystem::remove(badType);
+        expectTrue(!succeeded(badReport), "vio.estimator 非字符串时配置失败");
+        expectTrue(badConfig.vio.estimator.name == myslam::domain::PipelineConfig{}.estimator.name,
+                   "类型错误不改写默认估计器");
     }
 
 } // namespace
@@ -857,9 +1106,12 @@ int main()
     checkExtrinsic();
     checkFailurePaths();
     checkEmptyScript();
+    checkCameraModelSection();
+    checkDatasetCameraModel();
     checkLoggingSection();
     checkShippedConfig();
     checkDatasetSection();
+    checkDatasetInputSection();
 
     // 针对已修复缺陷的回归用例
     checkZeroNoiseRejected();
@@ -872,6 +1124,7 @@ int main()
     checkShippedConfigIsSilent();
     checkLoggingFlagRequiresSection();
     checkInitTimeout();
+    checkEstimatorSelection();
 
     if (g_failures == 0)
     {

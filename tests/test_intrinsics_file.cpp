@@ -8,7 +8,7 @@
  * 输入都必须被拒绝。断言计数风格与 mylog tests 一致。
  */
 
-#include "dataset/intrinsics_file.hpp"
+#include "sensor/intrinsics_file.hpp"
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -48,7 +48,7 @@ namespace
     /// Handheld1 的标定内参，作为基线
     myslam::dataset::MeiIntrinsics calibratedBaseline()
     {
-        return myslam::dataset::MeiIntrinsics{};
+        return myslam::dataset::subtHandheld1Intrinsics();
     }
 
     void testFocalWithInheritedDistortion()
@@ -203,6 +203,38 @@ namespace
         }
         std::filesystem::remove(path);
     }
+
+    /**
+     * @brief 针孔基线：focal 直接就是 fx/fy，且 MEI 的球面参数必须被归一化掉
+     *
+     * 基线故意构造成「模型为针孔、却携带 MEI 参数」——这正是从 SubT 标定
+     * 切到针孔序列时的真实状态。若不清零 xi，前端会把针孔图当作鱼眼反解。
+     * 用带非零 xi、非单位缩放、非方形像素的基线，上述每一条都有区分度。
+     */
+    void testPinholeBaselineNormalizesMeiParameters()
+    {
+        myslam::dataset::MeiIntrinsics baseline = myslam::dataset::subtHandheld1Intrinsics();
+        baseline.model = myslam::camera::CameraModel::PINHOLE;
+        baseline.pinholeScale = 0.4;
+        const double aspect = baseline.fy / baseline.fx;
+
+        const auto path = writeTemp("myslam_intr_pinhole.txt", "focal = 400\n"
+                                                               "width = 800\n"
+                                                               "height = 600\n");
+        const auto result = myslam::dataset::loadIntrinsicsFile(path, baseline);
+        expectTrue(result.has_value(), "针孔基线内参文件应解析成功");
+        if (result)
+        {
+            const auto &in = result->intrinsics;
+            expectTrue(!in.isMei(), "模型保持针孔");
+            expectTrue(near(in.xi, 0.0, 1e-12), "针孔下继承的 xi 被归一化为 0");
+            expectTrue(near(in.pinholeScale, 1.0, 1e-12), "针孔下 pinholeScale 归一化为 1");
+            expectTrue(near(in.fx, 400.0, 1e-9), "针孔下 focal 直接作为 fx");
+            expectTrue(near(in.pinholeFx(), 400.0, 1e-9), "针孔下虚拟针孔焦距等于 fx");
+            expectTrue(near(in.fy, 400.0 * aspect, 1e-9), "针孔下 fy 保留基线的长宽比");
+        }
+        std::filesystem::remove(path);
+    }
 } // namespace
 
 int main()
@@ -218,6 +250,7 @@ int main()
     testPrincipalPointOutside();
     testMissingFile();
     testScaleConflictWarns();
+    testPinholeBaselineNormalizesMeiParameters();
 
     if (g_failures == 0)
     {

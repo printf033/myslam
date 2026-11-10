@@ -28,3 +28,10 @@ if(TARGET myslam::myslam_lua)
 else()
     message(STATUS "myslam: MYSLAM_ENABLE_LUA is OFF, skipping myslam_config_test")
 endif()
+
+# 分层依赖检查纳入 ctest：越层 include 在测试阶段直接暴露，
+# 而不是等到某次“为什么 common 头能看见 backend”的排查才被发现。
+if(Python3_Interpreter_FOUND)
+    add_test(NAME myslam_layer_check
+             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_layers.py ${PROJECT_SOURCE_DIR})
+endif()

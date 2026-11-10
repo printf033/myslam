@@ -14,13 +14,32 @@
 -- 视觉惯性参数
 -- =============================================================================
 vio = {
-    -- 相机内参（针孔模型）
+    -- 估计器（后端）注册名：选哪个实现由这里决定，流水线一行不改。
+    --   gtsam_fixed_lag  紧耦合固定滞后平滑（参考实现，只接受针孔重投影）
+    --   imu_only         纯 IMU 航位推算（可替换性验证与 A/B 基线）
+    -- 未知名字在装配期报错，不会静默回退到默认实现。
+    estimator = "gtsam_fixed_lag",
+
+    -- 相机模型：pinhole（针孔）或 mei（鱼眼）。gtsam_fixed_lag 折算为虚拟针孔，
+    -- 支持全向重投影的估计器可直接使用 mei；
+    -- mei 时下面的 xi / k1 / k2 / p1 / p2 / pinholeScale 才会生效。
+    model = "pinhole",
+    -- 相机内参（针孔模型的投影参数）
     fx = 460.0,
     fy = 460.0,
     cx = 320.0,
     cy = 240.0,
-    imageWidth = 640.0,
-    imageHeight = 480.0,
+    imageWidth = 640,
+    imageHeight = 480,
+    -- MEI 参数：xi 与 pinholeScale 仅在 model = "mei" 下参与几何（针孔下 xi 归零、
+    -- pinholeScale 按 1 处理）；k1/k2/p1/p2 在两种模型下都作为 radtan 畸变生效。
+    -- 切回去时不用重新录入，所以这里保留一份基线值。
+    xi = 0.0,
+    k1 = 0.0,
+    k2 = 0.0,
+    p1 = 0.0,
+    p2 = 0.0,
+    pinholeScale = 1.0,
 
     -- 相机相对 IMU 的外参 tBc（Camera in Body frame）
     -- 工业标准定义：机身前向 (+X_b) 对应相机光轴 (+Z_c)，机身右向 (-Y_b) 对应
@@ -41,6 +60,22 @@ vio = {
 
     -- 重力常数
     gravityMagnitude = 9.81, -- 重力加速度模长 (m/s^2)
+
+    -- 相机-IMU 时间偏移 (s)：正值表示相机时间戳比 IMU 晚。由回放的时间同步器
+    -- 统一扣除；目前是固定常数，不做在线估计。
+    timeOffsetSeconds = 0.0,
+
+    -- 初始化阶段是否做静止检测与重力粗对齐。设为 false 即消融实验：不估初始
+    -- 姿态与零偏（初始姿态取单位阵、零偏置零），世界系 z 轴不再与真实重力对
+    -- 齐，轨迹会整体倾斜，用于量化“对齐这一步”的贡献。与 --gravity-alignment off 等价。
+    gravityAlignment = true,
+
+    -- 消融用：人为把初始姿态弄歪，测量后端能不能拉回来（需 gravityAlignment = false）。
+    -- 倾斜量绕世界系水平轴旋转，方位角决定轴的方向（0 = 绕 +X，即抬头/低头；
+    -- 90 = 绕 +Y，即左右侧倾）。与 --initial-tilt / --initial-tilt-azimuth 等价。
+    -- 注意：开启重力对齐时本项被忽略，因为对齐会估出真实姿态并覆盖它。
+    initialTiltDeg = 0.0,
+    initialTiltAzimuthDeg = 0.0,
 
     -- 视觉观测噪声与鲁棒核
     pixelNoiseSigma = 1.0,             -- 特征点重投影高斯噪声 (像素)
@@ -70,6 +105,28 @@ vio = {
     -- 滑动窗口
     maxSlidingWindowSize = 8, -- 滑动窗口内最大关键帧数
     slidingWindowLag = 1.6,   -- 固定滞后平滑窗口时长 (s)
+
+    -- 初始化判据：原为硬编码（40 样本 / 2 秒窗口），现可做消融
+    initializerMinSamples = 40,     -- 判定所需最少 IMU 样本数
+    initializerWindowSeconds = 2.0, -- 静止采样窗口时长 (s)，超出丢弃最旧样本
+
+    -- 健康监控阈值：原为硬编码，现可随平台/噪声量级调整
+    healthMaxAccelBiasNorm = 1.0,      -- 加速度计零偏模长上限 (m/s^2)
+    healthMaxGyroBiasNorm = 0.15,      -- 陀螺仪零偏模长上限 (rad/s)
+    healthMaxSpeed = 20.0,             -- 系统速度上限 (m/s)
+    healthMinActiveFeatures = 5,       -- 视觉观测数下限
+    healthAlertStreakThreshold = 3,    -- 连续异常多少帧才降级
+
+    -- 先验强度（标准差，m）：
+    -- landmarkPriorSigma 是两视图三角化的软正则项，过强会压制多视图观测；
+    -- recovery* 是局部恢复时以锚点重建平滑器的弱约束。
+    initialPoseSigma = 0.05,
+    initialVelSigma = 0.1,
+    initialBiasSigma = 0.05,
+    landmarkPriorSigma = 1.0,
+    recoveryPoseSigma = 0.1,
+    recoveryVelSigma = 0.2,
+    recoveryBiasSigma = 0.1,
 }
 
 -- =============================================================================
@@ -81,14 +138,42 @@ system = {
     totalDuration = 5.0,  -- 仿真/运行时长 (s)
     rmseThreshold = 0.20, -- 平移 RMSE 验收门限 (m)
     initTimeout = 2.0,    -- 初始化超时 (s)：超时后放宽静止检测，避免从运动状态开始时卡死
+    -- 初始化写入的世界系高度 (m)：世界系原点取初始 IMU 位置，水平面由重力对齐确定，
+    -- 高度是自由平移量，需要初值才能与仿真真值逐帧比较。
+    initialHeightMeters = 1.0,
 }
 
 -- =============================================================================
 -- 数据集回放（仅 2_subt_dataset 使用；本节为纯数据，不需要 OpenCV 即可解析）
 -- =============================================================================
 dataset = {
-    -- MEI 相机内参（默认值与 intrinsics_subt_handheld.yaml 一致）
+    -- -------------------------------------------------------------------------
+    -- 序列位置（相对仓库根目录；也可以写绝对路径）
+    --
+    -- 约定在仓库根目录运行，相对路径都按当前工作目录解析。
+    -- 换一条序列只改 root（或再调 replay.startFrame）。
+    -- -------------------------------------------------------------------------
+    sequence = {
+        root = "../MASt3R-Fusion/dataset/Handheld1_Folder",
+        -- 以下三项相对 root；写绝对路径则原样使用
+        cameraDir = "cam_0",                -- 帧图像目录（0.png, 1.png, ...）
+        imuFile = "imu/imu_data.csv",       -- IMU 记录
+        stampFile = "cam_0/timestamps.txt", -- 相机时间戳（每行一个纳秒时间）
+    },
+
+    -- -------------------------------------------------------------------------
+    -- 相机内参
+    --
+    -- source 决定下面的数值字段是否真的生效：
+    --   "config"  直接使用本节数值（默认）
+    --   "file"    从 file 指定的标定文件读取（本节数值作为缺失字段的基线）
+    --   "mast3r"  用 MASt3R 从图像估计焦距（缓存复用，见 mast3r 节）
+    -- -------------------------------------------------------------------------
     intrinsics = {
+        source = "config",
+        file = "",
+
+        model = "mei",
         fx = 758.3153257832925,
         fy = 676.6492212772476,
         cx = 318.27111164892506,
@@ -103,13 +188,41 @@ dataset = {
         imageHeight = 480,
     },
 
-    -- 回放范围与输出；路径写空串表示不输出
+    -- -------------------------------------------------------------------------
+    -- 回放专用相机-IMU 外参：T_imu_cam，相机在 IMU 系下的位姿。
+    --
+    -- 不写这一节就沿用 vio.extrinsic。分开是因为换序列时只需改这里，
+    -- 不必动仿真用的安装参数；早期实现把它硬编码在 2_subt_dataset 里，
+    -- 导致 config.lua 的 vio.extrinsic 在回放路径上被静默覆盖。
+    -- -------------------------------------------------------------------------
+    extrinsic = {
+        quaternion = { w = 0.482763536838, x = -0.495521661737, y = 0.505115659930, z = -0.515999829092 },
+        translation = { x = 0.19499356, y = 0.04340662, z = -0.01782382 },
+    },
+
+    -- -------------------------------------------------------------------------
+    -- MASt3R 内参估计选项（仅 intrinsics.source = "mast3r" 时使用）
+    -- -------------------------------------------------------------------------
+    mast3r = {
+        python = "",     -- 空 = 环境变量 MYSLAM_PYTHON，再退回 python3
+        weights = "",    -- 空 = 脚本内置候选或环境变量 MAST3R_WEIGHTS
+        pairs = 6,       -- 参与估计的图像对数 [1, 128]
+        device = "auto", -- auto / cpu / cuda
+        cache = "",      -- 空 = <sequence.root>/mast3r_intrinsics.txt
+        force = false,   -- true = 忽略已有缓存重新估计
+    },
+
+    -- -------------------------------------------------------------------------
+    -- 回放范围与输出
+    -- -------------------------------------------------------------------------
     replay = {
-        outputTum = "",  -- 关键帧轨迹输出（TUM 格式）
-        plyPath = "",    -- 路标/轨迹点云导出路径
-        startFrame = 0,   -- 从第几帧开始回放
-        maxFrames = 0,    -- 最多处理的图像帧数，0 = 全部
-        stride = 1,       -- 每隔多少帧取一帧，最小 1
+        outputTum = "build-release/subt_handheld1.tum", -- 关键帧轨迹输出（TUM 格式），空串 = 不写
+        plyPath = "",           -- 路标/轨迹点云导出路径，空串 = 不导出
+        -- Handheld1 前段曝光剧烈跳变且 IMU 有 0.4 s 空洞，因此从第 2300 帧起。
+        -- 换序列时按需调整；0 = 从头开始。
+        startFrame = 2300,
+        maxFrames = 0,     -- 最多处理的图像帧数，0 = 全部
+        stride = 1,        -- 每隔多少帧取一帧，最小 1
         maxFeatures = 200, -- 每帧特征数上限
         maxDuration = 0.0, -- 最长回放时长 (s)，0 = 不限
         -- IMU 断档判定倍数：相邻间隔超过 maxImuGapFactor / vio.imuRateHz 即视为断层。
@@ -119,7 +232,7 @@ dataset = {
 
     -- 实时可视化（需要 OpenCV highgui；两者都关闭时不做渲染）
     viz = {
-        showWindow = false, -- 打开实时窗口（需要 DISPLAY）
+        showWindow = true, -- 打开实时窗口（需要 DISPLAY）
         videoPath = "",     -- 视频输出路径，空则不写
         -- 画面右侧并排显示 MEI 去畸变后的虚拟针孔图像（与特征点坐标系一致），
         -- 关掉可省掉每帧一次 remap，只看原始鱼眼图
@@ -127,8 +240,8 @@ dataset = {
         displayStride = 1,  -- 每多少帧渲染一次
         panelHeight = 180,  -- 底部状态栏高度（像素）
         trailMaxPoints = 20000, -- 轨迹小地图保留的最大点数
-        videoFps = 20,          -- 视频帧率
-        playbackRate = 0.0,      -- 0 = 不限速；1 = 实时；2 = 两倍速
+        videoFps = 0,           -- 0 = 跟随序列的相机频率；非 0 = 固定帧率
+        playbackRate = 0.0,     -- 0 = 不限速；1 = 实时；2 = 两倍速
     },
 }
 

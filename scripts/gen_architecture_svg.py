@@ -6,8 +6,13 @@ computed here rather than hand-written so alignment stays exact.
 
 The two columns are the two sample rates. Each column is split into an
 initialization stage and a tracking stage, because within a column the two
-stages are mutually exclusive in code (`VioSystem::run()` branches on the
-current `SystemState`), not sequential.
+stages are mutually exclusive in code (`VioBenchmark::run()` branches on the
+current state machine value), not sequential.
+
+The emphasised box is the estimator: since the ports-and-adapters refactor the
+pipeline talks to `domain::IEstimator`, and the concrete implementation is
+selected by `vio.estimator` from the registry. Labels therefore name the port
+and its current GTSAM method, not a concrete class.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ BOX_FILL = "#ffffff"
 BOX_LINE = "#475569"
 INPUT_FILL = "#f1f5f9"
 INPUT_LINE = "#64748b"
-EMPH_FILL = "#eff6ff"    # VioBackend, the shared component
+EMPH_FILL = "#eff6ff"    # IEstimator, the shared port
 EMPH_LINE = "#2563eb"
 
 SANS = ("'Noto Sans CJK SC','Source Han Sans SC','PingFang SC',"
@@ -63,18 +68,18 @@ TEXT = {
     "en": {
         "sim": ("VioSimulator", "synthetic IMU / camera"),
         "seq": ("SubtSequence", "recorded sequence reader"),
-        "loop": "VioSystem::run()",
+        "loop": "VioBenchmark::run()",
         "loop_sub": "dual-rate main loop",
         "imu": "IMU 200 Hz",
         "cam": "Camera 20 Hz",
         "stage_init": "initialization",
         "stage_track": "tracking",
-        "l1": ("VioInitializer", "feedImu"),
-        "l2": ("VioBackend", "integrateImu"),
-        "l3": ("HighRatePropagator", "propagate"),
-        "r1": ("VioInitializer", "tryGravityAlignment"),
+        "l1": ("Initializer", "feedImu"),
+        "l2": ("IEstimator", "addKeyframe"),
+        "l3": ("StatePropagator", "propagate"),
+        "r1": ("Initializer", "tryGravityAlignment"),
         "r2": ("KeyframeSelector", "evaluate"),
-        "r3": ("VioBackend", "processKeyframe"),
+        "r3": ("IEstimator", "addKeyframe"),
         "reset": "reset base after optimization",
         "keyframe": "isKeyframe",
         "out": ("RunReport", "RMSE / max error"),
@@ -83,18 +88,18 @@ TEXT = {
     "zh": {
         "sim": ("VioSimulator", "合成 IMU / 相机观测"),
         "seq": ("SubtSequence", "序列读取"),
-        "loop": "VioSystem::run()",
+        "loop": "VioBenchmark::run()",
         "loop_sub": "双速率主循环",
         "imu": "IMU 200 Hz",
         "cam": "Camera 20 Hz",
         "stage_init": "初始化阶段",
         "stage_track": "追踪阶段",
-        "l1": ("VioInitializer", "feedImu"),
-        "l2": ("VioBackend", "integrateImu"),
-        "l3": ("HighRatePropagator", "propagate"),
-        "r1": ("VioInitializer", "tryGravityAlignment"),
+        "l1": ("Initializer", "feedImu"),
+        "l2": ("IEstimator", "addKeyframe"),
+        "l3": ("StatePropagator", "propagate"),
+        "r1": ("Initializer", "tryGravityAlignment"),
         "r2": ("KeyframeSelector", "evaluate"),
-        "r3": ("VioBackend", "processKeyframe"),
+        "r3": ("IEstimator", "addKeyframe"),
         "reset": "优化后重置外推基线",
         "keyframe": "isKeyframe",
         "out": ("RunReport", "RMSE / 最大偏差"),
