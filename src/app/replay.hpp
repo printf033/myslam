@@ -46,6 +46,52 @@ namespace myslam::dataset
 {
 
     /**
+     * @brief 顺序回放源接口：把「一段已录制的序列」抽象成回放器可消费的输入
+     *
+     * 回放管道按时间顺序遍历整段数据，需要「全部帧时间戳 + 全部 IMU + 按索引取灰度图」
+     * 这三件事。它与 @c domain::ISensorSource 的查询式接口（@c imuAt / @c frameAt）
+     * 语义不同：查询式接口无法表达单调推进，每帧都要重新二分查找。两者并存，
+     * 各自服务于自己的消费方——批量回放走本接口，仿真/在线查询走 ISensorSource。
+     *
+     * 回放器因此不必认识任何具体的数据集布局：SubtSequence、rosbag2、TUM 或
+     * 仿真导出的序列都可以实现本接口。
+     */
+    class IReplaySource
+    {
+    public:
+        virtual ~IReplaySource() = default;
+
+        /// 各帧相对时间戳（秒，升序）
+        [[nodiscard]] virtual const std::vector<double> &stamps() const = 0;
+
+        /// 全部 IMU 记录（按时间升序，时间已相对化）
+        [[nodiscard]] virtual const std::vector<ImuRecord> &imu() const = 0;
+
+        /// 读取第 frameIndex 帧并转成 8 位灰度图；失败返回空 Mat
+        [[nodiscard]] virtual cv::Mat loadGray(std::size_t frameIndex) const = 0;
+    };
+
+    /**
+     * @brief SubtSequence 的默认回放适配：保留原有「路径 + imread」行为
+     */
+    struct SubtSequenceSource final : IReplaySource
+    {
+        explicit SubtSequenceSource(const SubtSequence &sequence)
+            : sequence(sequence)
+        {
+        }
+
+        [[nodiscard]] const std::vector<double> &stamps() const override { return sequence.stamps(); }
+        [[nodiscard]] const std::vector<ImuRecord> &imu() const override { return sequence.imu(); }
+        [[nodiscard]] cv::Mat loadGray(std::size_t frameIndex) const override
+        {
+            return cv::imread(sequence.imagePath(frameIndex), cv::IMREAD_GRAYSCALE);
+        }
+
+        const SubtSequence &sequence;
+    };
+
+    /**
      * @brief 数据集回放器
      */
     class ReplayRunner
@@ -69,6 +115,15 @@ namespace myslam::dataset
         }
 
         DatasetRunReport run(const SubtSequence &sequence)
+        {
+            const SubtSequenceSource source(sequence);
+            return run(source);
+        }
+
+        /**
+         * @brief 回放任意实现 @c IReplaySource 的序列
+         */
+        DatasetRunReport run(const IReplaySource &source)
         {
             const auto wallStart = std::chrono::steady_clock::now();
 
@@ -149,11 +204,26 @@ namespace myslam::dataset
             auto restartSegment = [&](double cameraTime) -> bool
             {
                 accumulatePoints(*segment, exportedLandmarks, exportedTrajectory);
+                // emplace 会销毁旧 segment，必须先把终态取出来。只有真正跟踪过
+                // 的段才有可继承的先验；初始化未完成的段回到从原点重来的行为。
+                std::optional<domain::KinematicState> previousState;
+                if (segment->pipeline.state() == domain::SystemState::TRACKING_OK)
+                {
+                    previousState = segment->pipeline.latestState();
+                }
                 segment.emplace(config_, intrinsics_, runConfig_.maxFeatures, factory_);
                 if (!segment->pipeline.valid())
                 {
                     mylog::error("[回放] 重建后的流水线无效，终止回放: {}", segment->pipeline.error());
                     return false;
+                }
+                // 新段从断裂处继续，而不是回到原点：否则轨迹在段边界跳回
+                // (0,0,0)，导出的 TUM 与点云都不是一条连续轨迹。
+                if (previousState)
+                {
+                    segment->pipeline.setInitialStateHint(*previousState);
+                    mylog::info("[回放] 新段从上一段终态继续: t=({:.3f}, {:.3f}, {:.3f})", previousState->pose.t.x(),
+                                previousState->pose.t.y(), previousState->pose.t.z());
                 }
                 segment->sync.reset(cameraTime);
                 ++report.resets;
@@ -162,8 +232,8 @@ namespace myslam::dataset
                 return true;
             };
 
-            const auto &stamps = sequence.stamps();
-            const auto &imu = sequence.imu();
+            const auto &stamps = source.stamps();
+            const auto &imu = source.imu();
             const std::size_t firstFrame =
                 runConfig_.startFrame > 0 ? static_cast<std::size_t>(runConfig_.startFrame) : 0;
 
@@ -189,7 +259,9 @@ namespace myslam::dataset
                 {
                     break;
                 }
-                const double cameraTime = stamps[frameIndex];
+                // 图像内容对应曝光中点：触发时刻 + exposure/2。默认
+                // exposureSeconds = 0 时与旧行为一致。
+                const double cameraTime = stamps[frameIndex] + config_.camera.exposureSeconds * 0.5;
                 if (runConfig_.maxDuration > 0.0 && cameraTime - stamps.front() > runConfig_.maxDuration)
                 {
                     break;
@@ -222,10 +294,10 @@ namespace myslam::dataset
                     }
                 }
 
-                cv::Mat gray = cv::imread(sequence.imagePath(frameIndex), cv::IMREAD_GRAYSCALE);
+                cv::Mat gray = source.loadGray(frameIndex);
                 if (gray.empty())
                 {
-                    mylog::warn("图像读取失败，跳过第 {} 帧: {}", frameIndex, sequence.imagePath(frameIndex));
+                    mylog::warn("图像读取失败，跳过第 {} 帧（回放源）", frameIndex);
                     continue;
                 }
                 if (gray.cols != intrinsics_.imageWidth || gray.rows != intrinsics_.imageHeight)
@@ -414,8 +486,8 @@ namespace myslam::dataset
             }
             if (report.segments > 1)
             {
-                mylog::warn("   流水线被重建 {} 次，各段独立重新初始化，轨迹与点云坐标互不连续", report.resets);
-                mylog::warn("   跨段输出共 {} 条轨迹记录，直接拼接会在段边界出现位置跳变", report.trajectorySamples);
+                mylog::warn("   流水线被重建 {} 次：段边界的位置/姿态由上段终态接续，不会跳回原点；", report.resets);
+                mylog::warn("   但每段仍是独立初始化（零偏重估、路标重建），段内漂移各自累积，轨迹不是严格全局一致");
             }
             mylog::info("================================================================================");
             return report;
@@ -430,7 +502,8 @@ namespace myslam::dataset
             {
                 return;
             }
-            stream << "# segment " << segment << " begins at t=" << timestamp << " (独立初始化，坐标不与上一段连续)\n";
+            stream << "# segment " << segment << " begins at t=" << timestamp << " (独立初始化，起点接续上一段终态)"
+                   << "\n";
         }
 
         static void writeTum(std::ofstream &stream, double timestamp, const domain::Pose &pose)

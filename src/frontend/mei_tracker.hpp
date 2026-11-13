@@ -111,9 +111,24 @@ namespace myslam::vio
                 std::vector<float> err;
                 cv::calcOpticalFlowPyrLK(prevGray_, gray, prevPoints_, nextPoints, status, err, cv::Size(31, 31), 4);
 
+                // 前向-后向一致性校验：OpenCV 的 err 输出是末层金字塔 SAD 代价（31x31 窗口），
+                // 单位不是像素，完美匹配也可能达几十到上百，不能当残差门限用。标准做法是反向
+                // 再跑一次 LK，往返残差超过 ~2x 像素噪声(1px) 即判为坏跟踪（ORB-SLAM 同款）。
+                std::vector<cv::Point2f> backPoints;
+                std::vector<uchar> backStatus;
+                std::vector<float> backErr;
+                cv::calcOpticalFlowPyrLK(gray, prevGray_, nextPoints, backPoints, backStatus, backErr, cv::Size(31, 31),
+                                         4);
+
                 for (std::size_t i = 0; i < nextPoints.size(); ++i)
                 {
-                    if (status[i] == 0 || err[i] > 50.0F || !inBounds(nextPoints[i]))
+                    if (status[i] == 0 || !inBounds(nextPoints[i]))
+                    {
+                        continue;
+                    }
+                    const float dx = backPoints[i].x - prevPoints_[i].x;
+                    const float dy = backPoints[i].y - prevPoints_[i].y;
+                    if (backStatus[i] == 0 || std::hypot(dx, dy) > 2.0F)
                     {
                         continue;
                     }

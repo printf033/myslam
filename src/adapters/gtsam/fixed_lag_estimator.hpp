@@ -809,13 +809,13 @@ namespace myslam::adapters
                 ++streak;
                 mylog::debug("[外点门控] 特征点 #{} 优化后残差 {:.2f} px 超软门限 {:.2f} px (连续 {} 帧)",
                              observation.id, residualPx, config_.vision.maxReprojectionError, streak);
-                if (streak >= kOutlierStreakThreshold)
+                if (streak >= config_.vision.outlierStreakThreshold)
                 {
                     outlierLandmarks_.insert(observation.id);
                     outlierStreak_.erase(observation.id);
                     postOptOutliers++;
                     mylog::warn("[外点剔除] 特征点 #{} 连续 {} 帧超软门限 {:.2f} px，已标记为外点", observation.id,
-                                kOutlierStreakThreshold, config_.vision.maxReprojectionError);
+                                config_.vision.outlierStreakThreshold, config_.vision.maxReprojectionError);
                 }
             }
 
@@ -959,8 +959,6 @@ namespace myslam::adapters
 
         domain::HealthMonitor healthMonitor_;
         domain::HealthReport lastHealth_{};
-
-        static constexpr int kOutlierStreakThreshold = 3;
 
         std::size_t recoveredFrames_{0};
         std::deque<domain::ImuSample> recentImu_;

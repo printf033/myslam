@@ -89,15 +89,15 @@ namespace myslam::config
         if (!std::filesystem::is_regular_file(config, ec))
         {
             detail::reportError("配置文件不存在或不可读: {}", config.string());
-            return std::unexpected(
-                ConfigError{ConfigErrorKind::FileNotFound, std::format("配置文件不存在或不可读: {}", config.string())});
+            return std::unexpected(ConfigError{ConfigErrorKind::FILE_NOT_FOUND,
+                                               std::format("配置文件不存在或不可读: {}", config.string())});
         }
 
         lua_State *rawState = luaL_newstate();
         if (rawState == nullptr)
         {
             detail::reportError("无法创建 Lua 状态机（内存不足）");
-            return std::unexpected(ConfigError{ConfigErrorKind::LuaRuntime, "无法创建 Lua 状态机（内存不足）"});
+            return std::unexpected(ConfigError{ConfigErrorKind::LUA_RUNTIME, "无法创建 Lua 状态机（内存不足）"});
         }
 
         // RAII 持有 lua_State：解析路径里有 std::format / std::string / Values 拷贝
@@ -121,8 +121,8 @@ namespace myslam::config
             const char *err = lua_tostring(L, -1);
             const std::string detailText = err != nullptr ? err : "未知 Lua 错误";
             detail::reportError("执行 {} 失败: {}", config.string(), detailText);
-            return std::unexpected(
-                ConfigError{ConfigErrorKind::LuaRuntime, std::format("执行 {} 失败: {}", config.string(), detailText)});
+            return std::unexpected(ConfigError{ConfigErrorKind::LUA_RUNTIME,
+                                               std::format("执行 {} 失败: {}", config.string(), detailText)});
         }
 
         ProjectConfig parsed = out;
@@ -188,7 +188,7 @@ namespace myslam::config
         if (!projectValid)
         {
             const ConfigErrorKind kind =
-                structureError.empty() ? ConfigErrorKind::InvalidValue : ConfigErrorKind::InvalidStructure;
+                structureError.empty() ? ConfigErrorKind::INVALID_VALUE : ConfigErrorKind::INVALID_STRUCTURE;
             const std::string message =
                 structureError.empty() ? std::format("配置文件 {} 的字段校验未通过，详见上方逐条告警", config.string())
                                        : structureError;
@@ -228,7 +228,7 @@ namespace myslam::config
         const std::string message =
             std::format("本构建未启用 Lua 配置支持（MYSLAM_ENABLE_LUA=OFF），无法加载 {}", config.string());
         std::fprintf(stderr, "[myslam] config error: %s\n", message.c_str());
-        return std::unexpected(ConfigError{ConfigErrorKind::Unsupported, message});
+        return std::unexpected(ConfigError{ConfigErrorKind::UNSUPPORTED, message});
     }
 
 #endif // MYSLAM_HAS_LUA

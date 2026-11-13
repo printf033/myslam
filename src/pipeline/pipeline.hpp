@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <format>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <utility>
@@ -244,9 +245,22 @@ namespace myslam::vio
 
             domain::KinematicState initialState;
             initialState.timestamp = timestamp;
-            initialState.pose = initializer_.alignedPose();
-            initialState.pose.t.z() = config_.initialization.initialHeightMeters;
-            initialState.velocity = domain::Vec3::Zero();
+            if (initialHint_)
+            {
+                // 重建后从上一段断裂处继续。否则每段都从原点重新出发，
+                // 轨迹在段边界跳回 (0,0,0)，下游拿到的是碎片而非一条轨迹。
+                // 位置与速度都取上一段的终态；零偏仍用本段重新对齐的结果，
+                // 因为跨段沿用旧零偏会把上一段的误差带入新段。
+                initialState.pose = initialHint_->pose;
+                initialState.velocity = initialHint_->velocity;
+            }
+            else
+            {
+                initialState.pose = initializer_.alignedPose();
+                initialState.pose.t.z() = config_.initialization.initialHeightMeters;
+                // 默认零，适用于静止起始；运动起始的序列由配置注入真值速度。
+                initialState.velocity = config_.initialization.initialVelocity;
+            }
             initialState.bias = initializer_.alignedBias();
 
             domain::Keyframe firstKeyframe;
@@ -254,6 +268,53 @@ namespace myslam::vio
             firstKeyframe.timestamp = timestamp;
             firstKeyframe.observations = frame.observations;
             firstKeyframe.image = frame.image;
+
+            // 首关键帧退化门控：观测太少或全部挤在图像中心附近时，三角化
+            // 病态（深度不可观），初始化后视觉约束不足。保持 GRAVITY_ALIGNED
+            // 等下一帧重试，而不是带病启动。
+            {
+                const auto &obs = frame.observations;
+                if (static_cast<int>(obs.size()) < config_.initialization.minInitObservations)
+                {
+                    mylog::debug("[流水线] 初始化门控：观测数 {} < {}，延迟初始化", obs.size(),
+                                 config_.initialization.minInitObservations);
+                    return outcome;
+                }
+
+                // 射线最大夹角：优先用前端已算好的 normalized，缺失时用相机模型反投影
+                std::vector<domain::Vec3> rays;
+                rays.reserve(obs.size());
+                for (const auto &o : obs)
+                {
+                    if (o.normalized.has_value())
+                    {
+                        rays.push_back(*o.normalized);
+                    }
+                    else if (auto ray = model_->unproject(o.uv))
+                    {
+                        rays.push_back(*ray);
+                    }
+                }
+
+                double maxSpreadRad = 0.0;
+                for (std::size_t i = 0; i < rays.size(); ++i)
+                {
+                    for (std::size_t j = i + 1; j < rays.size(); ++j)
+                    {
+                        const double cosAngle =
+                            std::clamp(rays[i].dot(rays[j]) / (rays[i].norm() * rays[j].norm()), -1.0, 1.0);
+                        maxSpreadRad = std::max(maxSpreadRad, std::acos(cosAngle));
+                    }
+                }
+
+                const double minSpreadRad = config_.initialization.minInitSpreadDeg * std::numbers::pi / 180.0;
+                if (maxSpreadRad < minSpreadRad)
+                {
+                    mylog::debug("[流水线] 初始化门控：射线最大夹角 {:.2f}° < {:.2f}°，延迟初始化",
+                                 maxSpreadRad * 180.0 / std::numbers::pi, config_.initialization.minInitSpreadDeg);
+                    return outcome;
+                }
+            }
 
             bool initialized = false;
             try
@@ -279,6 +340,8 @@ namespace myslam::vio
             lastKeyframeTimestamp_ = timestamp;
             clearImuWindow();
             tracking_ = true;
+            // 先验只用于本次启动；后续若再次重置，由 reset() 重新采集当前状态。
+            initialHint_.reset();
 
             outcome.tracking = true;
             outcome.initialPose = initialState.pose;
@@ -408,11 +471,29 @@ namespace myslam::vio
          *
          * @param action 动作；@c NONE 与 @c RELOCALIZE 不由本类处理
          */
+        /**
+         * @brief 注入重建后的初始状态先验（位置 + 速度）
+         *
+         * 段重建时调用：新段从上一段的终态继续，保证输出的轨迹在时间轴上
+         * 连续。不调用时保持旧行为（首次初始化从原点出发）。
+         */
+        void setInitialStateHint(const domain::KinematicState &state) { initialHint_ = state; }
+
+        /// 清除初始状态先验（回到「从原点开始」的行为）
+        void clearInitialStateHint() { initialHint_.reset(); }
+
         void reset(domain::RecoveryAction action = domain::RecoveryAction::RESET_PIPELINE)
         {
             if (action == domain::RecoveryAction::NONE || action == domain::RecoveryAction::RELOCALIZE)
             {
                 return;
+            }
+
+            // 就地重置也会回到未初始化状态，必须先把当前状态记下来作为重启先验，
+            // 否则这条恢复路径同样会把轨迹拉回原点。
+            if (lastState_)
+            {
+                initialHint_ = *lastState_;
             }
 
             if (action == domain::RecoveryAction::RESET_ESTIMATOR && factory_ && lastState_)
@@ -670,6 +751,9 @@ namespace myslam::vio
         double lastKeyframeTimestamp_{-1.0};
         domain::KeyframeId lastKeyframeId_{0};
         std::optional<domain::KinematicState> lastState_;
+
+        /// 重建后的起点：只对「下一次初始化」生效，初始化成功后清空
+        std::optional<domain::KinematicState> initialHint_;
         double initDeadline_{-1.0};
         bool tracking_{false};
         std::size_t resets_{0};

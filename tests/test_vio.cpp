@@ -202,6 +202,10 @@ int main()
     myslam::adapters::registerBuiltinEstimators();
 
     myslam::domain::PipelineConfig config;
+    // 首关键帧退化门控针对真实前端；测试里的 stub 观测是人为构造的
+    // （数量少、挤在一条直线上），显式关闭以免门控把桩路径拦住。
+    config.initialization.minInitObservations = 0;
+    config.initialization.minInitSpreadDeg = 0.0;
     myslam::domain::SystemConfig systemConfig;
 
     // ------------------------------------------------------------------

@@ -53,8 +53,8 @@ vio = {
     -- IMU 噪声特性（连续时间功率谱密度，200 Hz 采样下样本标准差 = sigma / sqrt(dt)）
     accelNoiseSigma = 0.0057, -- 加速度计白噪声 (m/s^2 / sqrt(Hz))
     gyroNoiseSigma = 3.6e-4,  -- 陀螺仪白噪声 (rad/s / sqrt(Hz))
-    accelBiasRw = 3e-4,       -- 加速度计零偏随机游走 (m/s^3 / sqrt(Hz))
-    gyroBiasRw = 3e-5,        -- 陀螺仪零偏随机游走 (rad/s^2 / sqrt(Hz))
+    accelBiasRw = 0.01,       -- 加速度计零偏随机游走 (m/s^3 / sqrt(Hz))，Allan 实测上界 ~0.12 的保守折扣（手持 MEMS）
+    gyroBiasRw = 0.002,       -- 陀螺仪零偏随机游走 (rad/s^2 / sqrt(Hz))，Allan 实测上界 ~0.012 的保守折扣（手持 MEMS）
     integrationNoise = 1e-8,  -- 数值积分不确定度
     imuRateHz = 200.0,        -- IMU 采样率 (Hz)：采样步长由它派生，不再单独配置
 
@@ -64,6 +64,10 @@ vio = {
     -- 相机-IMU 时间偏移 (s)：正值表示相机时间戳比 IMU 晚。由回放的时间同步器
     -- 统一扣除；目前是固定常数，不做在线估计。
     timeOffsetSeconds = 0.0,
+
+    -- 曝光时长 (s)：图像内容对应曝光中点（触发时刻 + exposure/2）。数据集
+    -- timestamps.txt 只记录触发时刻且无曝光元数据，保持 0 即不修正。
+    exposureSeconds = 0.0,
 
     -- 初始化阶段是否做静止检测与重力粗对齐。设为 false 即消融实验：不估初始
     -- 姿态与零偏（初始姿态取单位阵、零偏置零），世界系 z 轴不再与真实重力对
@@ -83,6 +87,7 @@ vio = {
     maxReprojectionError = 8.0,        -- 优化后外点软门限 (像素)
     maxReprojectionErrorHard = 15.0,   -- 优化后外点硬门限 (像素)，应不严于软门限
     maxReprojectionErrorPreopt = 50.0, -- 预优化预门控宽门限 (像素)，应最宽松
+    outlierStreakThreshold = 3,        -- 软门限连续超限多少帧后标记为外点
     postOptOutlierMarking = true,      -- 诊断开关：优化后是否永久标记外点
     preoptTemporaryRejection = true,   -- 诊断开关：预优化是否临时拒绝超限观测
 
@@ -109,6 +114,8 @@ vio = {
     -- 初始化判据：原为硬编码（40 样本 / 2 秒窗口），现可做消融
     initializerMinSamples = 40,     -- 判定所需最少 IMU 样本数
     initializerWindowSeconds = 2.0, -- 静止采样窗口时长 (s)，超出丢弃最旧样本
+    minInitObservations = 15,       -- 首关键帧退化门控：有效观测数下限
+    minInitSpreadDeg = 3.0,         -- 首关键帧退化门控：射线最大夹角下限 (deg)
 
     -- 健康监控阈值：原为硬编码，现可随平台/噪声量级调整
     healthMaxAccelBiasNorm = 1.0,      -- 加速度计零偏模长上限 (m/s^2)
@@ -154,7 +161,7 @@ dataset = {
     -- 换一条序列只改 root（或再调 replay.startFrame）。
     -- -------------------------------------------------------------------------
     sequence = {
-        root = "../MASt3R-Fusion/dataset/Handheld1_Folder",
+        root = "../data/Handheld1_Folder",
         -- 以下三项相对 root；写绝对路径则原样使用
         cameraDir = "cam_0",                -- 帧图像目录（0.png, 1.png, ...）
         imuFile = "imu/imu_data.csv",       -- IMU 记录

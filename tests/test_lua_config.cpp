@@ -363,7 +363,7 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
         myslam::config::ProjectConfig config;
         const auto missing = loadFrom(std::filesystem::temp_directory_path() / "myslam_cfg_does_not_exist.lua", config);
         expectTrue(!succeeded(missing), "配置文件缺失时返回失败");
-        expectTrue(missing.error().kind == myslam::config::ConfigErrorKind::FileNotFound,
+        expectTrue(missing.error().kind == myslam::config::ConfigErrorKind::FILE_NOT_FOUND,
                    "缺失文件归类为 FileNotFound");
         expectTrue(!missing.error().message.empty(), "失败时携带说明文本");
 
@@ -371,7 +371,7 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
         const auto syntaxReport = loadFrom(syntax, config);
         std::filesystem::remove(syntax);
         expectTrue(!succeeded(syntaxReport), "语法错误的脚本返回失败");
-        expectTrue(syntaxReport.error().kind == myslam::config::ConfigErrorKind::LuaRuntime,
+        expectTrue(syntaxReport.error().kind == myslam::config::ConfigErrorKind::LUA_RUNTIME,
                    "语法错误归类为 LuaRuntime");
 
         const auto wrongType = writeLua("wrong-type", "vio = 42\nsystem = { totalDuration = 1.0 }");
@@ -379,7 +379,7 @@ vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
         const auto wrongTypeReport = loadFrom(wrongType, config2);
         std::filesystem::remove(wrongType);
         expectTrue(!succeeded(wrongTypeReport), "配置节不是 table 时返回失败");
-        expectTrue(wrongTypeReport.error().kind == myslam::config::ConfigErrorKind::InvalidStructure,
+        expectTrue(wrongTypeReport.error().kind == myslam::config::ConfigErrorKind::INVALID_STRUCTURE,
                    "配置节类型错误归类为 InvalidStructure");
         expectNear(config2.system.totalDuration, 5.0, "失败时不写回调用方配置");
 
@@ -390,7 +390,7 @@ vio = { minKeyframeInterval = 0.5, maxKeyframeInterval = 0.2 }
         myslam::config::ProjectConfig config3;
         const auto contradictionReport = loadFrom(contradiction, config3);
         std::filesystem::remove(contradiction);
-        expectTrue(contradictionReport.error().kind == myslam::config::ConfigErrorKind::InvalidValue,
+        expectTrue(contradictionReport.error().kind == myslam::config::ConfigErrorKind::INVALID_VALUE,
                    "交叉约束失败归类为 InvalidValue");
         expectTrue(contradictionReport.error().kindName() == "InvalidValue", "kindName 与枚举一致");
     }
@@ -480,7 +480,9 @@ dataset = { intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, cx = 320, 
         // 不得报成配置错误——否则每个合法的针孔序列配置都会带一条假告警。
         myslam::config::ProjectConfig silentConfig;
         const auto silentPath = writeLua("dataset-camera-pinhole-silent", R"(
-dataset = { intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, cx = 320, cy = 240, k1 = 0.0, k2 = 0.0, p1 = 0.0, p2 = 0.0 } }
+dataset = {
+    intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, cx = 320, cy = 240, k1 = 0.0, k2 = 0.0, p1 = 0.0, p2 = 0.0 }
+}
 )");
         const std::string captured = captureStderr([&] { (void)loadFrom(silentPath, silentConfig); });
         std::filesystem::remove(silentPath);
@@ -961,7 +963,7 @@ dataset = { intrinsics = { cx = 318.0 } }
         expectTrue(!succeeded(report), "预编译字节码配置被拒绝");
         if (!report)
         {
-            expectTrue(report.error().kind == myslam::config::ConfigErrorKind::LuaRuntime,
+            expectTrue(report.error().kind == myslam::config::ConfigErrorKind::LUA_RUNTIME,
                        "字节码被拒时归类为 LuaRuntime");
             // 关键区分：只看“加载失败”不够——一个截断的垃圾 chunk 在任何 mode
             // 下都会失败，那样测试在修复前后都成立，等于没测。必须验证失败原因
@@ -1012,7 +1014,7 @@ vio = { fx = 500.0 }
 
         myslam::config::ProjectConfig config;
         myslam::config::LoadResult report =
-            std::unexpected(myslam::config::ConfigError{myslam::config::ConfigErrorKind::FileNotFound, "not loaded"});
+            std::unexpected(myslam::config::ConfigError{myslam::config::ConfigErrorKind::FILE_NOT_FOUND, "not loaded"});
         const std::string captured = captureStderr([&] { report = loadFrom(shipped, config); });
 
         expectTrue(succeeded(report), "仓库自带配置能被正确加载");

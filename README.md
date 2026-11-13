@@ -47,16 +47,20 @@ myslam/
 │   ├── domain/             # 契约与值类型：位姿、观测、端口、配置、初始化、时间同步
 │   ├── adapters/           # 估计器实现：gtsam 固定滞后、纯 IMU
 │   ├── frontend/           # 图像 → 观测（GFTT + 金字塔 LK）
+│   │                       #   拆成两个目标：myslam_frontend（接口层，只依赖 domain）
+│   │                       #   与 myslam_frontend_cv（OpenCV 光流实现，回放/可视化用）
 │   ├── sensor/             # 数据来源：仿真器、数据集读取、标定文件
 │   ├── pipeline/           # 编排核心，只依赖 domain
 │   ├── app/                # 两个入口：VioBenchmark（有真值，打分）、ReplayRunner（只统计）
 │   ├── viz/                # 窗口、去畸变图、观察者实现
 │   ├── common/ config/     # 非算法数据、Lua 解析
-│   └── vio.hpp             # 聚合头
+│   ├── vio.hpp             # 聚合头
+│   ├── log_config.hpp      # mylog 日志级别与文件输出封装（logger/fileManager 两节）
+│   └── myslam.hpp.in       # 版本头模板，构建时由 project(VERSION) 生成 myslam.hpp
 ├── examples/               # 1_visual_inertial_odometry / 2_subt_dataset
 ├── tests/                  # test_vio / test_lua_config / test_intrinsics_file
 ├── docs/                   # 架构图、ADR、本文档
-├── scripts/                # run_subt.sh / check_layers.py / plot_tum.py
+├── scripts/                # run_subt.sh / run_rosbag.sh / run_tum.sh / check_layers.py / plot_tum.py
 └── thirdparty/             # gtsam / mylog / opencv / mast3r（submodule）
 ```
 
@@ -1016,6 +1020,62 @@ IMU 采样步长不是配置项，由 `vio.imuRateHz` 派生：`SystemConfig::im
 
 消融实验复制一份 Lua 再改（例如 `vio.gravityAlignment = false`），而不是拼命令行覆盖项。
 `dataset.sequence.root` 等相对路径按仓库根解析，因此请在仓库根目录运行。
+
+rosbag2（.db3）数据集走同一条回放管道，一键脚本为 `scripts/run_rosbag.sh`：
+
+```bash
+./scripts/run_rosbag.sh                     # 默认 07_25 包，构建并跑 VIO（带实时窗口）
+./scripts/run_rosbag.sh /path/to/xxx.db3    # 指定 bag（目录或 .db3）
+./scripts/run_rosbag.sh --inspect           # 只做数据体检（topic/IMU/相机/参考轨迹）
+./scripts/run_rosbag.sh --max-frames 100 --plot
+./scripts/run_rosbag.sh --no-show --video out.avi   # 不开窗口，只录像
+./scripts/run_rosbag.sh --playback-rate 2          # 两倍速
+./scripts/run_rosbag.sh --topic /camera/left/image_raw/compressed --fx 800 --fy 800
+```
+
+实时可视化默认跟随 `dataset.viz`（`config.lua` 里 `showWindow = true`）：左侧原始图、右侧
+去畸变图与特征点，底部状态栏与轨迹小地图，按 `q`/`ESC` 退出。可用 `--show`/`--no-show`
+强制开关；窗口不可用（无 `DISPLAY`）时自动降级为无输出而不报错。
+
+TUM RGB-D 数据集（**自带运动捕捉真值**）走 `scripts/run_tum.sh`，回放结束自动输出 ATE：
+
+```bash
+./scripts/run_tum.sh                              # 默认 freiburg1_desk
+./scripts/run_tum.sh ../data/tum/rgbd_dataset_freiburg1_xyz
+./scripts/run_tum.sh --inspect                    # 数据体检
+./scripts/run_tum.sh --max-frames 100 --plot
+```
+
+TUM 有三点与上面两类数据不同，程序会在启动时明确打印：
+
+- **没有陀螺仪**：`groundtruth.txt` 的姿态差分合成 gyro，加速度取 `accelerometer.txt`
+  的真实测量（Kinect 加速度计需自动做轴向校准）。因此结果验证的是位置与视觉
+  融合链路，不能等同于标准 VIO 的精度结论。
+- **图像带明显径向畸变**：默认按标定矫正后再送入前端（`--no-undistort` 可关闭）。
+- **序列从运动开始**：初始速度由真值差分给出（`--keep-imu-config` 只影响噪声参数）。
+
+精度参考（freiburg1 各序列，SE(3) 对齐后平移 RMSE）：
+
+| 序列 | 真值路径 | ATE RMSE | 重建次数 |
+| :--- | ---: | ---: | ---: |
+| `freiburg1_360` | 7.5 m | **0.84 m** | 1 |
+| `freiburg1_xyz` | 9.2 m | **1.46 m** | 1 |
+| `freiburg1_rpy` | 2.6 m | 6.12 m | 4 |
+| `freiburg1_desk` | 10.6 m | 10.19 m | 4 |
+
+前两个序列接近可用精度，后两个仍有明显漂移且触发多次重建。剩余误差的主因是
+Kinect 加速度计质量（纯惯性积分即使配上完美姿态，3 s 也漂 0.25–0.5 m）与视觉
+跟踪中断；该数据集本质上更适合纯视觉/RGB-D 方法，不匹配本项目「静止初始化 +
+IMU 预积分」的假设。
+
+> 历史读数不可信的两处：早期每段重建都从原点重新开始，短段被 SE(3) 对齐掩盖后
+> 曾得到 3.3 m；后来发现加速度计坐标系标定的判据对符号不敏感，选反后预积分按
+> `R·a + g ≈ 2g` 加速，曾出现 75 m 的估计路径。现在段间位置连续（边界跳变为 0），
+> 并在标定中解完整 3DoF 旋转（含约 3.4° 安装倾角）。
+
+内参优先级为「命令行 > bag 内 camera_info > Lua 配置」；bag 没有 `camera_info` 时必须
+显式给出 `--fx/--fy/--cx/--cy`（按针孔模型解释，图像宽高自动取自首帧），否则图像
+尺寸与标定不符会直接终止而不是静默跑偏。数据根目录用 `DATA_ROOT` 覆盖（默认 `../data`）。
 
 ## 测试
 

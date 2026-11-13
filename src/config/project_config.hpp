@@ -47,11 +47,11 @@ namespace myslam::config
      */
     enum class ConfigErrorKind
     {
-        FileNotFound,     ///< 路径不存在或不是普通文件
-        LuaRuntime,       ///< Lua 虚拟机创建失败、脚本语法错误或执行出错
-        InvalidStructure, ///< 配置节类型不符（例如 `vio = 42`）
-        InvalidValue,     ///< 字段值越界、缺失或违反交叉约束
-        Unsupported,      ///< 本次构建未启用 Lua 支持
+        FILE_NOT_FOUND,    ///< 路径不存在或不是普通文件
+        LUA_RUNTIME,       ///< Lua 虚拟机创建失败、脚本语法错误或执行出错
+        INVALID_STRUCTURE, ///< 配置节类型不符（例如 `vio = 42`）
+        INVALID_VALUE,     ///< 字段值越界、缺失或违反交叉约束
+        UNSUPPORTED,       ///< 本次构建未启用 Lua 支持
     };
 
     /**
@@ -61,8 +61,8 @@ namespace myslam::config
      */
     struct ConfigError
     {
-        ConfigErrorKind kind{ConfigErrorKind::InvalidValue}; ///< 失败类别
-        std::string message;                                 ///< 面向使用者的说明
+        ConfigErrorKind kind{ConfigErrorKind::INVALID_VALUE}; ///< 失败类别
+        std::string message;                                  ///< 面向使用者的说明
 
         /**
          * @brief 类别名称，便于日志与测试断言
@@ -71,15 +71,15 @@ namespace myslam::config
         {
             switch (kind)
             {
-            case ConfigErrorKind::FileNotFound:
+            case ConfigErrorKind::FILE_NOT_FOUND:
                 return "FileNotFound";
-            case ConfigErrorKind::LuaRuntime:
+            case ConfigErrorKind::LUA_RUNTIME:
                 return "LuaRuntime";
-            case ConfigErrorKind::InvalidStructure:
+            case ConfigErrorKind::INVALID_STRUCTURE:
                 return "InvalidStructure";
-            case ConfigErrorKind::InvalidValue:
+            case ConfigErrorKind::INVALID_VALUE:
                 return "InvalidValue";
-            case ConfigErrorKind::Unsupported:
+            case ConfigErrorKind::UNSUPPORTED:
                 return "Unsupported";
             }
             return "Unknown";

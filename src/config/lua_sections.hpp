@@ -64,6 +64,7 @@ namespace myslam::config
                               "maxReprojectionError",
                               "maxReprojectionErrorHard",
                               "maxReprojectionErrorPreopt",
+                              "outlierStreakThreshold",
                               "postOptOutlierMarking",
                               "preoptTemporaryRejection",
                               "minParallaxPx",
@@ -82,6 +83,8 @@ namespace myslam::config
                               "slidingWindowLag",
                               "initializerMinSamples",
                               "initializerWindowSeconds",
+                              "minInitObservations",
+                              "minInitSpreadDeg",
                               "healthMaxAccelBiasNorm",
                               "healthMaxGyroBiasNorm",
                               "healthMaxSpeed",
@@ -95,7 +98,8 @@ namespace myslam::config
                               "recoveryVelSigma",
                               "recoveryBiasSigma",
                               "estimator",
-                              "timeOffsetSeconds"});
+                              "timeOffsetSeconds",
+                              "exposureSeconds"});
 
             bool valid = true;
             fieldTypeErrors() = 0;
@@ -122,6 +126,9 @@ namespace myslam::config
             // 相机-IMU 时间偏移：正值表示相机时间戳比 IMU 晚。目前是固定常数
             // （不在线估计），由 TimeSynchronizer 在回放时应用。
             loadDouble(L, idx, kSection, "timeOffsetSeconds", -1.0, 1.0, cfg.camera.timeOffsetSeconds);
+            // 曝光时长：图像内容对应曝光中点，回放时加 exposure/2。数据集无
+            // 曝光元数据时保持默认 0（行为与旧版一致）。
+            loadDouble(L, idx, kSection, "exposureSeconds", 0.0, 10.0, cfg.camera.exposureSeconds);
 
             // 相机内参：@c model 决定装配层选择哪个投影模型
             if (!loadCameraModel(L, idx, kSection, cfg.camera.intrinsics.model))
@@ -195,6 +202,7 @@ namespace myslam::config
             loadDouble(L, idx, kSection, "maxReprojectionError", 0.0, 1e4, cfg.vision.maxReprojectionError);
             loadDouble(L, idx, kSection, "maxReprojectionErrorHard", 0.0, 1e4, cfg.vision.maxReprojectionErrorHard);
             loadDouble(L, idx, kSection, "maxReprojectionErrorPreopt", 0.0, 1e4, cfg.vision.maxReprojectionErrorPreopt);
+            loadInteger(L, idx, kSection, "outlierStreakThreshold", 1, 1'000, cfg.vision.outlierStreakThreshold);
             loadBool(L, idx, kSection, "postOptOutlierMarking", cfg.vision.postOptOutlierMarking);
             loadBool(L, idx, kSection, "preoptTemporaryRejection", cfg.vision.preoptTemporaryRejection);
 
@@ -224,6 +232,9 @@ namespace myslam::config
             // 何时降级。它们是最该拿来做消融的量，因此必须进配置。
             loadInteger(L, idx, kSection, "initializerMinSamples", 1, 1'000'000, cfg.initialization.minSamples);
             loadDouble(L, idx, kSection, "initializerWindowSeconds", 0.0, 600.0, cfg.initialization.windowSeconds);
+            // 首关键帧退化门控：观测数下限与射线最大夹角下限 (deg)
+            loadInteger(L, idx, kSection, "minInitObservations", 0, 1'000'000, cfg.initialization.minInitObservations);
+            loadDouble(L, idx, kSection, "minInitSpreadDeg", 0.0, 90.0, cfg.initialization.minInitSpreadDeg);
             loadDouble(L, idx, kSection, "healthMaxAccelBiasNorm", 1e-3, 1e3, cfg.health.maxAccelBiasNorm);
             loadDouble(L, idx, kSection, "healthMaxGyroBiasNorm", 1e-4, 1e2, cfg.health.maxGyroBiasNorm);
             loadDouble(L, idx, kSection, "healthMaxSpeed", 1e-3, 1e4, cfg.health.maxSpeed);

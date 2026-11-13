@@ -129,6 +129,25 @@ if(MYSLAM_BUILD_DATASET_TOOLS)
 endif()
 
 # -----------------------------------------------------------------------------
+# SQLite (vendored amalgamation)
+#
+# rosbag2 的 .db3 存储本质是一个 SQLite 数据库。系统级安装需要 root（本环境
+# 被 no-new-privs 阻止），因此直接 vendor 官方 amalgamation（sqlite.org 发布的
+# 单文件版本，无许可证问题：public domain）。
+#
+# 升级时从 https://www.sqlite.org/download.html 拉取新的 amalgamation，整体替换
+# sqlite3.c / sqlite3.h 即可，接口稳定。
+# -----------------------------------------------------------------------------
+add_library(myslam_sqlite STATIC sqlite/sqlite3.c)
+target_include_directories(myslam_sqlite INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/sqlite>
+)
+# 诊断工具只读打开数据库，不需要动态加载扩展（也避免引入 dlopen 依赖）。
+target_compile_definitions(myslam_sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION)
+target_compile_options(myslam_sqlite PRIVATE -w)
+add_library(myslam::sqlite ALIAS myslam_sqlite)
+
+# -----------------------------------------------------------------------------
 # MASt3R (https://github.com/naver/mast3r)
 #
 # Pinned as a submodule so the reconstruction toolchain behind the SubT

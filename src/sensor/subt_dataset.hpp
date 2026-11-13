@@ -119,8 +119,19 @@ namespace myslam::dataset
             return {};
         }
 
+        /**
+         * @brief 图像帧数
+         */
         std::size_t size() const { return stamps_.size(); }
+
+        /**
+         * @brief 各帧相对时间戳（秒，升序）
+         */
         const std::vector<double> &stamps() const { return stamps_; }
+
+        /**
+         * @brief 全部 IMU 记录（按时间升序，时间已相对化）
+         */
         const std::vector<ImuRecord> &imu() const { return imu_; }
 
         /**
@@ -131,6 +142,9 @@ namespace myslam::dataset
             return (cameraDir_ / (std::to_string(index) + ".png")).string();
         }
 
+        /**
+         * @brief 由首尾时间戳估计的 IMU 平均频率 (Hz)；样本不足 2 条时返回 0
+         */
         double estimateImuRate() const
         {
             if (imu_.size() < 2)
@@ -141,6 +155,9 @@ namespace myslam::dataset
             return span > 0.0 ? static_cast<double>(imu_.size() - 1) / span : 0.0;
         }
 
+        /**
+         * @brief 由首尾时间戳估计的相机平均帧率 (Hz)；样本不足 2 帧时返回 0
+         */
         double estimateCameraRate() const
         {
             if (stamps_.size() < 2)

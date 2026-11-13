@@ -60,6 +60,11 @@ namespace myslam::domain
 
         /// 相机-IMU 时间偏移 (s)：正值表示相机时间戳比 IMU 晚
         double timeOffsetSeconds{0.0};
+
+        /// 曝光时长 (s)：图像内容对应曝光中点（触发时刻 + exposure/2）。
+        /// 数据集通常只记录触发时刻，不做中点修正会让视觉观测与 IMU
+        /// 积分区间产生半个曝光的系统性时移；无曝光元数据时保持 0。
+        double exposureSeconds{0.0};
     };
 
     /**
@@ -72,8 +77,8 @@ namespace myslam::domain
         /// 连续时间噪声谱密度：离散样本标准差 = sigma / sqrt(dt)
         double accelNoiseSigma{0.0057}; ///< m/s^2 / sqrt(Hz)
         double gyroNoiseSigma{3.6e-4};  ///< rad/s / sqrt(Hz)
-        double accelBiasRw{3e-4};       ///< m/s^3 / sqrt(Hz)
-        double gyroBiasRw{3e-5};        ///< rad/s^2 / sqrt(Hz)
+        double accelBiasRw{0.01};       ///< m/s^3 / sqrt(Hz)，Allan 实测上界 ~0.12 的保守折扣（手持 MEMS）
+        double gyroBiasRw{0.002};       ///< rad/s^2 / sqrt(Hz)，Allan 实测上界 ~0.012 的保守折扣（手持 MEMS）
         double integrationNoise{1e-8};
 
         double gravityMagnitude{9.81}; ///< m/s^2
@@ -90,12 +95,14 @@ namespace myslam::domain
         double pixelNoiseSigma{1.0};
         double huberLossDelta{1.345};
 
-        /// 优化后外点软门限：持续超限才标记
+        /// 优化后外点软门限：连续超限帧数达到 outlierStreakThreshold 才标记
         double maxReprojectionError{8.0};
         /// 优化后外点硬门限：单帧残差超过即标记
         double maxReprojectionErrorHard{15.0};
         /// 预优化宽门限：只有预积分预测位姿可用，仅拦截灾难性误匹配
         double maxReprojectionErrorPreopt{50.0};
+        /// 软门限连续超限多少帧后标记为外点（防单帧抖动误杀）
+        int outlierStreakThreshold{3};
         bool postOptOutlierMarking{true};
         bool preoptTemporaryRejection{true};
 
@@ -139,6 +146,19 @@ namespace myslam::domain
 
         /// 世界系初始高度 (m)：自由平移量，不影响相对精度
         double initialHeightMeters{1.0};
+
+        /// 初始速度（世界上系，m/s）。默认零，适用于从静止开始的序列；
+        /// 从运动开始的序列（如 TUM RGB-D 手持数据）必须给出真值速度，
+        /// 否则预积分预测会系统性偏离视觉观测，零偏估计被迫代偿而发散。
+        Vec3 initialVelocity = Vec3::Zero();
+
+        /// 首关键帧退化门控：有效观测数下限。低于此值说明特征太少，
+        /// 初始化后视觉约束不足，保持 GRAVITY_ALIGNED 等下一帧。
+        int minInitObservations{15};
+
+        /// 首关键帧退化门控：观测射线最大夹角下限 (deg)。所有点都挤在图像
+        /// 中心附近时三角化病态（深度不可观），同样延迟初始化。
+        double minInitSpreadDeg{3.0};
     };
 
     /**

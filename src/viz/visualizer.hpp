@@ -94,7 +94,14 @@ namespace myslam::viz
         DatasetVisualizer(const DatasetVisualizer &) = delete;
         DatasetVisualizer &operator=(const DatasetVisualizer &) = delete;
 
+        /**
+         * @brief 是否有可用输出（窗口或视频）；两者都关闭时渲染全部跳过
+         */
         bool active() const { return active_; }
+
+        /**
+         * @brief 用户是否请求退出（窗口按键或 Ctrl-C）
+         */
         bool shouldQuit() const { return quit_; }
 
         /**
@@ -237,6 +244,10 @@ namespace myslam::viz
             mylog::error("[可视化] 无法打开视频文件 {}：当前 OpenCV 构建没有可用的编码器", path);
         }
 
+        /**
+         * @brief 组装一帧完整画面：上方原图/去畸变图并排，下方轨迹小地图 + 状态栏
+         * @return 拼好的画布；输入为空时返回空 Mat
+         */
         cv::Mat buildCanvas(const cv::Mat &gray, const domain::Frame &frame, const std::vector<domain::Vec2> &trail,
                             const std::vector<std::string> &statusLines, const cv::Mat *undistorted,
                             const cv::Mat *sourceMask)
@@ -282,6 +293,9 @@ namespace myslam::viz
             return canvas;
         }
 
+        /**
+         * @brief 灰度图转 BGR；已是彩色则克隆后原样返回
+         */
         static cv::Mat toBgr(const cv::Mat &image)
         {
             if (image.channels() == 1)
@@ -329,6 +343,9 @@ namespace myslam::viz
             cv::drawContours(image, maskContours_, -1, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
         }
 
+        /**
+         * @brief 在画面左上角写字幕（黑底描边 + 白字）
+         */
         static void drawCaption(cv::Mat &image, const std::string &text)
         {
             // 先黑底描边再写白字：图像亮暗都能看清，且不遮住下方特征点
@@ -337,6 +354,9 @@ namespace myslam::viz
             cv::putText(image, text, origin, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(235, 235, 235), 1, cv::LINE_AA);
         }
 
+        /**
+         * @brief 在面板左侧画轨迹小地图（世界系 XY，含比例尺；起点绿、当前红）
+         */
         void drawTrail(cv::Mat &panel, const std::vector<domain::Vec2> &trail) const
         {
             const int size = std::min(panel.rows, panel.cols);
@@ -386,6 +406,9 @@ namespace myslam::viz
                         1, cv::LINE_AA);
         }
 
+        /**
+         * @brief 在面板右侧逐行写状态文字，超出面板高度时截断
+         */
         void drawStatus(cv::Mat &panel, const std::vector<std::string> &statusLines) const
         {
             const int size = std::min(panel.rows, panel.cols);

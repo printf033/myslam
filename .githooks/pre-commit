@@ -30,6 +30,12 @@ fi
 UNFORMATTED=()
 
 while IFS= read -r -d '' file; do
+    # 第三方 vendor 代码（submodule / amalgamation）按其上游风格维护，
+    # 不参与本项目的格式化门禁：格式化 sqlite3.c 这类 25 万行单文件会
+    # 耗时数分钟，且会让后续上游升级产生巨大且无意义的 diff。
+    if [[ "$file" == thirdparty/* ]]; then
+        continue
+    fi
     if [[ "$file" =~ \.(cpp|hpp|c|h|cc|cxx|hxx)$ ]]; then
         mode=$(git ls-files --stage -- "$file" | awk '{print $1}')
         if [ "$mode" = "120000" ]; then

@@ -174,7 +174,16 @@ namespace myslam::domain
     public:
         virtual ~ISensorSource() = default;
 
+        /**
+         * @brief 查询时刻 time（相对秒）处最近的一条 IMU 样本
+         * @return 该时间点的角速度与比力；实现需保证序列非空且时间升序
+         */
         [[nodiscard]] virtual ImuSample imuAt(double time) = 0;
+
+        /**
+         * @brief 查询第 frameIndex 帧图像及其相对时间戳 time（秒）
+         * @return 该帧的像素数据与时间；索引越界的行为由实现定义
+         */
         [[nodiscard]] virtual Frame frameAt(int frameIndex, double time) = 0;
 
         /// 无真值的来源返回 @c std::nullopt

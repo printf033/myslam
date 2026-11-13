@@ -61,9 +61,11 @@ add_library(myslam::config ALIAS myslam_config)
 target_link_libraries(myslam_config INTERFACE myslam_common)
 
 # 数据来源：仿真器、数据集读取、内参文件。不链接 gtsam。
+# rosbag2 源需要 SQLite（.db3 存储）；nlohmann/json 走系统头文件，
+# 只用于解析 mfosn INS 的 JSON 字符串消息。
 add_library(myslam_sensor INTERFACE)
 add_library(myslam::sensor ALIAS myslam_sensor)
-target_link_libraries(myslam_sensor INTERFACE myslam_common)
+target_link_libraries(myslam_sensor INTERFACE myslam_common myslam::sqlite)
 
 # 前端：相机模型与观测提取接口在 domain；具体光流实现需要 OpenCV。
 add_library(myslam_frontend INTERFACE)

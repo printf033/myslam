@@ -72,7 +72,7 @@ int main(int argc, char **argv)
     const myslam::config::LoadResult loaded =
         configFileExists ? myslam::config::load(configPath, project)
                          : myslam::config::LoadResult(std::unexpected(
-                               myslam::config::ConfigError{myslam::config::ConfigErrorKind::FileNotFound,
+                               myslam::config::ConfigError{myslam::config::ConfigErrorKind::FILE_NOT_FOUND,
                                                            std::format("配置文件不存在: {}", configPath.string())}));
 
     if (!loaded && explicitConfig)

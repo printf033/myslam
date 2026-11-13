@@ -3,7 +3,9 @@ cmake_minimum_required(VERSION 3.20)
 project(myslam
     VERSION 0.1.1
     DESCRIPTION "A C++26 SLAM project built on gtsam, following mylog engineering conventions"
-    LANGUAGES CXX
+    # C 用于编译 vendored 的 SQLite amalgamation（rosbag2 .db3 读取）；
+    # 其余代码均为 C++。
+    LANGUAGES C CXX
 )
 
 # -----------------------------------------------------------------------------
