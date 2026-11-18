@@ -26,6 +26,7 @@
 #include "domain/time_synchronizer.hpp"
 #include "domain/types.hpp"
 #include "frontend/mei_tracker.hpp"
+#include "frontend/visual_initializer.hpp"
 #include "logger.hpp"
 #include "pipeline/pipeline.hpp"
 #include "sensor/subt_dataset.hpp"
@@ -94,6 +95,27 @@ namespace myslam::dataset
     /**
      * @brief 数据集回放器
      */
+    /**
+     * @brief 按配置构造动态初始化器
+     *
+     * 只在 @c initialization.dynamicEnabled 时返回实现：回放路径已经链接了
+     * OpenCV，注入它的代价只是多一个对象；但默认关闭，因为静止初始化只要
+     * 成立就更准。
+     *
+     * 放在命名空间作用域而不是 @c run() 内部：@c Segment 是 run() 的局部
+     * 结构体，C++ 不允许在函数体内定义函数，helper 必须在这一层。
+     */
+    [[nodiscard]] inline std::unique_ptr<domain::IDynamicInitializer>
+    makeDynamicInitializer(const domain::PipelineConfig &config, const MeiIntrinsics &intrinsics)
+    {
+        if (!config.initialization.dynamicEnabled)
+        {
+            return nullptr;
+        }
+        return std::make_unique<vio::VisualImuInitializer>(config.initialization, config.imu, intrinsics,
+                                                           config.camera.bodyPSensor.orientation);
+    }
+
     class ReplayRunner
     {
     public:
@@ -104,8 +126,11 @@ namespace myslam::dataset
          */
         ReplayRunner(const domain::PipelineConfig &config, const MeiIntrinsics &intrinsics,
                      const DatasetRunConfig &runConfig, std::unique_ptr<vio::IRunObserver> observer = nullptr,
-                     domain::EstimatorFactory factory = {})
+                     domain::EstimatorFactory factory = {}, std::string timingCsvPath = {})
             : config_(config),
+              // 初始化顺序与成员声明一致（config_ → timingCsvPath_ → intrinsics_
+              // → runConfig_ → observer_ → factory_），否则 -Wreorder。
+              timingCsvPath_(std::move(timingCsvPath)),
               intrinsics_(intrinsics),
               runConfig_(runConfig),
               observer_(std::move(observer)),
@@ -134,10 +159,10 @@ namespace myslam::dataset
             {
                 Segment(const domain::PipelineConfig &config, const MeiIntrinsics &intrinsics, int maxFeatures,
                         const domain::EstimatorFactory &factory)
-                    : pipeline(config, factory),
+                    : pipeline(config, factory, makeDynamicInitializer(config, intrinsics)),
                       sync(config.imu),
-                      tracker(intrinsics, domain::makeCameraModel(intrinsics), pipeline.observationModel(), maxFeatures,
-                              config.vision.minFeatures)
+                      tracker(intrinsics, domain::makeCameraModel(intrinsics), pipeline.observationModel(),
+                              config.vision, maxFeatures)
                 {
                     // 相机时间戳与 IMU 时间戳的固定偏移：由同步器统一扣除，
                     // 而不是在每个调用点手工加减（那样必然会漏掉某一条路径）。
@@ -196,7 +221,7 @@ namespace myslam::dataset
                 }
                 for (const domain::KeyframeState &keyframe : snapshot.keyframes)
                 {
-                    trajectory.push_back(keyframe.pose.t);
+                    trajectory.push_back(keyframe.pose.position);
                 }
             };
 
@@ -204,6 +229,9 @@ namespace myslam::dataset
             auto restartSegment = [&](double cameraTime) -> bool
             {
                 accumulatePoints(*segment, exportedLandmarks, exportedTrajectory);
+                // emplace 会销毁旧 segment：它的耗时统计必须先并入总账，
+                // 否则多段回放只留下最后一段的数字。
+                accumulatedTimings_.merge(segment->pipeline.timings());
                 // emplace 会销毁旧 segment，必须先把终态取出来。只有真正跟踪过
                 // 的段才有可继承的先验；初始化未完成的段回到从原点重来的行为。
                 std::optional<domain::KinematicState> previousState;
@@ -222,10 +250,12 @@ namespace myslam::dataset
                 if (previousState)
                 {
                     segment->pipeline.setInitialStateHint(*previousState);
-                    mylog::info("[回放] 新段从上一段终态继续: t=({:.3f}, {:.3f}, {:.3f})", previousState->pose.t.x(),
-                                previousState->pose.t.y(), previousState->pose.t.z());
+                    mylog::info("[回放] 新段从上一段终态继续: t=({:.3f}, {:.3f}, {:.3f})",
+                                previousState->pose.position.x(), previousState->pose.position.y(),
+                                previousState->pose.position.z());
                 }
-                segment->sync.reset(cameraTime);
+                // 必须传原始相机时刻：同步器内部扣除 timeOffsetSeconds。
+                segment->sync.resetToCameraTime(cameraTime);
                 ++report.resets;
                 ++report.segments;
                 writeTumSegment(tum, report.segments, cameraTime);
@@ -465,6 +495,11 @@ namespace myslam::dataset
             report.elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count();
 
             mylog::info("================================================================================");
+            if (segment.has_value())
+            {
+                accumulatedTimings_.merge(segment->pipeline.timings());
+            }
+            writeTimings();
             mylog::info("📊 数据集回放完成: 处理 {} 帧, 关键帧 {}, IMU {} 条, 初始化 {}", report.framesProcessed,
                         report.keyframes, report.imuSamples, report.initialized ? "成功" : "未完成");
             mylog::info("   回放时长 {:.2f} s (序列总长 {:.2f} s), 墙钟耗时 {:.2f} s", report.durationSeconds,
@@ -512,13 +547,32 @@ namespace myslam::dataset
             {
                 return;
             }
-            const domain::Vec3 t = pose.t;
-            const Eigen::Quaterniond &q = pose.q;
+            const domain::Vec3 t = pose.position;
+            const Eigen::Quaterniond &q = pose.orientation;
             stream << timestamp << " " << t.x() << " " << t.y() << " " << t.z() << " " << q.x() << " " << q.y() << " "
                    << q.z() << " " << q.w() << "\n";
         }
 
+        /// 把分段耗时写到 CSV（空则不写）。失败只告警：计时是观测设施。
+        void writeTimings() const
+        {
+            if (timingCsvPath_.empty() || accumulatedTimings_.empty())
+            {
+                return;
+            }
+            std::ofstream out(timingCsvPath_);
+            if (!out)
+            {
+                mylog::warn("[耗时] 无法写入 {}；分段耗时: {}", timingCsvPath_, accumulatedTimings_.summary());
+                return;
+            }
+            out << domain::StageTimings::csvHeader() << accumulatedTimings_.toCsv();
+            mylog::info("[耗时] 分段耗时已写入 {}: {}", timingCsvPath_, accumulatedTimings_.summary());
+        }
+
         domain::PipelineConfig config_;
+        std::string timingCsvPath_;
+        domain::StageTimings accumulatedTimings_;
         MeiIntrinsics intrinsics_;
         DatasetRunConfig runConfig_;
         std::unique_ptr<vio::IRunObserver> observer_;

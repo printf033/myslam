@@ -4,7 +4,7 @@
  *
  * 用法：
  * @code
- * 2_subt_dataset                        # 读 config/config.lua，按里面的配置跑
+ * 2_subt_dataset                        # 读 config/subt_handheld1.lua，按里面的配置跑
  * 2_subt_dataset --config abl.lua       # 用另一份配置（消融实验）
  * @endcode
  *
@@ -66,7 +66,7 @@ namespace
                              "  dataset.viz.*         窗口、录像、播放倍速\n"
                              "  vio.* / system.*      算法与时序参数\n"
                              "\n"
-                             "--config 不指定时读取当前目录的 config/config.lua；该文件不存在时\n"
+                             "--config 不指定时读取当前目录的 config/subt_handheld1.lua；该文件不存在时\n"
                              "使用内置默认值（此时没有序列路径，回放会直接报错）。\n");
     }
 
@@ -190,7 +190,7 @@ int main(int argc, char **argv)
 {
     // 唯一的命令行参数：选哪份 Lua 配置。其余全部来自配置本身，
     // 这样「配置里写的」与「实际运行的」不会因为漏传参数而分叉。
-    std::filesystem::path configPath = "config/config.lua";
+    std::filesystem::path configPath = "config/subt_handheld1.lua";
     bool explicitConfig = false;
     for (int i = 1; i < argc; ++i)
     {
@@ -407,7 +407,7 @@ int main(int argc, char **argv)
     // （MEI 自动乘 pinholeScale，针孔直接使用）。回放只需把标定交给配置，
     // 由装配层与适配器决定怎么消费。
     // 以配置文件的 vio 节为基线再覆盖——原先直接 default 构造配置，
-    // 导致 config/config.lua 里所有 vio.* 参数（门限、窗口、噪声、Huber…）
+    // 导致 config/subt_handheld1.lua 里所有 vio.* 参数（门限、窗口、噪声、Huber…）
     // 在这条回放路径上全部静默失效。
     myslam::domain::PipelineConfig vioConfig = project.vio;
     vioConfig.camera.intrinsics = intrinsics;
@@ -415,7 +415,7 @@ int main(int argc, char **argv)
     // 离散化与断档判定周期，写死配置值会让时间同步按错误的周期判断层。
     vioConfig.imu.rateHz = sequence.estimateImuRate() > 0.0 ? sequence.estimateImuRate() : 200.0;
     // 回放专用外参：dataset.extrinsic 优先，未配置则沿用 vio.extrinsic。
-    // 以前这段是硬编码在这里的，导致 config.lua 的 vio.extrinsic 在回放路径
+    // 以前这段是硬编码在这里的，导致配置文件的 vio.extrinsic 在回放路径
     // 上被静默覆盖——配置改了却不生效，比没有配置更糟。
     if (input.hasExtrinsic)
     {

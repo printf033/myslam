@@ -37,6 +37,23 @@ namespace myslam::domain
     using Vec3 = Eigen::Vector3d;
     using Mat3 = Eigen::Matrix3d;
 
+    /**
+     * @brief 位姿切线空间的 6x6 协方差
+     *
+     * 元素顺序固定为**前 3 旋转、后 3 平移**（与 gtsam @c Pose3 的切线顺序
+     * 一致）。这个顺序是对外契约的一部分：任何按块取用的调用方都不该再猜。
+     */
+    using Mat6 = Eigen::Matrix<double, 6, 6>;
+
+    /**
+     * @brief 位姿协方差
+     *
+     * 用 @c std::optional 而不是全零矩阵：不作协方差传播的后端（例如纯 IMU
+     * 航位推算）与「协方差恰好为零」是两件事。前者必须让 NEES 这类指标明确
+     * 缺席，而不是算出一个无穷大的分数。
+     */
+    using PoseCovariance = std::optional<Mat6>;
+
     /// 关键帧编号：由编排层单调分配，重建后继续递增（跨段不重号）
     using KeyframeId = int;
     /// 特征编号：由前端跨帧维护，后端只当作不透明标识
@@ -45,38 +62,56 @@ namespace myslam::domain
     using LandmarkId = int;
 
     /**
-     * @brief 刚体位姿（World <- Body）
+     * @brief 刚体位姿（World ← Body）
      *
      * 用四元数 + 平移表达，避免把 4x4 齐次矩阵当成通用容器。四元数在
      * 优化器之外不会被反复归一化，做复合/求逆时的数值行为与 gtsam 的
      * @c Rot3 一致（后者内部也是四元数）。
+     *
+     * @par 帧语义靠约定而不是靠类型
+     *
+     * 本类型表达的是「把 Body 系的点变到 World 系」这一个方向的变换。成员
+     * 叫 @c orientation / @c position 而不是 @c q_Wb / @c p_Wb，是因为同一个
+     * 类型也用来表达外参（那时是 Body ← Sensor）：把帧后缀写进成员名，
+     * 遇到外参就是错的。帧语义因此靠**使用点的变量名约定**承担：
+     * @c tWb / @c tWc 是「World ← Body / World ← Camera」，
+     * @c bodyPSensor 是「Body ← Sensor」。新代码沿用同一套前缀。
+     *
+     * 这层约定无法被编译器检查，所以两个易错点必须显式写明：
+     *   - @c operator* 是「先右后左」，@c A * B 表示先施加 B；
+     *   - @c transformTo 把世界点变到本机体系，@c unrotate 只转向量不平移。
      */
     struct Pose
     {
-        Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
-        Vec3 t = Vec3::Zero();
+        /// 姿态（本体系到父系的旋转）；对 World←Body 位姿即 q_Wb
+        Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+        /// 原点位置（父系表达）；对 World←Body 位姿即 p_Wb
+        Vec3 position = Vec3::Zero();
 
         [[nodiscard]] static Pose identity() noexcept { return {}; }
 
-        [[nodiscard]] Mat3 rotation() const noexcept { return q.toRotationMatrix(); }
+        [[nodiscard]] Mat3 rotation() const noexcept { return orientation.toRotationMatrix(); }
 
         /// 变换一个点：R * p + t
-        [[nodiscard]] Vec3 operator*(const Vec3 &point) const noexcept { return q * point + t; }
+        [[nodiscard]] Vec3 operator*(const Vec3 &point) const noexcept { return orientation * point + position; }
 
         /// 复合：this * rhs（先 rhs 后 this）
-        [[nodiscard]] Pose operator*(const Pose &rhs) const noexcept { return Pose{q * rhs.q, q * rhs.t + t}; }
+        [[nodiscard]] Pose operator*(const Pose &rhs) const noexcept
+        {
+            return Pose{orientation * rhs.orientation, orientation * rhs.position + position};
+        }
 
         [[nodiscard]] Pose inverse() const noexcept
         {
-            const Eigen::Quaterniond inv = q.conjugate();
-            return Pose{inv, -(inv * t)};
+            const Eigen::Quaterniond inv = orientation.conjugate();
+            return Pose{inv, -(inv * position)};
         }
 
         /// 把世界系点变换到本机体系
         [[nodiscard]] Vec3 transformTo(const Vec3 &point) const noexcept { return inverse() * point; }
 
         /// 只反向旋转一个向量（不含平移）
-        [[nodiscard]] Vec3 unrotate(const Vec3 &vector) const noexcept { return q.conjugate() * vector; }
+        [[nodiscard]] Vec3 unrotate(const Vec3 &vector) const noexcept { return orientation.conjugate() * vector; }
     };
 
     /**
@@ -223,6 +258,8 @@ namespace myslam::domain
         KeyframeId id{0};
         double timestamp{0.0};
         Pose pose{};
+        /// 位姿边际协方差；估计器不提供时为 @c std::nullopt
+        PoseCovariance poseCovariance{};
     };
 
     /**
@@ -237,6 +274,22 @@ namespace myslam::domain
         std::vector<KeyframeState> keyframes;
         std::vector<LandmarkEstimate> landmarks;
     };
+
+    /**
+     * @brief 从一个位姿协方差里取出平移块
+     *
+     * 约定见 @c Mat6：后 3 维是平移。取不到协方差时返回 @c std::nullopt，
+     * 调用方据此跳过一致性检验，而不是拿默认值替代。
+     */
+    [[nodiscard]] inline std::optional<Mat3> translationCovariance(const PoseCovariance &covariance) noexcept
+    {
+        if (!covariance.has_value())
+        {
+            return std::nullopt;
+        }
+        const Mat3 block = covariance->block<3, 3>(3, 3);
+        return block;
+    }
 
     /**
      * @brief 仿真真值（只有带解析真值的来源才提供）

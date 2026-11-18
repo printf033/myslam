@@ -106,18 +106,6 @@ namespace myslam::dataset
     };
 
     /**
-     * @brief SubT Handheld1 的 MEI 基线标定（与 intrinsics_subt_handheld.yaml 一致）
-     *
-     * 它以前是 @c MeiIntrinsics 的结构体默认值。统一内参类型后，默认值属于
-     * 通用模型（针孔仿真），数据集专属标定改为显式工厂：新建一条序列时
-     * 不会再静默继承别的数据集的标定。
-     */
-    [[nodiscard]] inline MeiIntrinsics subtHandheld1Intrinsics() noexcept
-    {
-        return camera::CameraIntrinsics::subtHandheld1Mei();
-    }
-
-    /**
      * @brief 可视化配置
      */
     struct VisualizationConfig

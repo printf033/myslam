@@ -114,7 +114,10 @@ namespace myslam::domain
             const double dt = current.timestamp - lastKeyframeTimestamp;
             if (dt < config_.minKeyframeInterval)
             {
-                return {false, "时间间隔未达最小视差基线要求 (保持高频推算)", 0.0, 1.0};
+                // 必须回传真实统计量：写死 {0.0, 1.0} 会在跟踪全丢（coVisible = 0）
+                // 时报告「完美共视、零视差」，把这份决策结果接进零速判据就会
+                // 在这个分支把「正在快速运动」读成「静止」。
+                return {false, "时间间隔未达最小视差基线要求 (保持高频推算)", avgParallax, trackingRatio};
             }
 
             if (avgParallax >= config_.minParallaxPx)

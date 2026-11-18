@@ -28,7 +28,7 @@ namespace myslam::adapters
 
     [[nodiscard]] inline gtsam::Pose3 toGtsam(const domain::Pose &value)
     {
-        return gtsam::Pose3(gtsam::Rot3(value.q.toRotationMatrix()), toGtsam(value.t));
+        return gtsam::Pose3(gtsam::Rot3(value.orientation.toRotationMatrix()), toGtsam(value.position));
     }
 
     [[nodiscard]] inline domain::Pose fromGtsam(const gtsam::Pose3 &value)

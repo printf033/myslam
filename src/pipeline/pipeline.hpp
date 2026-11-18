@@ -30,11 +30,13 @@
 #include "domain/ports.hpp"
 #include "domain/propagator.hpp"
 #include "domain/registry.hpp"
+#include "domain/stage_timings.hpp"
 #include "domain/status.hpp"
 #include "domain/types.hpp"
 #include "logger.hpp"
 #include <algorithm>
 #include <cstddef>
+#include <deque>
 #include <format>
 #include <memory>
 #include <numbers>
@@ -54,6 +56,8 @@ namespace myslam::vio
         bool aligned{false};
         bool tracking{false};
         bool relaxed{false};
+        /// 本次对齐来自动态（运动起始）初始化，而不是静止检测
+        bool dynamic{false};
         std::optional<domain::Pose> initialPose;
     };
 
@@ -75,6 +79,8 @@ namespace myslam::vio
         Kind kind{Kind::NOT_TRACKING};
         domain::KeyframeDecision decision{};
         std::optional<domain::Pose> pose;
+        /// 本帧位姿边际协方差（仅 @c KEYFRAME_OPTIMIZED 时有值）
+        domain::PoseCovariance poseCovariance{};
         domain::HealthReport health{};
         /// 估计器建议的恢复动作；编排层据此决定是否重建，而不是一律重置
         domain::RecoveryAction recovery{domain::RecoveryAction::NONE};
@@ -102,13 +108,21 @@ namespace myslam::vio
          * @param config 分组后的算法配置
          * @param factory 估计器工厂；为空时按 @c config.estimator.name 查询注册表
          */
-        explicit VioPipeline(const domain::PipelineConfig &config, domain::EstimatorFactory factory = {})
+        explicit VioPipeline(const domain::PipelineConfig &config, domain::EstimatorFactory factory = {},
+                             std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer = nullptr)
             : config_(config),
               factory_(factory ? std::move(factory) : registryFactory()),
               initializer_(config.initialization, config.imu),
               selector_(config.vision),
-              propagator_(config.imu)
+              propagator_(config.imu),
+              dynamicInitializer_(std::move(dynamicInitializer))
         {
+            if (dynamicInitializer_ && !config_.initialization.dynamicEnabled)
+            {
+                // 注入了实现却忘了开开关是最容易发生的一种「静默不生效」：
+                // 明确告警一次，而不是让它一声不响地永远不被调用。
+                mylog::warn("[流水线] 传入了动态初始化器，但 initialization.dynamicEnabled = false，它不会被调用");
+            }
             std::expected<domain::EstimatorBundle, std::string> bundle =
                 std::unexpected(std::string("估计器工厂未执行"));
             try
@@ -142,14 +156,19 @@ namespace myslam::vio
          * @param factory 重建工厂；为空时 @c reset 会明确失败而不是换回默认实现
          */
         VioPipeline(const domain::PipelineConfig &config, std::unique_ptr<domain::IEstimator> estimator,
-                    std::shared_ptr<const domain::ICameraModel> observationModel, domain::EstimatorFactory factory = {})
+                    std::shared_ptr<const domain::ICameraModel> observationModel, domain::EstimatorFactory factory = {},
+                    std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer = nullptr)
             : config_(config),
               factory_(std::move(factory)),
               initializer_(config.initialization, config.imu),
               selector_(config.vision),
               propagator_(config.imu),
+              // 初始化顺序必须与成员声明顺序一致（estimator_ → model_ →
+              // dynamicInitializer_）；否则 -Wreorder 告警，且一旦有人给
+              // 这些成员加上互相依赖的初始化表达式，真实顺序就会与书写顺序不符。
               estimator_(std::move(estimator)),
-              model_(std::move(observationModel))
+              model_(std::move(observationModel)),
+              dynamicInitializer_(std::move(dynamicInitializer))
         {
             if (!estimator_ || !model_)
             {
@@ -167,6 +186,14 @@ namespace myslam::vio
 
         /// 高层是否处于追踪状态
         [[nodiscard]] bool tracking() const noexcept { return tracking_; }
+
+        /**
+         * @brief 本次运行的分段耗时（只读）
+         *
+         * 由流水线在阶段边界累计；编排层负责写文件/打日志。计时器本身
+         * 不参与任何算法分支。
+         */
+        [[nodiscard]] const domain::StageTimings &timings() const noexcept { return timings_; }
 
         /// 状态机（初始化阶段由本类维护，追踪后固定为 TRACKING_OK）
         [[nodiscard]] domain::SystemState state() const noexcept
@@ -193,11 +220,24 @@ namespace myslam::vio
             if (!tracking_)
             {
                 initializer_.feedImu(slice.sample);
+                // 动态初始化需要覆盖整个窗口的 IMU，而不只是最后几秒的统计量。
+                // 按时间裁掉窗口之外的样本，避免长时间无法初始化时无界增长。
+                if (dynamicInitializer_ && config_.initialization.dynamicEnabled)
+                {
+                    initImu_.push_back(slice);
+                    const double windowStart =
+                        slice.sample.timestamp - config_.initialization.dynamicWindowSeconds - 0.5;
+                    const auto firstKept =
+                        std::find_if(initImu_.begin(), initImu_.end(), [windowStart](const domain::ImuSlice &slice)
+                                     { return slice.sample.timestamp >= windowStart; });
+                    initImu_.erase(initImu_.begin(), firstKept);
+                }
                 return std::nullopt;
             }
 
             imuWindow_.push_back(slice);
             noteImuWindowPressure();
+            const domain::StageTimings::Scoped propagationTimer(timings_, domain::TimingStage::kPropagation);
             return propagator_.propagate(slice);
         }
 
@@ -206,6 +246,7 @@ namespace myslam::vio
          */
         InitOutcome stepInitialization(domain::KeyframeId keyframeId, const domain::Frame &frame, double timestamp)
         {
+            const domain::StageTimings::Scoped initializationTimer(timings_, domain::TimingStage::kInitialization);
             InitOutcome outcome;
             if (!valid())
             {
@@ -238,6 +279,51 @@ namespace myslam::vio
                 }
             }
 
+            // 静止路径失败时尝试动态初始化。顺序是刻意的：静止初始化只要
+            // 成立就比动态更准（零速度是硬约束），所以永远先试它。动态路径
+            // 每次多花一次几何求解，只在「确实静不下来」时才付出这个代价。
+            if (initializer_.state() != domain::SystemState::GRAVITY_ALIGNED && config_.initialization.dynamicEnabled &&
+                dynamicInitializer_ != nullptr)
+            {
+                domain::Keyframe probe;
+                probe.id = keyframeId;
+                probe.timestamp = timestamp;
+                probe.observations = frame.observations;
+                initFrames_.push_back(std::move(probe));
+
+                // 只保留窗口内的帧：长窗口会让线性系统病态，也会拖慢每帧
+                // 一次的重试成本。上限取「配置帧数 + 少量余量」。
+                const auto maxFrames =
+                    static_cast<std::size_t>(std::max(4, config_.initialization.dynamicPoseCount + 4));
+                while (initFrames_.size() > maxFrames)
+                {
+                    initFrames_.erase(initFrames_.begin());
+                }
+                while (!initFrames_.empty() &&
+                       timestamp - initFrames_.front().timestamp > config_.initialization.dynamicWindowSeconds)
+                {
+                    initFrames_.erase(initFrames_.begin());
+                }
+
+                if (initFrames_.size() >= 4)
+                {
+                    const domain::DynamicInitResult dynamic = dynamicInitializer_->tryInitialize(initFrames_, initImu_);
+                    if (dynamic.success)
+                    {
+                        dynamicInitialState_ = dynamic.state;
+                        dynamicInitialCovariance_ = dynamic.poseCovariance;
+                        initializer_.setState(domain::SystemState::GRAVITY_ALIGNED);
+                        outcome.aligned = true;
+                        outcome.dynamic = true;
+                        mylog::info("[流水线] 采用动态初始化结果（{}），跳过静止对齐", dynamic.detail);
+                    }
+                    else
+                    {
+                        mylog::debug("[流水线] 动态初始化未完成: {}", dynamic.detail);
+                    }
+                }
+            }
+
             if (initializer_.state() != domain::SystemState::GRAVITY_ALIGNED)
             {
                 return outcome;
@@ -257,11 +343,51 @@ namespace myslam::vio
             else
             {
                 initialState.pose = initializer_.alignedPose();
-                initialState.pose.t.z() = config_.initialization.initialHeightMeters;
+                initialState.pose.position.z() = config_.initialization.initialHeightMeters;
                 // 默认零，适用于静止起始；运动起始的序列由配置注入真值速度。
                 initialState.velocity = config_.initialization.initialVelocity;
             }
             initialState.bias = initializer_.alignedBias();
+
+            // 动态初始化给出的姿态、速度、零偏覆盖上面那套默认值：它已经
+            // 从观测中解出了运动状态，再叠一个「零速度」假设等于把它扔掉。
+            if (!initialHint_ && dynamicInitialState_.has_value())
+            {
+                initialState.pose = dynamicInitialState_->pose;
+                initialState.pose.position.z() = config_.initialization.initialHeightMeters;
+                initialState.velocity = dynamicInitialState_->velocity;
+                initialState.bias = dynamicInitialState_->bias;
+            }
+
+            // 初始位姿协方差：这是「估计器知不知道自己有多不确定」的第一个
+            // 出口。缺它的时候，整个初始化阶段都不存在任何一致性验收。
+            //
+            // 静止路径的 roll/pitch 由样本统计导出；航向绕重力不可观，
+            // 必须显式给大。位置是人为锚定的世界系原点，取配置的固定值。
+            domain::PoseCovariance initialCovariance;
+            if (config_.estimator.initialCovarianceFromInit && !initialHint_)
+            {
+                if (dynamicInitialState_.has_value())
+                {
+                    initialCovariance = dynamicInitialCovariance_;
+                }
+                else
+                {
+                    // 航向不可观：静止初始化对它没有任何信息，给一个
+                    // 明确很大的值，而不是拿 roll/pitch 的精度冒充。
+                    constexpr double kYawSigmaRad = 0.5;
+                    const double tiltSigma = initializer_.alignedTiltSigma();
+                    const double positionSigma = config_.estimator.initialPoseSigma;
+                    domain::Mat6 covariance = domain::Mat6::Zero();
+                    covariance(0, 0) = tiltSigma * tiltSigma;
+                    covariance(1, 1) = tiltSigma * tiltSigma;
+                    covariance(2, 2) = kYawSigmaRad * kYawSigmaRad;
+                    covariance(3, 3) = positionSigma * positionSigma;
+                    covariance(4, 4) = positionSigma * positionSigma;
+                    covariance(5, 5) = positionSigma * positionSigma;
+                    initialCovariance = covariance;
+                }
+            }
 
             domain::Keyframe firstKeyframe;
             firstKeyframe.id = keyframeId;
@@ -319,7 +445,7 @@ namespace myslam::vio
             bool initialized = false;
             try
             {
-                initialized = estimator_->initialize(firstKeyframe, initialState);
+                initialized = estimator_->initialize(firstKeyframe, initialState, initialCovariance);
             }
             catch (const std::exception &error)
             {
@@ -403,7 +529,10 @@ namespace myslam::vio
             domain::StepResult result;
             try
             {
-                result = estimator_->addKeyframe(keyframe, imuWindow_);
+                {
+                    const domain::StageTimings::Scoped estimatorTimer(timings_, domain::TimingStage::kEstimator);
+                    result = estimator_->addKeyframe(keyframe, imuWindow_);
+                }
             }
             catch (const std::exception &error)
             {
@@ -442,6 +571,7 @@ namespace myslam::vio
                 clearImuWindow();
                 consecutiveLocalRebuilds_ = 0;
                 outcome.pose = result.state->pose;
+                outcome.poseCovariance = result.poseCovariance;
                 outcome.kind = FrameOutcome::Kind::KEYFRAME_OPTIMIZED;
                 return outcome;
 
@@ -508,6 +638,14 @@ namespace myslam::vio
             initializer_.resetSamples();
             propagator_ = domain::StatePropagator(config_.imu);
             clearImuWindow();
+            initFrames_.clear();
+            initImu_.clear();
+            dynamicInitialState_.reset();
+            dynamicInitialCovariance_.reset();
+            if (dynamicInitializer_)
+            {
+                dynamicInitializer_->reset();
+            }
             lastKeyframeObservations_.clear();
             lastKeyframeTimestamp_ = -1.0;
             lastState_.reset();
@@ -736,7 +874,21 @@ namespace myslam::vio
         domain::StatePropagator propagator_;
 
         std::unique_ptr<domain::IEstimator> estimator_;
+        domain::StageTimings timings_;
         std::shared_ptr<const domain::ICameraModel> model_;
+        /// 动态初始化实现（可为空）；只在 initialization.dynamicEnabled 时被调用
+        std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer_;
+        /// 初始化窗口内缓存的观测帧（只存观测，图像视图会失效）
+        std::vector<domain::Keyframe> initFrames_;
+        /// 初始化窗口内的 IMU 切片
+        ///
+        /// 用 vector 而不是 deque：动态初始化端口接收 span，需要连续存储。
+        /// 裁剪导致的内存搬移发生在初始化阶段（每帧一次、窗口几十条），
+        /// 与追踪阶段的热路径无关。
+        std::vector<domain::ImuSlice> initImu_;
+        /// 动态初始化给出的初始状态；一旦置位就覆盖默认的零速度假设
+        std::optional<domain::KinematicState> dynamicInitialState_;
+        domain::PoseCovariance dynamicInitialCovariance_;
 
         std::vector<domain::ImuSlice> imuWindow_;
         /// IMU 窗口已超过保留时限：下一帧必须成为关键帧

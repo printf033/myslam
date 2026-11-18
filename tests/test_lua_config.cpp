@@ -7,6 +7,7 @@
  */
 
 #include "config/lua_config.hpp"
+#include "domain/camera_model.hpp"
 #include "log_config.hpp"
 #include <cmath>
 #include <cstdio>
@@ -51,7 +52,7 @@ namespace
     {
         Eigen::Matrix3d expected;
         expected << 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0;
-        return pose.q.toRotationMatrix().isApprox(expected, 1e-12);
+        return pose.orientation.toRotationMatrix().isApprox(expected, 1e-12);
     }
 
     /**
@@ -140,6 +141,9 @@ vio = {
     healthMaxSpeed = 5.0,
     healthAlertStreakThreshold = 5,
     landmarkPriorSigma = 0.5,
+    initialPoseSigma = 0.11,
+    initialVelSigma = 0.12,
+    initialBiasSigma = 0.13,
 }
 system = { totalDuration = 1.25, cameraDt = 0.05 }
 )");
@@ -156,6 +160,11 @@ system = { totalDuration = 1.25, cameraDt = 0.05 }
         expectNear(config.vio.health.maxSpeed, 5.0, "vio.healthMaxSpeed 覆盖生效");
         expectTrue(config.vio.health.alertStreakThreshold == 5, "vio.healthAlertStreakThreshold 覆盖生效");
         expectNear(config.vio.estimator.landmarkPriorSigma, 0.5, "vio.landmarkPriorSigma 覆盖生效");
+        // 这三个字段曾只在 checkUnknownKeys 的白名单里、没有对应的解析调用：
+        // 用户写了不生效，且因为进了白名单连「未知字段」告警都没有。
+        expectNear(config.vio.estimator.initialPoseSigma, 0.11, "vio.initialPoseSigma 覆盖生效");
+        expectNear(config.vio.estimator.initialVelSigma, 0.12, "vio.initialVelSigma 覆盖生效");
+        expectNear(config.vio.estimator.initialBiasSigma, 0.13, "vio.initialBiasSigma 覆盖生效");
         expectNear(config.system.totalDuration, 1.25, "system.totalDuration 覆盖生效");
         expectNear(myslam::domain::SystemConfig::imuDtFrom(config.vio.imu.rateHz), 0.005,
                    "默认 200 Hz 派生的步长为 5 ms");
@@ -340,11 +349,12 @@ vio = {
 
         expectTrue(succeeded(report), "合法外参解析成功");
         // 四元数 (2,0,0,0) 单位化后是恒等旋转
-        expectTrue(config.vio.camera.bodyPSensor.q.toRotationMatrix().isApprox(Eigen::Matrix3d::Identity(), 1e-12),
-                   "外参四元数被单位化为恒等旋转");
-        expectNear(config.vio.camera.bodyPSensor.t.x(), 1.5, "外参平移 x 生效");
-        expectNear(config.vio.camera.bodyPSensor.t.y(), -2.0, "外参平移 y 生效");
-        expectNear(config.vio.camera.bodyPSensor.t.z(), 0.25, "外参平移 z 生效");
+        expectTrue(
+            config.vio.camera.bodyPSensor.orientation.toRotationMatrix().isApprox(Eigen::Matrix3d::Identity(), 1e-12),
+            "外参四元数被单位化为恒等旋转");
+        expectNear(config.vio.camera.bodyPSensor.position.x(), 1.5, "外参平移 x 生效");
+        expectNear(config.vio.camera.bodyPSensor.position.y(), -2.0, "外参平移 y 生效");
+        expectNear(config.vio.camera.bodyPSensor.position.z(), 0.25, "外参平移 z 生效");
 
         const auto zeroPath = writeLua("extrinsic-zero", R"(
 vio = { extrinsic = { quaternion = { w = 0, x = 0, y = 0, z = 0 } } }
@@ -462,8 +472,8 @@ vio = { model = "mei", pinholeScale = 1e-6 }
      */
     void checkDatasetCameraModel()
     {
-        // 默认基线是 SubT 的 MEI（xi = 1.583）。把模型改成 pinhole 时，xi 必须
-        // 被清零：前端不按模型分支，而是靠 xi = 0 让 MEI 公式退化为针孔。
+        // 基线是代码内置默认内参（针孔、xi = 0）。把模型显式改成 pinhole 且未写 xi
+        // 时，归一化是正常结果：前端不按模型分支，而是靠 xi = 0 让 MEI 公式退化为针孔。
         const auto path = writeLua("dataset-camera-pinhole", R"(
 dataset = { intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, cx = 320, cy = 240 } }
 )");
@@ -499,7 +509,7 @@ dataset = { intrinsics = { model = "pinhole", fx = 500.0, fy = 500.0, xi = 1.5 }
         expectNear(xiConfig.intrinsics.xi, 0.0, "显式 xi 在针孔模型下仍被归一化为 0");
 
         const auto meiPath = writeLua("dataset-camera-mei", R"(
-dataset = { intrinsics = { model = "mei", fx = 800.0, pinholeScale = 0.5 } }
+dataset = { intrinsics = { model = "mei", fx = 800.0, pinholeScale = 0.5, xi = 1.5 } }
 )");
         myslam::config::ProjectConfig meiConfig;
         const auto meiReport = loadFrom(meiPath, meiConfig);
@@ -553,7 +563,7 @@ dataset = { intrinsics = { model = "mei", fx = 800.0, pinholeScale = 0.5 } }
         expectTrue(succeeded(report), "仓库默认配置通过全部校验");
         expectNear(config.vio.camera.intrinsics.fx, 460.0, "默认配置的 fx 与代码默认值一致");
         expectNear(config.vio.imu.accelNoiseSigma, 0.0057, "默认配置的加速度噪声与代码默认值一致");
-        expectNear(config.vio.camera.bodyPSensor.t.x(), 0.10, "默认配置的外参平移与代码默认值一致");
+        expectNear(config.vio.camera.bodyPSensor.position.x(), 0.10, "默认配置的外参平移与代码默认值一致");
         expectTrue(defaultBodyRotation(config.vio.camera.bodyPSensor), "默认配置的外参旋转与代码默认值一致");
         expectTrue(config.intrinsics.isValid(), "默认配置的 dataset 内参合法");
         expectTrue(config.replay.viz.trailMaxPoints == 20000, "默认配置的可视化参数与代码默认值一致");
@@ -674,7 +684,7 @@ dataset = {
         expectTrue(config.input.mast3r.force, "mast3r.force 生效");
         expectTrue(config.input.mast3r.python == "/opt/conda/bin/python", "mast3r.python 生效");
         expectTrue(config.input.hasExtrinsic, "dataset.extrinsic 被标记为已配置");
-        expectNear(config.input.extrinsic.t.x(), 0.2, "回放外参平移生效");
+        expectNear(config.input.extrinsic.position.x(), 0.2, "回放外参平移生效");
 
         // 默认：未配置 sequence 与 extrinsic
         const auto minimal = writeLua("dataset-input-minimal", R"(
@@ -906,13 +916,13 @@ vio = { minLandmarkDepth = 3.0, maxLandmarkDepth = 3.0 }
     /**
      * @brief 回归：strict 字段的类型错误不能被当成“字段缺失”而静默放行
      *
-     * 旧实现下 dataset.intrinsics.fx = "758.3"（YAML 拷来的带引号数字）会静默
+     * 旧实现下 dataset.intrinsics.fx = "500.0"（YAML 拷来的带引号数字）会静默
      * 保留默认值并通过加载，与 fx = 0 被判非法的行为不一致。
      */
     void checkStrictTypeErrors()
     {
         const auto str = writeLua("strict-str", R"(
-dataset = { intrinsics = { fx = "758.3" } }
+dataset = { intrinsics = { fx = "500.0" } }
 )");
         myslam::config::ProjectConfig strConfig;
         const auto strReport = loadFrom(str, strConfig);
@@ -988,41 +998,147 @@ vio = { fx = 500.0 }
         expectNear(textConfig.vio.camera.intrinsics.fx, 500.0, "文本源码的值生效（对照）");
     }
 
+    /// 在仓库根 / 构建目录两种当前目录下定位随仓库分发的配置
+    std::filesystem::path findShippedConfig(const char *relative)
+    {
+        for (const char *prefix : {"", "../", "../../"})
+        {
+            const std::filesystem::path candidate = std::filesystem::path(prefix) / relative;
+            if (std::filesystem::is_regular_file(candidate))
+            {
+                return candidate;
+            }
+        }
+        return {};
+    }
+
     /**
-     * @brief 回归：仓库自带配置不得产生任何诊断告警
+     * @brief 回归：仓库自带的每份配置都不得产生任何诊断告警
      *
      * maxImuGapFactor 曾经被解析但漏登记到 known 列表，导致每次启动都打印
      * “未知字段（拼写错误？）”——而该值实际生效。这类假告警会训练用户
      * 忽略真告警，比不报警更危险。
+     *
+     * “数据源 ↔ 配置文件”一一对应下，每份 shipped 配置都要过这道闸：
+     * 新增数据源时忘了登记字段，这里会立刻失败。
      */
     void checkShippedConfigIsSilent()
     {
-        std::filesystem::path shipped;
-        for (const char *candidate : {"config/config.lua", "../config/config.lua", "../../config/config.lua"})
+        const char *relativePaths[] = {"config/config.lua", "config/subt_handheld1.lua", "config/tum_vi.lua"};
+        for (const char *relative : relativePaths)
         {
-            if (std::filesystem::is_regular_file(candidate))
+            const std::filesystem::path shipped = findShippedConfig(relative);
+            const std::string foundMsg = std::string("找到仓库自带配置: ") + relative;
+            expectTrue(!shipped.empty(), foundMsg.c_str());
+            if (shipped.empty())
             {
-                shipped = candidate;
-                break;
+                continue;
+            }
+
+            myslam::config::ProjectConfig config;
+            myslam::config::LoadResult report = std::unexpected(
+                myslam::config::ConfigError{myslam::config::ConfigErrorKind::FILE_NOT_FOUND, "not loaded"});
+            const std::string captured = captureStderr([&] { report = loadFrom(shipped, config); });
+
+            const std::string okMsg = std::string("仓库自带配置能被正确加载: ") + relative;
+            expectTrue(succeeded(report), okMsg.c_str());
+            const std::string silentMsg = std::string("配置加载时不产生任何 stderr 诊断: ") + relative;
+            expectTrue(captured.empty(), silentMsg.c_str());
+            if (!captured.empty())
+            {
+                std::fprintf(stderr, "  %s 的实际 stderr 输出:\n%s\n", relative, captured.c_str());
             }
         }
-        if (shipped.empty())
+    }
+
+    /**
+     * @brief 每份数据源配置的关键语义
+     *
+     * 数值本身由配置文件拥有，测试不重复抄写；这里只钉住“换错文件会立刻
+     * 暴露”的那几条语义：SubT 是 MEI、TUM 是针孔且外参为单位阵（gyro 由
+     * 真值差分，body 系与相机系重合）、通用配置保留 rosbag 依赖的开窗默认。
+     */
+    void checkShippedDatasetSemantics()
+    {
+        if (const auto path = findShippedConfig("config/subt_handheld1.lua"); !path.empty())
         {
-            std::printf("SKIP: 未找到仓库自带配置，跳过零告警检查\n");
+            myslam::config::ProjectConfig config;
+            expectTrue(succeeded(loadFrom(path, config)), "加载 subt_handheld1.lua");
+            expectTrue(config.intrinsics.isMei(), "SubT 配置使用 MEI 模型");
+            expectTrue(config.intrinsics.xi != 0.0, "SubT 配置的 MEI xi 非零");
+        }
+
+        if (const auto path = findShippedConfig("config/tum_vi.lua"); !path.empty())
+        {
+            myslam::config::ProjectConfig config;
+            expectTrue(succeeded(loadFrom(path, config)), "加载 tum_vi.lua");
+            expectTrue(!config.intrinsics.isMei(), "TUM 配置使用针孔模型");
+            expectTrue(config.vio.camera.bodyPSensor.orientation.toRotationMatrix().isApprox(
+                           Eigen::Matrix3d::Identity(), 1e-12),
+                       "TUM 外参旋转为单位阵");
+            expectTrue(config.vio.camera.bodyPSensor.position.norm() < 1e-12, "TUM 外参平移为零");
+        }
+
+        if (const auto path = findShippedConfig("config/config.lua"); !path.empty())
+        {
+            myslam::config::ProjectConfig config;
+            expectTrue(succeeded(loadFrom(path, config)), "加载 config.lua");
+            expectTrue(config.replay.viz.showWindow, "通用配置保持默认开窗（rosbag 入口依赖）");
+        }
+    }
+
+    /**
+     * @brief 真实鱼眼标定确实驱动相机模型（标定数值全部来自 lua 配置）
+     *
+     * 代码内默认值是针孔仿真参数（xi=0），MEI 在默认值下数学上退化为针孔，
+     * 鱼眼几何得不到验证。这里用随仓库分发的 SubT 配置（真实 MEI 标定，xi 与
+     * 畸变均非零）构建模型，钉住几条只有真鱼眼才成立的性质：视场超过 180°
+     * （相机后方点仍可投影）、投影/反投影往返自洽、虚拟针孔比投影焦距更窄。
+     */
+    void checkShippedFisheyeGeometry()
+    {
+        const auto path = findShippedConfig("config/subt_handheld1.lua");
+        expectTrue(!path.empty(), "找到 config/subt_handheld1.lua");
+        if (path.empty())
+        {
             return;
         }
 
-        myslam::config::ProjectConfig config;
-        myslam::config::LoadResult report =
-            std::unexpected(myslam::config::ConfigError{myslam::config::ConfigErrorKind::FILE_NOT_FOUND, "not loaded"});
-        const std::string captured = captureStderr([&] { report = loadFrom(shipped, config); });
+        myslam::config::ProjectConfig project;
+        expectTrue(succeeded(loadFrom(path, project)), "加载 SubT 配置用于鱼眼几何检查");
+        const auto &intrinsics = project.intrinsics;
+        expectTrue(intrinsics.isMei(), "SubT 配置的相机模型为 MEI");
+        expectTrue(intrinsics.xi > 0.0, "SubT 配置的 xi 为正（真实鱼眼）");
+        expectTrue(intrinsics.pinholeScale > 0.0 && intrinsics.pinholeScale < 1.0,
+                   "SubT 配置的虚拟针孔缩放小于 1（视场收窄）");
 
-        expectTrue(succeeded(report), "仓库自带配置能被正确加载");
-        expectTrue(captured.empty(), "仓库自带配置加载时不产生任何 stderr 诊断");
-        if (!captured.empty())
+        const auto mei = myslam::domain::makeCameraModel(intrinsics);
+        const auto pinhole = myslam::domain::makeCameraModel(myslam::camera::CameraIntrinsics{});
+
+        // 视场 > 180°：相机后方的点仍落在视场内，纯针孔模型必须拒绝。
+        const myslam::domain::Vec3 behind(2.0, 0.0, -1.0);
+        expectTrue(mei->project(behind).has_value(), "MEI 能投影相机后方点（视场 > 180°）");
+        expectTrue(!pinhole->project(behind).has_value(), "针孔模型拒绝相机后方点（对照）");
+
+        // 投影 -> 反投影 -> 再投影，广角点也要亚像素自洽。
+        for (const myslam::domain::Vec3 &point :
+             {myslam::domain::Vec3(0.0, 0.0, 1.0), myslam::domain::Vec3(0.8, 0.2, 1.0),
+              myslam::domain::Vec3(-1.2, 0.6, 0.7), behind})
         {
-            std::fprintf(stderr, "  实际 stderr 输出:\n%s\n", captured.c_str());
+            const auto uv = mei->project(point);
+            if (!uv)
+            {
+                expectTrue(false, "MEI 投影广角点成功");
+                continue;
+            }
+            const auto ray = mei->unproject(*uv);
+            const auto again = ray ? mei->project(*ray) : std::nullopt;
+            expectTrue(again.has_value() && (*again - *uv).norm() < 1e-3, "MEI 广角往返保持亚像素");
         }
+
+        // 虚拟针孔是收窄后的视场，焦距必须小于 MEI 投影焦距。
+        const auto virtualPinhole = myslam::domain::makeVirtualPinholeModel(intrinsics);
+        expectTrue(virtualPinhole->focalLengthPx() < mei->focalLengthPx(), "真实鱼眼下虚拟针孔焦距窄于 MEI 投影焦距");
     }
 
     /**
@@ -1124,6 +1240,8 @@ int main()
     checkStrictTypeErrors();
     checkBytecodeRejected();
     checkShippedConfigIsSilent();
+    checkShippedDatasetSemantics();
+    checkShippedFisheyeGeometry();
     checkLoggingFlagRequiresSection();
     checkInitTimeout();
     checkEstimatorSelection();

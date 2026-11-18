@@ -92,8 +92,11 @@ namespace myslam::camera
          * @brief 把与模型相悖的参数归一化，使调用方无需按模型分支
          *
          * 针孔模型下 @c xi 必须为 0，否则 MEI 公式会把边缘像素当作鱼眼反解。
-         * @c k1 / @c k2 / @c p1 / @c p2 不清零：对「带径向/切向畸变的针孔相机」
-         * 它们是合法参数。
+         *
+         * @c k1 / @c k2 / @c p1 / @c p2 **不在这里清零**：它们只在 @c MeiCameraModel
+         * 里参与几何，切回 @c model = "mei" 时仍需保留整份畸变标定。
+         * 这并不意味着针孔模型会应用它们——@c PinholeCameraModel **要求输入
+         * 图像已预矫正**，见该类文档。
          *
          * @return true 表示确实改动了取值（调用方可据此提示使用者）
          */
@@ -105,31 +108,6 @@ namespace myslam::camera
             }
             xi = 0.0;
             return true;
-        }
-
-        /**
-         * @brief SubT Handheld1 的 MEI 标定（与 intrinsics_subt_handheld.yaml 一致）
-         *
-         * 单独做成工厂函数而不是结构体默认值：默认值属于「某个数据集」，
-         * 不适合成为全项目通用的内参默认。
-         */
-        [[nodiscard]] static CameraIntrinsics subtHandheld1Mei() noexcept
-        {
-            CameraIntrinsics intrinsics{};
-            intrinsics.model = CameraModel::MEI;
-            intrinsics.fx = 758.3153257832925;
-            intrinsics.fy = 676.6492212772476;
-            intrinsics.cx = 318.27111164892506;
-            intrinsics.cy = 239.79816832491474;
-            intrinsics.xi = 1.583106303248484;
-            intrinsics.k1 = -0.059098218173967695;
-            intrinsics.k2 = 0.1793477408661115;
-            intrinsics.p1 = 0.0016819528105368057;
-            intrinsics.p2 = -0.0005887999624264534;
-            intrinsics.pinholeScale = 0.4;
-            intrinsics.imageWidth = 640;
-            intrinsics.imageHeight = 480;
-            return intrinsics;
         }
     };
 

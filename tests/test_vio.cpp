@@ -8,10 +8,13 @@
 
 #include "adapters/register_builtin.hpp"
 #include "adapters/simple/imu_only_estimator.hpp"
+#include "app/trajectory_eval.hpp"
 #include "domain/camera_model.hpp"
 #include "domain/config.hpp"
 #include "domain/health_monitor.hpp"
+#include "domain/initializer.hpp"
 #include "domain/ports.hpp"
+#include "domain/propagator.hpp"
 #include "domain/registry.hpp"
 #include "domain/time_synchronizer.hpp"
 #include "log_config.hpp"
@@ -19,7 +22,10 @@
 #include "vio.hpp"
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <vector>
@@ -60,7 +66,8 @@ namespace
     public:
         [[nodiscard]] std::string_view name() const noexcept override { return "stub"; }
 
-        bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &) override
+        bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &,
+                        const myslam::domain::PoseCovariance & = {}) override
         {
             return initializeResult;
         }
@@ -193,6 +200,22 @@ namespace
         return run;
     }
 
+    /**
+     * @brief 测试用 MEI 内参：代码内置默认值，仅把模型切换为 MEI
+     *
+     * 本文件只验证「模型按名字注册、能力查询正确、流水线能跑通 MEI 代码路径」，
+     * 与标定数值无关，因此不携带任何数据源参数。注意默认 xi = 0 时 MEI 投影
+     * 在数学上退化为针孔，鱼眼几何（视场 > 180°、畸变、视场收窄）由
+     * tests/test_lua_config.cpp 的 checkShippedFisheyeGeometry 用真实 lua
+     * 标定验证。
+     */
+    myslam::camera::CameraIntrinsics meiIntrinsicsFromDefaults()
+    {
+        myslam::camera::CameraIntrinsics intrinsics{};
+        intrinsics.model = myslam::camera::CameraModel::MEI;
+        return intrinsics;
+    }
+
 } // namespace
 
 int main()
@@ -229,6 +252,61 @@ int main()
     expectTrue(report.rmse < systemConfig.rmseThreshold, "rmse within acceptance threshold");
     expectTrue(myslam::domain::isAcceptable(report, systemConfig.rmseThreshold),
                "default run is accepted by isAcceptable");
+
+    // ------------------------------------------------------------------
+    // 可自证性：协方差必须被上报，且 NEES 落在一致性带上
+    //
+    // 这是「精度」之外的第二个结论。只断言 RMSE 无法区分「碰巧算对」与
+    // 「知道自己有多不确定」；后者才能外推。上下界取得很宽（不是统计
+    // 严格检验，而是回归门禁）：均值远大于 20 说明协方差严重偏小，
+    // 均值远小于 0.2 说明根本不是在估计不确定性。
+    // ------------------------------------------------------------------
+    {
+        expectTrue(report.neesSamples > 0, "backend publishes pose covariance for consistency checking");
+        // 初始化锚点走 initialize() 而不是 addKeyframe()，不产出 StepResult，
+        // 因此它没有边际协方差。这是契约形状决定的，不是缺陷：为它编造一个
+        // 协方差只会让 NEES 的分子分母不再同源。除锚点外必须每个关键帧都有。
+        expectTrue(report.neesSamples + 1 >= report.keyframeCount,
+                   "every keyframe except the initial anchor carries a covariance sample");
+        expectTrue(report.neesMean > 0.0, "nees mean is positive");
+        expectTrue(myslam::domain::isConsistent(report, 0.2, 20.0),
+                   "nees mean stays inside the consistency band (theory: 3)");
+
+        // 反向用例：无法检验不得被当成检验通过
+        myslam::domain::RunReport noCovariance = report;
+        noCovariance.neesSamples = 0;
+        expectTrue(!myslam::domain::isConsistent(noCovariance, 0.2, 20.0),
+                   "missing covariance is not treated as consistent");
+        myslam::domain::RunReport overconfident = report;
+        overconfident.neesSamples = 10;
+        overconfident.neesMean = 1000.0;
+        expectTrue(!myslam::domain::isConsistent(overconfident, 0.2, 20.0),
+                   "grossly overconfident covariance is rejected");
+    }
+
+    // ------------------------------------------------------------------
+    // 逆深度路标：可切换、能跑通、仍然上报协方差
+    //
+    // 这里不断言逆深度的精度优于全局 3D 点——那是数据相关的结论，不该被
+    // 钉死成回归门禁。要钉住的是「这条参数化路径确实是活的」：配置能切
+    // 过去、流水线能初始化、能产出位姿、协方差照旧上报。仿真时长压到 2 s
+    // 只为覆盖路径，不追求精度。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::PipelineConfig inverseDepthConfig = config;
+        inverseDepthConfig.estimator.landmarkRepresentation = "anchored_inverse_depth";
+        myslam::domain::SystemConfig shortSystem = systemConfig;
+        shortSystem.totalDuration = 2.0;
+
+        myslam::vio::VioBenchmark inverseDepthBenchmark(inverseDepthConfig, shortSystem);
+        const myslam::domain::RunReport inverseDepthReport = inverseDepthBenchmark.run();
+
+        expectTrue(inverseDepthReport.initialized, "inverse-depth parameterization completes initialization");
+        expectTrue(inverseDepthReport.keyframeCount >= 2, "inverse-depth parameterization produces keyframe poses");
+        expectTrue(inverseDepthReport.neesSamples > 0, "inverse-depth parameterization still publishes covariance");
+        expectTrue(inverseDepthReport.rmse < shortSystem.rmseThreshold,
+                   "inverse-depth parameterization stays within the rmse threshold");
+    }
 
     // ------------------------------------------------------------------
     // 验收判定不得把「没结果」当成「完美」
@@ -304,12 +382,13 @@ int main()
                    "pinhole model exposes pinhole calibration");
         expectTrue(pinhole->name() == "pinhole", "pinhole model reports its name");
 
-        const auto mei = myslam::domain::makeCameraModel(myslam::camera::CameraIntrinsics::subtHandheld1Mei());
+        const auto mei = myslam::domain::makeCameraModel(meiIntrinsicsFromDefaults());
         expectTrue(dynamic_cast<const myslam::domain::IPinholeCalibration *>(mei.get()) == nullptr,
                    "true MEI model does not pretend to be a pinhole calibration");
         expectTrue(mei->name() == "mei", "MEI model reports its name");
 
-        // 往返：MEI 投影 -> 反投影 -> 再投影，误差应在亚像素
+        // 往返：MEI 投影 -> 反投影 -> 再投影，误差应在亚像素（默认 xi=0，
+        // 此处等价于针孔往返；真实鱼眼几何见 test_lua_config 的 shipped 配置用例）
         for (int i = 0; i < 50; ++i)
         {
             const double x = -1.0 + 0.04 * static_cast<double>(i);
@@ -326,13 +405,75 @@ int main()
                        "MEI project/unproject round-trip stays sub-pixel");
         }
 
-        const auto meiIntrinsics = myslam::camera::CameraIntrinsics::subtHandheld1Mei();
+        const auto meiIntrinsics = meiIntrinsicsFromDefaults();
         const auto virtualPinhole = myslam::domain::makeVirtualPinholeModel(meiIntrinsics);
         expectTrue(std::abs(virtualPinhole->focalLengthPx() -
                             0.5 * (meiIntrinsics.pinholeFx() + meiIntrinsics.pinholeFy())) < 1e-9,
                    "virtual pinhole uses the scaled focal length");
-        expectTrue(virtualPinhole->focalLengthPx() < mei->focalLengthPx(),
-                   "MEI virtual pinhole focal is narrower than the projection focal");
+        // 默认 pinholeScale = 1，折算退化为恒等：虚拟针孔焦距与 MEI 投影焦距相同。
+        // 真实鱼眼下 pinholeScale < 1 会收窄视场，该性质在 test_lua_config 中验证。
+        expectTrue(std::abs(virtualPinhole->focalLengthPx() - mei->focalLengthPx()) < 1e-9,
+                   "默认 pinholeScale 下虚拟针孔焦距与 MEI 投影焦距一致");
+
+        // xi=0 且无畸变时，MEI 必须与针孔在数值上等价。这是一条解析恒等式
+        // 的检查：球面投影公式里的符号若写错，往返测试仍可能自洽通过
+        // （project 与 unproject 用了同一处错误），但与针孔对照立刻暴露。
+        {
+            auto pinholeIntrinsics = meiIntrinsicsFromDefaults();
+            pinholeIntrinsics.model = myslam::camera::CameraModel::PINHOLE;
+            const auto pinholeZero = myslam::domain::makeCameraModel(pinholeIntrinsics);
+            const auto meiZero = myslam::domain::makeCameraModel(meiIntrinsicsFromDefaults());
+
+            double worstGap = 0.0;
+            for (int i = -6; i <= 6; ++i)
+            {
+                for (int k = -6; k <= 6; ++k)
+                {
+                    const myslam::domain::Vec3 ray(0.18 * static_cast<double>(i), 0.18 * static_cast<double>(k), 1.0);
+                    const auto uvPinhole = pinholeZero->project(ray);
+                    const auto uvMei = meiZero->project(ray);
+                    expectTrue(uvPinhole.has_value() && uvMei.has_value(), "both models project a forward ray");
+                    if (!uvPinhole || !uvMei)
+                    {
+                        continue;
+                    }
+                    worstGap = std::max(worstGap, (*uvPinhole - *uvMei).norm());
+                }
+            }
+            expectTrue(worstGap < 1e-6, "MEI with xi=0 matches the pinhole projection numerically");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 分段耗时：CSV 结构与合并语义
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::StageTimings timings;
+        expectTrue(timings.empty(), "fresh timings are empty");
+        timings.add(myslam::domain::TimingStage::kEstimator, 1500);
+        timings.add(myslam::domain::TimingStage::kEstimator, 500);
+        timings.add(myslam::domain::TimingStage::kPropagation, 250);
+
+        expectTrue(!timings.empty(), "timings become non-empty after recording");
+        expectTrue(timings.stats(myslam::domain::TimingStage::kEstimator).calls == 2, "calls are counted per stage");
+        expectTrue(std::abs(timings.stats(myslam::domain::TimingStage::kEstimator).meanMilliseconds() - 1.0) < 1e-9,
+                   "mean milliseconds divide by call count");
+        expectTrue(std::abs(timings.totalMilliseconds() - 2.25) < 1e-9, "total sums all stages");
+
+        const std::string csv = timings.toCsv();
+        expectTrue(csv.find("estimator,2.000,1.0000,2") != std::string::npos,
+                   "csv row carries total, mean and call count");
+        expectTrue(csv.find("initialization") == std::string::npos,
+                   "stages that were never recorded are omitted from csv");
+
+        myslam::domain::StageTimings other;
+        other.add(myslam::domain::TimingStage::kEstimator, 1000);
+        other.add(myslam::domain::TimingStage::kInitialization, 100);
+        timings.merge(other);
+        expectTrue(timings.stats(myslam::domain::TimingStage::kEstimator).calls == 3, "merge adds call counts");
+        expectTrue(std::abs(timings.stats(myslam::domain::TimingStage::kInitialization).totalMilliseconds() - 0.1) <
+                       1e-9,
+                   "merge carries stages that the target did not have");
     }
 
     // ------------------------------------------------------------------
@@ -389,6 +530,105 @@ int main()
         const auto gap = gapped.advanceTo(1.000);
         expectTrue(gap.gapDetected, "a 1 s hole is reported as a gap");
         expectTrue(gap.gapSeconds > 0.9, "gap duration is reported");
+    }
+
+    // ------------------------------------------------------------------
+    // 段重启：重置基线必须落在**对齐后**的时间域
+    //
+    // advanceTo() 工作在 cameraTime - timeOffsetSeconds 域。旧实现把未扣偏移的
+    // cameraTime 存进基线：offset > 0 时 from > to、重启后整段时间窗的切片
+    // 静默为空；offset < 0 时反向多积一段。这里用负偏移把「多积」量化出来。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::ImuConfig imu;
+        imu.rateHz = 200.0;      // 5 ms
+        imu.maxGapFactor = 10.0; // 50 ms
+        myslam::domain::TimeSynchronizer sync(imu);
+        sync.setTimeOffset(-0.2); // aligned = cameraTime + 0.2
+
+        sync.resetToCameraTime(1.0);
+        expectTrue(std::abs(sync.integratedUntil() - 1.2) < 1e-12,
+                   "resetToCameraTime stores the aligned timestamp, not the raw camera time");
+
+        for (int i = 200; i < 400; ++i) // t = 1.000 .. 1.995
+        {
+            const double t = 0.005 * static_cast<double>(i);
+            sync.push({t, myslam::domain::Vec3::Zero(), myslam::domain::Vec3::Zero()});
+        }
+        const auto afterRestart = sync.advanceTo(1.05); // target = 1.25
+        expectTrue(std::abs(afterRestart.integratedSeconds - 0.05) < 1e-9,
+                   "after a restart only the remaining span is integrated (not the whole offset)");
+    }
+
+    // ------------------------------------------------------------------
+    // 高频外推：时间戳是积分区间的终点；非正步长不得凭空推进
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::ImuConfig imu;
+        imu.rateHz = 200.0;
+        myslam::domain::StatePropagator propagator(imu);
+        propagator.reset(myslam::domain::KinematicState{});
+
+        myslam::domain::ImuSample sample;
+        sample.timestamp = 0.100;
+        sample.accel = myslam::domain::Vec3(0.0, 0.0, imu.gravityMagnitude);
+        const auto advanced = propagator.propagate(myslam::domain::ImuSlice{sample, 0.005});
+        expectTrue(std::abs(advanced.timestamp - 0.105) < 1e-12,
+                   "propagator timestamps the state at the end of the slice, not its start");
+        expectTrue(advanced.velocity.norm() < 1e-9, "specific force cancels gravity exactly");
+
+        const auto noProgress = propagator.propagate(myslam::domain::ImuSlice{sample, 0.0});
+        expectTrue(std::abs(noProgress.timestamp - advanced.timestamp) < 1e-12,
+                   "a non-positive dt does not advance the timestamp");
+        expectTrue((noProgress.pose.position - advanced.pose.position).norm() < 1e-12,
+                   "a non-positive dt does not invent motion");
+    }
+
+    // ------------------------------------------------------------------
+    // 消融路径的倾角不确定度不能留 0
+    //
+    // 0 会被下游当成「倾角完全已知」，先验被拧到 1e-4 rad，估计器再没有
+    // 自由度去纠回 initialTiltDeg 故意弄歪的角度。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::InitializationConfig init;
+        init.minSamples = 4;
+        init.initialTiltDeg = 5.0;
+        myslam::domain::Initializer initializer(init, myslam::domain::ImuConfig{});
+        for (int i = 0; i < 8; ++i)
+        {
+            initializer.feedImu({0.005 * i, myslam::domain::Vec3(0.0, 0.0, 9.81), myslam::domain::Vec3::Zero()});
+        }
+        myslam::domain::Pose pose;
+        myslam::domain::Bias bias;
+        expectTrue(initializer.skipGravityAlignment(pose, bias), "skip-alignment path succeeds with enough samples");
+        expectTrue(initializer.alignedTiltSigma() > 0.0,
+                   "skip-alignment reports a non-zero tilt sigma instead of pinning the prior");
+        const double injectedRad = init.initialTiltDeg * std::numbers::pi / 180.0;
+        expectTrue(initializer.alignedTiltSigma() >= injectedRad - 1e-12,
+                   "tilt sigma covers the deliberately injected tilt");
+
+        initializer.resetSamples();
+        expectTrue(initializer.alignedTiltSigma() == 0.0, "resetSamples clears the cached tilt sigma");
+    }
+
+    // ------------------------------------------------------------------
+    // CRLF 轨迹文件：std::getline 只吃掉 '\n'，末字段会带 '\r'
+    // ------------------------------------------------------------------
+    {
+        const auto path = std::filesystem::temp_directory_path() / "myslam_crlf_trajectory_test.tum";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "0.0 0 0 0 0 0 0 1\r\n"
+                   "1.0 1 0 0 0 0 0 1\r\n"
+                   "2.0 2 0 0 0 0 0 1\r\n";
+        }
+        const auto loaded = myslam::app::loadTumTrajectory(path);
+        expectTrue(loaded.has_value() && loaded->size() == 3, "CRLF trajectory lines are not dropped");
+        expectTrue(loaded.has_value() && !loaded->empty() && loaded->front().orientation.has_value(),
+                   "CRLF trajectory keeps the optional orientation columns");
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
     }
 
     // ------------------------------------------------------------------
@@ -547,7 +787,8 @@ int main()
         {
         public:
             [[nodiscard]] std::string_view name() const noexcept override { return "recovering"; }
-            bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &) override
+            bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &,
+                            const myslam::domain::PoseCovariance & = {}) override
             {
                 return true;
             }
@@ -688,7 +929,8 @@ int main()
         {
         public:
             [[nodiscard]] std::string_view name() const noexcept override { return "always_failing"; }
-            bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &) override
+            bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &,
+                            const myslam::domain::PoseCovariance & = {}) override
             {
                 return true;
             }
@@ -771,7 +1013,8 @@ int main()
         {
         public:
             [[nodiscard]] std::string_view name() const noexcept override { return "trivial"; }
-            bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &) override
+            bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &,
+                            const myslam::domain::PoseCovariance & = {}) override
             {
                 return true;
             }
@@ -828,7 +1071,7 @@ int main()
     // ------------------------------------------------------------------
     {
         myslam::domain::PipelineConfig meiConfig = config;
-        meiConfig.camera.intrinsics = myslam::camera::CameraIntrinsics::subtHandheld1Mei();
+        meiConfig.camera.intrinsics = meiIntrinsicsFromDefaults();
 
         myslam::vio::VioSimulator simulator(myslam::vio::makeSimulatorOptions(meiConfig),
                                             myslam::domain::makeVirtualPinholeModel(meiConfig.camera.intrinsics));
@@ -841,7 +1084,7 @@ int main()
         myslam::vio::VioBenchmark meiBenchmark(meiConfig, shortConfig);
         const myslam::domain::RunReport meiReport = meiBenchmark.run();
         expectTrue(meiReport.initialized && meiReport.keyframeCount > 1,
-                   "MEI intrinsics still produce a trajectory (models agree end to end)");
+                   "MEI 代码路径端到端跑通（默认标定下与针孔等价）");
     }
 
     // ------------------------------------------------------------------

@@ -28,8 +28,8 @@
  * - `fx`/`fy` 是 **MEI 投影参数**，只在反解畸变时使用，随 `xi` 一起定义鱼眼
  *   的投影曲线。
  *
- * 两者不是一回事：Handheld1 的 `fx = 758.3`、`xi = 1.583`，其近轴等效针孔
- * 焦距只有 `fx / (1 + xi) ≈ 294`。把估计值直接当成 `fx` 会同时破坏畸变反解，
+ * 两者不是一回事：MEI 的近轴等效针孔焦距是 `fx / (1 + xi)`，`xi` 越大差得
+ * 越多（典型鱼眼可达数倍）。把估计值直接当成 `fx` 会同时破坏畸变反解，
  * 让整幅鱼眼图被当作针孔图处理——这正是早期实现把特征点堆到镜头圆形边框上
  * 的原因。
  *
@@ -119,8 +119,8 @@ namespace myslam::dataset
      *                 在文件未给出时被继承
      * @return 成功时给出内参与来源标记；失败时给出面向使用者的说明
      */
-    inline std::expected<IntrinsicsEstimate, std::string>
-    loadIntrinsicsFile(const std::filesystem::path &path, const MeiIntrinsics &baseline = subtHandheld1Intrinsics())
+    inline std::expected<IntrinsicsEstimate, std::string> loadIntrinsicsFile(const std::filesystem::path &path,
+                                                                             const MeiIntrinsics &baseline)
     {
         std::ifstream file(path);
         if (!file)
@@ -161,17 +161,6 @@ namespace myslam::dataset
             }
             const std::string_view key = detail::trimView(view.substr(0, separator));
             const std::string_view value = detail::trimView(view.substr(separator + 1));
-
-            auto readDouble = [&](double &slot) -> bool
-            {
-                double parsed = 0.0;
-                if (!detail::parseNumber(value, parsed) || !std::isfinite(parsed))
-                {
-                    return false;
-                }
-                slot = parsed;
-                return true;
-            };
 
             if (key == "fx" || key == "fy")
             {

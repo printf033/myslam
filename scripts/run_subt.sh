@@ -2,13 +2,13 @@
 #
 # 在 SubT-MRS 数据集上回放 myslam VIO。
 #
-# 运行时配置全部在 config/config.lua（见文件里的 dataset 一节）：
+# 运行时配置全部在 config/subt_handheld1.lua（见文件里的 dataset 一节）：
 #   序列目录、内参来源、回放起止帧、轨迹/点云输出、可视化开关、算法参数。
 # 本脚本只负责「构建 + 启动」，不再提供与 Lua 字段一一对应的一套命令行参数
 # ——那套参数每加一个字段都要改三处，而且漏传时配置会被静默地当成默认值。
 #
 # 示例：
-#   scripts/run_subt.sh                       # 构建并回放（用 config/config.lua）
+#   scripts/run_subt.sh                       # 构建并回放（用 config/subt_handheld1.lua）
 #   scripts/run_subt.sh --no-build            # 跳过构建，直接运行已有二进制
 #   scripts/run_subt.sh --config config/ablation_no_gravity.lua   # 换一份配置
 #   scripts/run_subt.sh --plot                # 回放结束后画轨迹图
@@ -26,7 +26,7 @@ BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$(nproc)}"
 # 1 = 从 thirdparty/opencv 子模块构建 OpenCV（默认用系统包）
 OPENCV_BUNDLED="${OPENCV_BUNDLED:-0}"
-CONFIG="${MYSLAM_CONFIG:-$ROOT/config/config.lua}"
+CONFIG="${MYSLAM_CONFIG:-$ROOT/config/subt_handheld1.lua}"
 DO_BUILD=1
 PLOT=0
 
@@ -35,7 +35,7 @@ usage() {
     cat <<'EOF'
 
 可选参数:
-  --config FILE      使用指定的 Lua 配置（默认 config/config.lua）
+  --config FILE      使用指定的 Lua 配置（默认 config/subt_handheld1.lua）
   --plot             回放结束后用 matplotlib 画轨迹图（读配置里的输出路径）
   --no-build         跳过配置与编译，直接运行已有二进制
   -h, --help         显示本帮助

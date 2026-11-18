@@ -85,9 +85,16 @@ namespace myslam::viz
                     {
                         if (const auto raw = source_->project(*ray); raw.has_value())
                         {
-                            sourceX = static_cast<float>(raw->x());
-                            sourceY = static_cast<float>(raw->y());
-                            ++valid;
+                            // 必须同时判结果落在源画幅内，否则 validRatio_ 会把
+                            // 「投影成功但落在原图之外」也计为可用；而下面
+                            // sourceMask_ 的构造是判边界的。同一文件两套口径。
+                            if (raw->x() >= 0.0 && raw->x() < static_cast<double>(source_->imageWidth()) &&
+                                raw->y() >= 0.0 && raw->y() < static_cast<double>(source_->imageHeight()))
+                            {
+                                sourceX = static_cast<float>(raw->x());
+                                sourceY = static_cast<float>(raw->y());
+                                ++valid;
+                            }
                         }
                     }
                     mapX_.at<float>(y, x) = sourceX;

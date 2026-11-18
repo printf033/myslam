@@ -42,7 +42,7 @@ cmake --build build-release --target 2_subt_dataset -j"$(nproc)"
 ```
 myslam/
 ├── CMakeLists.txt          # 顶层构建、版本单一来源（project(VERSION)）、格式目标
-├── config/config.lua       # 唯一的运行时配置
+├── config/                 # Lua 运行时配置：config.lua（仿真/通用）、subt_handheld1.lua、tum_vi.lua
 ├── src/
 │   ├── domain/             # 契约与值类型：位姿、观测、端口、配置、初始化、时间同步
 │   ├── adapters/           # 估计器实现：gtsam 固定滞后、纯 IMU
@@ -990,12 +990,21 @@ TRACKING_OK ── reset(RESET_PIPELINE) / 完整重置 ──► UNINITIALIZED
 
 ## 配置
 
-`config/config.lua` 是唯一的运行时配置，配置期复制到 `build/config/`。四个节：
+运行时配置统一为 Lua 文件，配置期整目录复制到 `build/config/`。有几组数据源就给几份配置文件，一一对应：
+
+| 文件 | 用途 |
+| :--- | :--- |
+| `config/config.lua` | 仿真 / 通用默认（不含任何特定数据集的参数），rosbag 与仿真入口的默认配置 |
+| `config/subt_handheld1.lua` | SubT Handheld1 回放（`scripts/run_subt.sh` 默认） |
+| `config/tum_vi.lua` | TUM RGB-D 回放（`scripts/run_tum.sh` 默认） |
+
+每份文件含四个节，字段可全部省略，省略即保留内置默认值：
 
 - **`vio`** → `PipelineConfig`：相机模型与内参、外参、IMU 噪声、Huber 阈值、关键帧判据、
   滑动窗口、初始化判据、健康门限、先验强度
 - **`system`** → `SystemConfig`：相机步长、运行时长、RMSE 验收门限、初始化超时
 - **`dataset`** → 回放专用：序列位置、内参来源、相机-IMU 外参、MASt3R 选项、回放范围、可视化
+  （`config.lua` 只包含与数据源无关的回放/可视化默认，序列位置、标定与外参在各数据源文件里）
 - **`logger` / `fileManager`** → mylog：级别、缓冲、滚动
 
 字段可全部省略，省略即保留内置默认值。解析规则：
@@ -1012,10 +1021,10 @@ IMU 采样步长不是配置项，由 `vio.imuRateHz` 派生：`SystemConfig::im
 数据集回放不再接受命令行参数，只保留 `--config FILE`：
 
 ```bash
-./scripts/run_subt.sh                      # 构建并回放 config/config.lua
+./scripts/run_subt.sh                      # 构建并回放 config/subt_handheld1.lua
 ./scripts/run_subt.sh --no-build           # 跳过构建
 ./scripts/run_subt.sh --plot               # 回放结束后绘制轨迹
-./scripts/run_subt.sh --config config/ablation_no_gravity.lua
+./scripts/run_subt.sh --config config/ablation_no_gravity.lua   # 换一份配置
 ```
 
 消融实验复制一份 Lua 再改（例如 `vio.gravityAlignment = false`），而不是拼命令行覆盖项。
@@ -1033,7 +1042,7 @@ rosbag2（.db3）数据集走同一条回放管道，一键脚本为 `scripts/ru
 ./scripts/run_rosbag.sh --topic /camera/left/image_raw/compressed --fx 800 --fy 800
 ```
 
-实时可视化默认跟随 `dataset.viz`（`config.lua` 里 `showWindow = true`）：左侧原始图、右侧
+实时可视化默认跟随 `dataset.viz`（`config/config.lua` 与各数据源配置里 `showWindow = true`）：左侧原始图、右侧
 去畸变图与特征点，底部状态栏与轨迹小地图，按 `q`/`ESC` 退出。可用 `--show`/`--no-show`
 强制开关；窗口不可用（无 `DISPLAY`）时自动降级为无输出而不报错。
 
@@ -1052,7 +1061,7 @@ TUM 有三点与上面两类数据不同，程序会在启动时明确打印：
   的真实测量（Kinect 加速度计需自动做轴向校准）。因此结果验证的是位置与视觉
   融合链路，不能等同于标准 VIO 的精度结论。
 - **图像带明显径向畸变**：默认按标定矫正后再送入前端（`--no-undistort` 可关闭）。
-- **序列从运动开始**：初始速度由真值差分给出（`--keep-imu-config` 只影响噪声参数）。
+- **序列从运动开始**：初始速度由真值差分给出。
 
 精度参考（freiburg1 各序列，SE(3) 对齐后平移 RMSE）：
 
@@ -1089,9 +1098,112 @@ ctest --test-dir build --output-on-failure
 | `myslam_config_test` | 解析、钳位、交叉校验、未知键、四元数归一化、失败路径、日志节生效、默认配置自洽 |
 | `myslam_intrinsics_test` | 内参文件：焦距落到虚拟针孔、畸变从基线继承、旧式 `fx` 字段被拒、主点回退与畸形输入被拒 |
 | `myslam_layer_check` | 分层依赖方向，任何跨层 `#include` 直接失败 |
+| `myslam_sim_gate` | 从 `config/config.lua` 加载真实配置跑完整仿真，用 `isAcceptable` + `isConsistent` 决定退出码（端到端精度与一致性门禁） |
+| `myslam_dynamic_init_test` | 动态初始化：观测充分时能解出有限状态、零偏留给后端、观测不足时明确失败（需 OpenCV，`MYSLAM_BUILD_DATASET_TOOLS=ON` 时注册） |
 
 CI（`.github/workflows/ci.yml`）在 Ubuntu + `g++-14` 上跑格式检查、构建与全部测试，
 `clang-format` 固定 23.1.3（提交钩子与 CI 版本一致）。
+
+## 一致性与统计门控
+
+估计器不只需要「算出一个位置」，还需要「说得出这个位置有多不确定」。这条
+链路是本次唯一新增的**输出**，其余改动都是它的消费者。
+
+- **协方差出口**：`StepResult::poseCovariance` 与 `KeyframeState::poseCovariance`
+  携带 6×6 位姿边际协方差（切线顺序：前 3 旋转、后 3 平移）。由
+  `IncrementalFixedLagSmoother::marginalCovariance` 取得，`publishCovariance`
+  可关（iSAM2 取边际块需要额外一次分解）。拿不到时是 `std::nullopt`，不是零矩阵——
+  「不传播协方差」与「协方差恰好为零」是两件事。
+- **NEES（仅仿真路径）**：`VioBenchmark::run()` 返回的 `RunReport::neesMean` /
+  `neesSamples` 由每个关键帧的 `StepResult::poseCovariance` 直接算出；仿真默认
+  配置实测均值 **1.23**（理论期望 3）——偏小表示偏保守（报出的不确定度大于真实
+  误差），方向上是安全的；此前只算位姿协方差时该值是 2.62。
+  真实数据集回放**不提供** NEES：`ReplayRunner` 写出的 TUM 轨迹只有
+  `t x y z qx qy qz qw` 八列，不含协方差，`app::evaluateAte` 无从计算。
+  曾在 `evaluateAte` 里保留过这段分支与表格列，但它永远读到缺失的协方差、
+  输出恒为 `-`，已删除；将来若给轨迹格式加 `cov` 列，应同时补上解析与计算。
+- **χ² 门控**：`vision.chi2Gating` 开启时，外点判定改为
+  `rᵀ(H P Hᵀ + H_l P_l H_lᵀ + σ²I)⁻¹r` 与 `multiplier × 95% 分位` 比较。`P_l` 是
+  路标世界系位置的边际协方差（`chi2UseLandmarkCovariance`，可关）；缺它时 `S`
+  偏小、`χ²` 偏大，会把「深度尚未收敛」的正确观测误杀。新观测
+  （`ObservationKind::NEW`）用更松的 `chi2MultiplierNew`：它只被一次观测约束过，
+  用成熟倍数卡它等于在收敛完成前就判死刑。像素硬门限始终生效；雅可比用中心
+  差分（穿过外参复合的解析式写错不会报错，只会让门控安静地在错误方向上工作）。
+  残差明显低于像素软门限时跳过统计检验——那里无论协方差如何都会接受，而每次
+  检验都要一次 3×3 分解，无条件付出会让后端耗时翻倍。
+- **RPE**：`app::evaluateRpe` 按固定路径长度比较相对位移与**相对旋转**误差——
+  滑动窗口系统逐段积累误差，RPE 比 ATE 更能反映局部质量。`TrackSample` 携带
+  姿态，因此 ATE 与 RPE 都能给出旋转分量；只量平移时「位置对了但朝向系统性
+  偏转」完全隐形。
+- **表格输出**：`toMarkdownRow` / `toLatexRow` 把一次评估压成一行，跨序列、
+  跨开关的对比可以直接拼表，不必手抄终端输出。缺失的分量写 `-` 而不是 0。
+
+## 估计质量的几道门
+
+每一道门都回答一个具体问题，且都**只丢观测、不丢状态**（除硬门限外）。默认值
+在 5 s 与 20 s 两段仿真上做过扫描，明显变差的区间没有作为默认。
+
+- **三角化退化**（`maxDepthBaselineRatio` / `minTriangulationBaselineDeg`）：视差
+  门限只量「相差多少像素」，不量「这个差能不能定出深度」。深度/基线比过大时，
+  三角化对观测噪声极敏感，解出的 `Z` 可以落在合理区间却完全错误——而重投影校验
+  拦不住它，因为残差已被求解吸收。判为退化时**推迟**（不标外点），下一帧基线更长
+  时自然重试。这里刻意不用 DLT 条件数：齐次坐标列的尺度差约一个焦距倍，未做
+  Hartley 归一化时条件数在任何正常三角化下都很大，不是可用的判据。
+- **活动轨迹去重**（`minTrackSeparationPx`）：检测掩码只排除「新点与已有点重合」，
+  管不住「两条已存在的轨迹逐渐收敛到同一片纹理」。同一物理点被两条轨迹各报一次，
+  就是同一约束在因子图里被计两次信息，估计器会过度自信。
+- **补点顺序**（`detectBeforeTrack`）：在**上一帧**补点再跟踪到当前帧，新点当帧就
+  获得一次可被光流与几何校验验证的观测；反过来让 `NEW` 观测未经验证直接进后端。
+- **零速更新四路与门**（`zuptMaxVelocity` / `zuptMaxDisparity` / `zuptMinFeatures` /
+  `zuptNoiseMultiplier`）：纯 IMU 方差判据在**匀速直线**运动时全部通过（加速度与
+  角速度都是零），ZUPT 会把真实运动钉死；速度上限与图像视差是另外两个独立信号。
+  噪声乘子刻意放大——判定错了会把整段运动拉停，漏检一次静止代价小得多。
+
+### 分段耗时
+
+`domain::StageTimings` 在阶段边界累计初始化、外推与后端求解的耗时（RAII 计时器，
+异常路径也不漏记），`system.timingCsv` 指定路径时写 CSV 并打一行占比汇总。
+只有一条「总耗时」的日志无法回答「慢在检测、跟踪还是求解」，而三者的优化手段
+完全不同。
+
+## 路标参数化与初始化
+
+- **锚定逆深度**（`estimator.landmarkRepresentation = "anchored_inverse_depth"`）：
+  路标参数化为锚点相机归一化平面上的 `(u, v, ρ)`，`ρ = 1/depth`。逆深度让远点
+  在数值上良态，深度不确定性不必被各向同性先验拉平。因子实现见
+  `adapters/gtsam/inverse_depth_factor.hpp`，雅可比用数值微分。
+  `inverseDepthAngularSigma` 吸收锚点帧位姿的误差，**换平台需重新标定**。
+- **动态（运动起始）初始化**（`initialization.dynamicEnabled`，**默认关闭**）：
+  本质矩阵 → 三角化 → 逐帧 PnP 统一尺度 → 陀螺零偏估计 → 带 `|g|` 硬约束的
+  线性最小二乘 → 世界系按重力对齐。放在 `frontend/` 是因为它需要视觉几何，
+  端口定义在 `domain/ports.hpp`，`pipeline` 只持有接口，分层未被破坏。
+  顺序永远是先试静止初始化，失败才走这里。
+  - **`|g|` 是硬约束**：未知量只有尺度、初速度与重力**方向**，模长由
+    `|g| = 9.81` 精确给定。解 7 个未知量再事后检查模长，允许解出的重力偏离
+    50%，激励不足时尺度与重力互相代偿，事后检查只能发现、不能纠正。迭代只在
+    残差下降时接受，单步转动超过 30° 即停——短窗口下重力方向几乎不可观，
+    无保护的迭代会正反馈发散。
+  - **陀螺零偏**由「视觉相对旋转 vs IMU 相对旋转」最小二乘给出，超出
+    0.2 rad/s 物理上限即拒绝并退回零初值。比较前必须把相机系相对旋转换到
+    body 系（`R_bc·dR·R_bcᵀ`），否则残差里混进一个常量旋转，解出的零偏纯是噪声。
+  - **坐标系**：IMU 传播从单位姿态起算、配置重力取 `(0,0,-G)`，位移活在**首帧
+    body 系**；视觉位姿活在**首帧相机系**。两者差一个外参旋转，必须先转到同一系
+    再进线性系统——否则 90° 的坐标系差会被当成重力偏差吸收，且不报任何错。
+  - 初始化结果带有由线性系统残差推导的位姿协方差，经
+    `IEstimator::initialize` 的第三参数交给后端，替代固定的先验 sigma
+    （`initialCovarianceFromInit`，可关）。
+
+### 实测（TUM `rgbd_dataset_freiburg1_desk`，前 250 帧）
+
+```
+配置                                   ATE RMSE     RPE RMSE（1 m 段）
+未开动态初始化（超时后放宽对齐）        6.918 m      7.748 m
+动态初始化 + global3d                   0.168 m      0.212 m
+动态初始化 + anchored_inverse_depth     0.059 m      0.081 m
+```
+
+三行是同一份代码、同一份数据，只改配置。前两行的差距说明「运动起始序列上
+把初速度置零」有多大代价；后两行说明逆深度在该序列上的收益。
 
 ## 限制
 
@@ -1099,6 +1211,14 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu + `g++-14` 上跑格式检查、构
 - 无地图持久化，路标随边缘化窗口回收
 - 出厂适配器只有单目 + IMU；契约已带可选相机系射线与单观测噪声，但多相机与深度融合未实现
 - `TimeSynchronizer` 处理偏移、断档与乱序，不估计相机-IMU 时间偏移（`vio.timeOffsetSeconds` 是常量）
+- 动态初始化是**实验性**的：只做线性解，模型假设窗口内近似匀速。低速、
+  共视充分的序列（TUM 手持）可用；高速运动下视觉基线变大、共视迅速减少，PnP 与
+  尺度求解退化，速度会被显著低估（内置仿真轨迹实测 0.045 m/s 对真值 1.6 m/s——
+  该窗口内尺度与重力方向接近退化，残差几乎相同的一组解可以给出数倍不同的尺度）。
+  默认关闭，作为默认路径前需要非线性精化
+- 逆深度的 `inverseDepthAngularSigma` 是仿真标定值（0.09），换平台需重标
+- 路标协方差已计入 χ² 的 `S`，但只有残差接近门限时才去取（每帧几十个观测各
+  一次 3×3 分解会把后端耗时翻倍），门限乘法器仍需留余量（默认 5）
 - 无 `install()` / `export()` 规则，`myslam` 是 INTERFACE 目标
 - 配置只在启动时加载一次，无热重载
 - 日志写到当前工作目录，而非项目管理的位置

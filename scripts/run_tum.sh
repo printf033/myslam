@@ -3,7 +3,7 @@
 # 一键在 TUM RGB-D 数据集上回放 myslam VIO，并输出与真值的轨迹误差（ATE）。
 #
 # 与 run_subt.sh / run_rosbag.sh 同一套约定：默认构建 Release、用
-# config/config.lua 的 vio.* 参数，脚本只负责「构建 + 启动」。
+# config/tum_vi.lua 的 vio.* 参数，脚本只负责「构建 + 启动」。
 #
 # TUM 的独特之处是**自带运动捕捉真值**，所以回放结束会自动算 ATE；
 # 但 TUM RGB-D 没有陀螺仪，gyro 由真值姿态差分合成，结果验证的是
@@ -25,7 +25,7 @@ BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$(nproc)}"
 OPENCV_BUNDLED="${OPENCV_BUNDLED:-0}"
 DATA_ROOT="${MYSLAM_DATA_ROOT:-$ROOT/../data}"
-CONFIG="${MYSLAM_CONFIG:-$ROOT/config/config.lua}"
+CONFIG="${MYSLAM_CONFIG:-$ROOT/config/tum_vi.lua}"
 DEFAULT_SEQUENCE="$DATA_ROOT/tum/rgbd_dataset_freiburg1_desk"
 
 MODE=vio
@@ -41,7 +41,7 @@ usage() {
 
 可选参数:
   --inspect           只运行数据体检，不跑 VIO
-  --config FILE       使用指定的 Lua 配置（默认 config/config.lua）
+  --config FILE       使用指定的 Lua 配置（默认 config/tum_vi.lua）
   --out FILE.tum      轨迹输出（默认 <BUILD_DIR>/tum_<序列名>.tum）
   --plot              回放结束后用 matplotlib 画轨迹图
   --no-build          跳过配置与编译，直接运行已有二进制
@@ -51,7 +51,6 @@ usage() {
   --start-frame N  --max-frames N  --stride N  --max-features N  --max-duration S
   --max-time-diff S   真值关联阈值（默认 0.02，与 TUM 官方一致）
   --fx V  --fy V  --cx V  --cy V
-  --keep-imu-config   保留 Lua 的 IMU 噪声参数（默认按 TUM 实测值适配）
   --no-undistort      关闭图像去畸变（默认按标定矫正）
   --show / --no-show  开/关实时窗口
   --video FILE  --video-fps N  --playback-rate R
@@ -77,7 +76,7 @@ is_passthru_with_value() {
 # 无值的透传开关
 is_passthru_flag() {
     case "$1" in
-        --show|--no-show|--no-undistort|--keep-imu-config)
+        --show|--no-show|--no-undistort)
             return 0 ;;
         *) return 1 ;;
     esac

@@ -167,7 +167,7 @@ namespace myslam::config
          * @brief 严格版数值读取：区分“字段缺失”与“字段存在但非法”
          *
          * @c readFiniteDouble 把两种情形都折叠成 false，对允许保留默认值的普通
-         * 字段没问题；但严格校验的字段必须把它们分开——否则 @c fx = "758.3"
+         * 字段没问题；但严格校验的字段必须把它们分开——否则 @c fx = "460.0"
          * （带引号的数字）会被当成“字段没写”而静默保留默认值，与
          * @c fx = 0 被判非法的行为不一致。
          *
@@ -570,8 +570,8 @@ namespace myslam::config
             const int extrinsicIdx = lua_gettop(L);
             checkUnknownKeys(L, extrinsicIdx, section, {"quaternion", "translation"});
             bool valid = true;
-            Eigen::Quaterniond rotation = pose.q;
-            domain::Vec3 translation = pose.t;
+            Eigen::Quaterniond rotation = pose.orientation;
+            domain::Vec3 translation = pose.position;
 
             lua_getfield(L, extrinsicIdx, "quaternion");
             if (lua_istable(L, -1))
@@ -631,8 +631,8 @@ namespace myslam::config
             lua_pop(L, 1); // 弹出 extrinsic 表
             if (valid)
             {
-                pose.q = rotation;
-                pose.t = translation;
+                pose.orientation = rotation;
+                pose.position = translation;
             }
             return valid;
         }

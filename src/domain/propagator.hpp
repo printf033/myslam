@@ -51,25 +51,40 @@ namespace myslam::domain
             }
 
             double dt = slice.dt;
-            if (!(dt > 0.0) || dt > maxDtFactor_ * nominalDt_)
+            if (!(dt > 0.0))
             {
-                mylog::debug("[高频外推] 积分步长异常 ({:.6f}s，标称 {:.6f}s)，按标称周期积分", dt, nominalDt_);
-                dt = nominalDt_;
+                // dt <= 0 表示这段区间实际没有被覆盖（调用方漏填或零长切片）。
+                // 不能像旧实现那样回退成标称周期：那会凭空发明一步积分，
+                // 而时间戳又不动，之后每一条输出都带着一个错误的位置。
+                mylog::debug("[高频外推] 非正积分步长 ({:.6f}s)，本步不推进", dt);
+                return state_;
+            }
+            const double nominalCap = maxDtFactor_ * nominalDt_;
+            if (dt > nominalCap)
+            {
+                // 不截断到标称周期：截断会让状态只前进 nominalDt 而时间戳
+                // 跳到样本时刻，时间与内容脱钩且误差随断档长度无界增长。
+                // 按实际步长积分（等价于假设该区间内匀速）并把可信度下降
+                // 明确告知，比一个自相矛盾的状态好。
+                mylog::warn("[高频外推] 积分步长 {:.4f}s 超过标称上限 {:.4f}s，按实际步长积分（该段输出可信度低）", dt,
+                            nominalCap);
             }
 
             const Vec3 unbiasedGyro = slice.sample.gyro - state_.bias.gyro;
             const Vec3 unbiasedAcc = slice.sample.accel - state_.bias.accel;
 
             // 姿态前向更新: R_{t+dt} = R_t * Exp(omega * dt)
-            state_.pose.q = state_.pose.q * exponentialMap(unbiasedGyro * dt);
+            state_.pose.orientation = state_.pose.orientation * exponentialMap(unbiasedGyro * dt);
 
             // 比力变换到世界系并加上重力: a_w = R * (a_b - ba) + g
-            const Vec3 accWorld = state_.pose.q * unbiasedAcc + gravity_;
+            const Vec3 accWorld = state_.pose.orientation * unbiasedAcc + gravity_;
 
-            state_.pose.t += state_.velocity * dt + 0.5 * accWorld * dt * dt;
+            state_.pose.position += state_.velocity * dt + 0.5 * accWorld * dt * dt;
             state_.velocity += accWorld * dt;
-            state_.timestamp = slice.sample.timestamp;
-            latestTime_ = slice.sample.timestamp;
+            // 积分结果对应区间的**终点**（sample 覆盖 [t, t+dt)），
+            // 因此时间戳必须取 t + dt；取起点会让每条外推输出恒定滞后一步。
+            state_.timestamp = slice.sample.timestamp + dt;
+            latestTime_ = state_.timestamp;
             return state_;
         }
 

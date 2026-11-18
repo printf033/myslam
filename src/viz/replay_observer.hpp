@@ -90,7 +90,7 @@ namespace myslam::viz
                 const std::size_t drop = std::max<std::size_t>(1, trailLimit_ / 4);
                 trail_.erase(trail_.begin(), trail_.begin() + static_cast<std::ptrdiff_t>(drop));
             }
-            trail_.emplace_back(pose.t.x(), pose.t.y());
+            trail_.emplace_back(pose.position.x(), pose.position.y());
         }
 
         [[nodiscard]] bool quitRequested() const override { return visualizer_.shouldQuit(); }

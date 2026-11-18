@@ -6,11 +6,11 @@
  * @code
  * 4_tum_vio <序列目录> [选项]
  *    --inspect           只做数据体检（不跑 VIO）
- *    --config FILE       Lua 配置（默认 config/config.lua）
+ *    --config FILE       Lua 配置（默认 config/tum_vi.lua）
  *    --out FILE.tum      关键帧轨迹输出（默认 <序列>.tum）
  *    --max-time-diff S   与真值的时间关联阈值（默认 0.02，与 TUM 官方一致）
  *    --start-frame N --max-frames N --stride N --max-features N --max-duration S
- *    --fx --fy --cx --cy 覆盖相机内参（默认 freiburg1 标定）
+ *    --fx --fy --cx --cy 覆盖 Lua 配置中的相机内参
  *    --show / --no-show --video FILE --video-fps N --playback-rate R
  * @endcode
  *
@@ -56,13 +56,12 @@ namespace
     {
         std::fprintf(stderr, "用法: 4_tum_vio <序列目录> [选项]\n"
                              "  --inspect           只做数据体检\n"
-                             "  --config FILE       Lua 配置（默认 config/config.lua）\n"
+                             "  --config FILE       Lua 配置（默认 config/tum_vi.lua）\n"
                              "  --out FILE.tum      轨迹输出\n"
                              "  --max-time-diff S   真值关联阈值（默认 0.02）\n"
                              "  --start-frame N --max-frames N --stride N --max-features N\n"
                              "  --max-duration S    最长回放时长\n"
-                             "  --fx --fy --cx --cy 覆盖内参（默认 freiburg1）\n"
-                             "  --keep-imu-config   保留 Lua 的 IMU 噪声参数（默认按 TUM 实测值适配）\n"
+                             "  --fx --fy --cx --cy 覆盖 Lua 中的内参\n"
                              "  --no-undistort      关闭图像去畸变（默认按标定矫正）\n"
                              "  --show / --no-show  开/关实时窗口\n"
                              "  --video FILE        录像输出\n"
@@ -73,10 +72,9 @@ namespace
     /**
      * @brief TumSequence → 顺序回放源
      *
-     * TUM freiburg1 的径向畸变很大（k1≈0.26, k2≈-0.95），而算法层的
-     * @c PinholeCameraModel 只做纯针孔投影、不应用畸变系数。不矫正的话
-     * 图像边缘的重投影误差可达几十像素，三角化会成片失败。因此这里用
-     * 原始内参+畸变预计算重映射表，把图像矫正到「同一个 K 的无畸变图」。
+     * TUM 序列的图像带明显径向畸变，而算法层的 @c PinholeCameraModel 只做纯
+     * 针孔投影、不应用畸变系数。不矫正的话图像边缘的重投影误差可达几十像素，
+     * 三角化会成片失败。因此这里用原始内参+畸变（取自 Lua 配置）预计算重映射表，把图像矫正到「同一个 K 的无畸变图」。
      * 保持 K 不变而不是用 getOptimalNewCameraMatrix，是为了不裁剪视场。
      */
     class TumReplaySource final : public myslam::dataset::IReplaySource
@@ -231,8 +229,7 @@ int main(int argc, char **argv)
 
     std::string sequencePath;
     bool doInspect = false;
-    std::filesystem::path configPath = "config/config.lua";
-    bool keepImuConfig = false;
+    std::filesystem::path configPath = "config/tum_vi.lua";
     std::filesystem::path outTum;
     int startFrame = -1;
     int maxFrames = -1;
@@ -336,10 +333,6 @@ int main(int argc, char **argv)
                 cy = v;
             }
         }
-        else if (arg == "--keep-imu-config")
-        {
-            keepImuConfig = true;
-        }
         else if (arg == "--no-undistort")
         {
             undistort = false;
@@ -406,37 +399,25 @@ int main(int argc, char **argv)
     }
 
     // ---------------------------------------------------------------------
-    // Lua 配置：vio 参数与外参。日志后端保持 mylog 默认（stdout）。
+    // Lua 配置：内参、vio 参数与外参（config/tum_vi.lua）。日志后端保持 mylog 默认（stdout）。
     // ---------------------------------------------------------------------
     myslam::config::ProjectConfig project;
-    if (std::filesystem::is_regular_file(configPath))
+    if (!std::filesystem::is_regular_file(configPath))
     {
-        if (const auto loaded = myslam::config::load(configPath, project, /*applyLogging=*/false); !loaded)
-        {
-            std::fprintf(stderr, "[warning] 配置加载失败（%s），使用默认值\n", loaded.error().message.c_str());
-        }
+        std::fprintf(stderr, "[error] 找不到配置文件: %s\n", configPath.string().c_str());
+        return 1;
     }
-    else
+    if (const auto loaded = myslam::config::load(configPath, project, /*applyLogging=*/false); !loaded)
     {
-        std::fprintf(stderr, "[info] 未找到 %s，使用内置默认配置\n", configPath.string().c_str());
+        std::fprintf(stderr, "[error] 配置加载失败: %s\n", loaded.error().message.c_str());
+        return 1;
     }
 
     // ---------------------------------------------------------------------
-    // 内参：命令行 > freiburg1 默认标定（TUM 官方数值）
+    // 内参：由 Lua 配置提供，命令行可覆盖
     // ---------------------------------------------------------------------
     myslam::camera::CameraIntrinsics intrinsics = project.intrinsics;
-    intrinsics.model = myslam::camera::CameraModel::PINHOLE;
-    intrinsics.fx = 517.306408;
-    intrinsics.fy = 516.469215;
-    intrinsics.cx = 318.643040;
-    intrinsics.cy = 255.313989;
-    intrinsics.k1 = 0.262383;
-    intrinsics.k2 = -0.953104;
-    intrinsics.p1 = -0.005358;
-    intrinsics.p2 = 0.002628;
-    intrinsics.imageWidth = 640;
-    intrinsics.imageHeight = 480;
-    std::string intrinsicsSource = "freiburg1 默认标定";
+    std::string intrinsicsSource = "lua 配置";
 
     if (fx)
     {
@@ -472,24 +453,6 @@ int main(int argc, char **argv)
     if (imuRate > 0.0)
     {
         vioConfig.imu.rateHz = imuRate;
-    }
-    // 外参必须是单位阵：gyro 由真值相机姿态差分得到，body 系与相机系重合。
-    // 继承 config.lua 里 SubT 的相机-IMU 外参（约 90° 旋转 + 19 cm 平移）会让
-    // 每一帧的重投影偏几十像素，三角化成片失败并触发重建——这是最开始
-    // ATE 偏大的主因。
-    vioConfig.camera.bodyPSensor = myslam::domain::Pose{Eigen::Quaterniond::Identity(), myslam::domain::Vec3::Zero()};
-
-    // TUM 的传感器特性与项目默认（手持 MEMS / 水下 IMU）差别很大：
-    //   - gyro 由真值差分，物理上无零偏、噪声极低 → 给很小的谱密度；
-    //   - accel 是 Kinect 加速度计，实测白噪声谱密度约 0.003 m/s^2/sqrt(Hz)，
-    //     且模值只有 9.55（而非 9.81），质量明显差于常规 IMU。
-    // 默认按实测值覆盖，避免用 SubT 的参数去跑 TUM；--keep-imu-config 可保留 Lua 值。
-    if (!keepImuConfig)
-    {
-        vioConfig.imu.accelNoiseSigma = 0.0030;
-        vioConfig.imu.gyroNoiseSigma = 1.0e-5;
-        vioConfig.imu.accelBiasRw = 0.001;
-        vioConfig.imu.gyroBiasRw = 1.0e-5;
     }
 
     myslam::dataset::DatasetRunConfig runConfig = project.replay;
@@ -616,6 +579,7 @@ int main(int argc, char **argv)
         }
         else
         {
+            const std::string trajectoryLabel = runConfig.outputTum.stem().string();
             const myslam::app::AteMetrics ate = myslam::app::evaluateAte(*track, sequence.groundTruth(), maxTimeDiff);
             std::printf("\n===== 绝对轨迹误差（SE3 对齐，无尺度）=====\n");
             std::printf("关联点对 %zu / %zu（阈值 %.3f s）\n", ate.matched, track->size(), maxTimeDiff);
@@ -627,6 +591,41 @@ int main(int argc, char **argv)
             {
                 std::printf("RMSE %.3f m   中位数 %.3f m   均值 %.3f m   最大 %.3f m\n", ate.rmse, ate.median, ate.mean,
                             ate.max);
+                // 这里没有 NEES：TUM 轨迹文件只存 t x y z qx qy qz qw，不含协方差，
+                // 一致性结论请用仿真路径（VioBenchmark 的 RunReport::neesMean）。
+                if (ate.rotationSamples > 0)
+                {
+                    std::printf("旋转 RMSE %.3f°   最大 %.3f°（%zu 个样本）\n", ate.rotationRmse, ate.rotationMax,
+                                ate.rotationSamples);
+                }
+                else
+                {
+                    std::printf("旋转误差不可用：轨迹或真值缺姿态列\n");
+                }
+
+                // RPE：走过 1 m 后的相对位移/旋转误差。滑动窗口系统逐段积累
+                // 误差，这个数比 ATE 更能反映局部质量（ATE 会被整体对齐吸收）。
+                const myslam::app::RpeMetrics rpe =
+                    myslam::app::evaluateRpe(*track, sequence.groundTruth(), maxTimeDiff, 1.0);
+                if (rpe.pairs > 0)
+                {
+                    std::printf("\n===== 相对位姿误差（段长 %.2f m）=====\n", rpe.segmentLength);
+                    std::printf("有效段数 %zu   RMSE %.4f m   均值 %.4f m   最大 %.4f m\n", rpe.pairs, rpe.rmse,
+                                rpe.mean, rpe.max);
+                    if (rpe.rotationPairs > 0)
+                    {
+                        std::printf("相对旋转 RMSE %.3f°   最大 %.3f°（%zu 段）\n", rpe.rotationRmse, rpe.rotationMax,
+                                    rpe.rotationPairs);
+                    }
+                }
+                else
+                {
+                    std::printf("\n[评估] 轨迹长度不足 %.2f m，无法计算 RPE\n", rpe.segmentLength);
+                }
+
+                // 结构化一行：多次运行直接拼成表格，不必手抄终端输出。
+                std::printf("\n%s", std::string(myslam::app::markdownHeader()).c_str());
+                std::printf("%s", myslam::app::toMarkdownRow(trajectoryLabel, ate, rpe).c_str());
             }
         }
     }

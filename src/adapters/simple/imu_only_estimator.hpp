@@ -16,6 +16,7 @@
 #include "domain/camera_model.hpp"
 #include "domain/config.hpp"
 #include "domain/ports.hpp"
+#include "domain/propagator.hpp"
 #include "domain/status.hpp"
 #include "domain/types.hpp"
 #include "logger.hpp"
@@ -34,16 +35,24 @@ namespace myslam::adapters
     {
     public:
         explicit ImuOnlyEstimator(const domain::PipelineConfig &config)
-            : config_(config),
-              gravity_(0.0, 0.0, -config.imu.gravityMagnitude)
+            // 复用领域层的高频外推器：此前本类自己写了一份欧拉积分
+            // （R←R⊗Exp(ωdt)、a_w=R(a−ba)+g、p += v dt + ½a dt²），与
+            // domain::StatePropagator 逐行相同。两份公式一旦需要修正
+            // （例如时间戳语义、步长异常处理），必然只改一处。
+            : propagator_(config.imu)
         {
         }
 
         [[nodiscard]] std::string_view name() const noexcept override { return "imu_only"; }
 
-        bool initialize(const domain::Keyframe &firstKeyframe, const domain::KinematicState &initialState) override
+        bool initialize(const domain::Keyframe &firstKeyframe, const domain::KinematicState &initialState,
+                        const domain::PoseCovariance &initialCovariance = {}) override
         {
+            // 纯 IMU 航位推算不作协方差传播，先验协方差对它没有意义，
+            // 显式忽略而不是默默接受一个永远不会被用的值。
+            (void)initialCovariance;
             state_ = initialState;
+            propagator_.reset(initialState);
             firstKeyframeId_ = firstKeyframe.id;
             keyframeCount_ = 1;
             return true;
@@ -62,24 +71,7 @@ namespace myslam::adapters
 
             for (const domain::ImuSlice &slice : imu)
             {
-                const double dt = slice.dt;
-                if (!(dt > 0.0))
-                {
-                    continue;
-                }
-                const domain::Vec3 unbiasedGyro = slice.sample.gyro - state_.bias.gyro;
-                const domain::Vec3 unbiasedAcc = slice.sample.accel - state_.bias.accel;
-
-                const double angle = unbiasedGyro.norm();
-                if (angle > 1e-12)
-                {
-                    state_.pose.q = state_.pose.q * Eigen::Quaterniond(Eigen::AngleAxisd(angle, unbiasedGyro / angle));
-                }
-
-                const domain::Vec3 accWorld = state_.pose.q * unbiasedAcc + gravity_;
-                state_.pose.t += state_.velocity * dt + 0.5 * accWorld * dt * dt;
-                state_.velocity += accWorld * dt;
-                state_.timestamp = slice.sample.timestamp;
+                state_ = propagator_.propagate(slice);
             }
 
             ++keyframeCount_;
@@ -114,8 +106,7 @@ namespace myslam::adapters
         [[nodiscard]] domain::EstimatorDiagnostics diagnostics() const override { return {0, 0, 0}; }
 
     private:
-        domain::PipelineConfig config_;
-        domain::Vec3 gravity_;
+        domain::StatePropagator propagator_;
         domain::KinematicState state_{};
         domain::KeyframeId firstKeyframeId_{0};
         std::size_t keyframeCount_{0};

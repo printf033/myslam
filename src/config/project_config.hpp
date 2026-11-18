@@ -35,11 +35,11 @@ namespace myslam::config
      */
     struct ProjectConfig
     {
-        domain::PipelineConfig vio{};                                           ///< 视觉惯性参数
-        domain::SystemConfig system{};                                          ///< 运行时序与验收门限
-        dataset::MeiIntrinsics intrinsics = dataset::subtHandheld1Intrinsics(); ///< 数据集相机内参（可以是针孔或 MEI）
-        dataset::DatasetRunConfig replay{};                                     ///< 数据集回放与可视化配置
-        dataset::DatasetInputConfig input{};                                    ///< 序列位置、内参来源与 MASt3R 选项
+        domain::PipelineConfig vio{};        ///< 视觉惯性参数
+        domain::SystemConfig system{};       ///< 运行时序与验收门限
+        dataset::MeiIntrinsics intrinsics{}; ///< 数据集相机内参（可以是针孔或 MEI）；具体数值由 lua 配置文件给出
+        dataset::DatasetRunConfig replay{};  ///< 数据集回放与可视化配置
+        dataset::DatasetInputConfig input{}; ///< 序列位置、内参来源与 MASt3R 选项
     };
 
     /**

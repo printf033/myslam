@@ -15,6 +15,10 @@
 #include <fstream>
 #include <string>
 
+#if defined(MYSLAM_HAS_LUA) && MYSLAM_HAS_LUA
+#include "config/lua_config.hpp"
+#endif
+
 namespace
 {
     int g_checks = 0;
@@ -45,10 +49,59 @@ namespace
         return path;
     }
 
-    /// Handheld1 的标定内参，作为基线
-    myslam::dataset::MeiIntrinsics calibratedBaseline()
+    /// 在仓库根 / 构建目录两种当前目录下定位随仓库分发的配置
+    std::filesystem::path findShippedConfig(const char *relative)
     {
-        return myslam::dataset::subtHandheld1Intrinsics();
+        for (const char *prefix : {"", "../", "../../"})
+        {
+            const std::filesystem::path candidate = std::filesystem::path(prefix) / relative;
+            if (std::filesystem::is_regular_file(candidate))
+            {
+                return candidate;
+            }
+        }
+        return {};
+    }
+
+    /// 测试基线：MEI 标定从随仓库分发的 lua 配置读取，源码里不内联任何数据源数值。
+    ///
+    /// 选 SubT 配置是因为它是真实的 MEI 鱼眼标定（xi 与畸变均非零），
+    /// 这才能验证「文件缺省字段继承基线」在鱼眼几何下真的生效。
+    /// 无 Lua 运行时（MYSLAM_ENABLE_LUA=OFF）时退回代码默认值，并在 stderr 说明：
+    /// 此时 xi 继承变为退化（0 == 0），鱼眼几何下不具判别力。
+    /// 实际加载基线标定（只在首次调用时执行一次，断言也只计一次）
+    myslam::dataset::MeiIntrinsics loadCalibratedBaseline()
+    {
+#if defined(MYSLAM_HAS_LUA) && MYSLAM_HAS_LUA
+        const auto path = findShippedConfig("config/subt_handheld1.lua");
+        // 有 Lua 时不允许静默退化：找不到配置说明工作目录不对，直接报失败，
+        // 否则鱼眼继承检查会在默认值下变成无判别力的空壳。
+        expectTrue(!path.empty(), "找到 config/subt_handheld1.lua（需从仓库根或构建目录运行）");
+        if (!path.empty())
+        {
+            myslam::config::ProjectConfig project;
+            const auto loaded = myslam::config::load(path, project, /*applyLogging=*/false);
+            expectTrue(loaded.has_value(), "从 lua 配置读取基线内参");
+            if (loaded)
+            {
+                expectTrue(project.intrinsics.isMei(), "基线配置为 MEI 模型");
+                expectTrue(project.intrinsics.xi > 0.0, "基线配置的 xi 非零（鱼眼继承才具判别力）");
+                return project.intrinsics;
+            }
+        }
+#else
+        std::fprintf(stderr, "[warning] 无 Lua 运行时，基线内参退回代码默认值（鱼眼继承检查退化）\n");
+#endif
+        myslam::dataset::MeiIntrinsics intrinsics{};
+        intrinsics.model = myslam::camera::CameraModel::MEI;
+        return intrinsics;
+    }
+
+    /// 各用例共用同一份基线（避免重复读配置与重复计数断言）
+    const myslam::dataset::MeiIntrinsics &calibratedBaseline()
+    {
+        static const myslam::dataset::MeiIntrinsics baseline = loadCalibratedBaseline();
+        return baseline;
     }
 
     void testFocalWithInheritedDistortion()
@@ -61,18 +114,19 @@ namespace
                                                              "cy = 240\n"
                                                              "width = 640\n"
                                                              "height = 480\n");
-        const auto result = myslam::dataset::loadIntrinsicsFile(path, calibratedBaseline());
+        const auto baseline = calibratedBaseline();
+        const auto result = myslam::dataset::loadIntrinsicsFile(path, baseline);
         expectTrue(result.has_value(), "focal 格式的文件应解析成功");
         if (result)
         {
             const auto &in = result->intrinsics;
             // 关键断言：虚拟针孔焦距等于文件给出的 focal
             expectTrue(near(in.pinholeFx(), 408.0, 1e-9), "pinholeFx() 应等于 focal");
-            expectTrue(near(in.fx, 758.3153257832925, 1e-6), "MEI 投影参数 fx 应继承标定值");
-            expectTrue(near(in.xi, 1.583106303248484, 1e-9), "xi 应继承标定值，不被清零");
-            expectTrue(near(in.k1, -0.059098218173967695, 1e-12), "k1 应继承标定值");
-            expectTrue(near(in.k2, 0.1793477408661115, 1e-12), "k2 应继承标定值");
-            expectTrue(near(in.pinholeScale, 408.0 / 758.3153257832925, 1e-9), "pinholeScale 应为 focal/fx");
+            expectTrue(near(in.fx, baseline.fx, 1e-6), "MEI 投影参数 fx 应继承标定值");
+            expectTrue(near(in.xi, baseline.xi, 1e-9), "xi 应继承标定值，不被清零");
+            expectTrue(near(in.k1, baseline.k1, 1e-12), "k1 应继承标定值");
+            expectTrue(near(in.k2, baseline.k2, 1e-12), "k2 应继承标定值");
+            expectTrue(near(in.pinholeScale, 408.0 / baseline.fx, 1e-9), "pinholeScale 应为 focal/fx");
             expectTrue(result->inheritedDistortion, "应标记畸变参数为继承");
             expectTrue(near(result->focalPx, 408.0, 1e-9), "focalPx 应回传");
             expectTrue(result->source == "mast3r", "source 应被保留");
@@ -87,14 +141,15 @@ namespace
                                                           "k1 = -0.1\n"
                                                           "width = 640\n"
                                                           "height = 480\n");
-        const auto result = myslam::dataset::loadIntrinsicsFile(path, calibratedBaseline());
+        const auto baseline = calibratedBaseline();
+        const auto result = myslam::dataset::loadIntrinsicsFile(path, baseline);
         expectTrue(result.has_value(), "显式给出畸变参数时应解析成功");
         if (result)
         {
             expectTrue(near(result->intrinsics.xi, 1.0, 1e-12), "xi 应被文件覆盖");
             expectTrue(near(result->intrinsics.k1, -0.1, 1e-12), "k1 应被文件覆盖");
             // 未给出的 k2 仍继承
-            expectTrue(near(result->intrinsics.k2, 0.1793477408661115, 1e-12), "k2 未给出时应继承");
+            expectTrue(near(result->intrinsics.k2, baseline.k2, 1e-12), "k2 未给出时应继承");
             expectTrue(!result->inheritedDistortion, "部分覆盖时不应标记为完全继承");
         }
         std::filesystem::remove(path);
@@ -192,7 +247,7 @@ namespace
         expectTrue(result.has_value(), "同时给出 scale 与 focal 时应成功");
         if (result)
         {
-            // focal 优先：scale 被重新算成 408/758.3，而不是 0.9
+            // focal 优先：scale 被重新算成 focal / 基线 fx，而不是 0.9
             expectTrue(near(result->intrinsics.pinholeFx(), 408.0, 1e-9), "focal 应优先于 pinholeScale");
             bool warned = false;
             for (const auto &w : result->warnings)
@@ -213,9 +268,9 @@ namespace
      */
     void testPinholeBaselineNormalizesMeiParameters()
     {
-        myslam::dataset::MeiIntrinsics baseline = myslam::dataset::subtHandheld1Intrinsics();
+        myslam::dataset::MeiIntrinsics baseline = calibratedBaseline();
         baseline.model = myslam::camera::CameraModel::PINHOLE;
-        baseline.pinholeScale = 0.4;
+        baseline.pinholeScale = 0.5;
         const double aspect = baseline.fy / baseline.fx;
 
         const auto path = writeTemp("myslam_intr_pinhole.txt", "focal = 400\n"

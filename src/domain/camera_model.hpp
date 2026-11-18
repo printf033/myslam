@@ -84,6 +84,16 @@ namespace myslam::domain
 
     /**
      * @brief 针孔模型（也用于 MEI 去畸变后的等效虚拟针孔）
+     *
+     * @warning **本模型不实现 radtan 畸变，要求输入图像已预矫正。**
+     * @c CameraIntrinsics 里的 @c k1 / @c k2 / @c p1 / @c p2 在这里**不参与
+     * 任何几何计算**，@c project 与 @c unproject 都是纯针孔映射。
+     *
+     * 带畸变的针孔相机必须先矫正（例如 TUM 路径的 @c initUndistortRectifyMap
+     * + @c remap），再交给本模型；否则图像边缘的重投影误差可达几十像素，
+     * 而且不会报任何错——前端会把畸变的像素当成理想针孔像素使用。
+     *
+     * 需要直接消费未矫正图像并自己处理畸变时，用 @c MeiCameraModel。
      */
     class PinholeCameraModel final : public ICameraModel, public IPinholeCalibration
     {
@@ -107,12 +117,12 @@ namespace myslam::domain
         [[nodiscard]] std::optional<Vec2> project(const Vec3 &pointCamera) const override
         {
             const double z = pointCamera.z();
-            if (!(z > 1e-9) || !std::isfinite(pointCamera.x()) || !std::isfinite(pointCamera.y()))
+            if (!(z > 1e-9) || !pointCamera.allFinite())
             {
                 return std::nullopt;
             }
             const Vec2 uv(fx_ * pointCamera.x() / z + cx_, fy_ * pointCamera.y() / z + cy_);
-            if (!std::isfinite(uv.x()) || !std::isfinite(uv.y()))
+            if (!uv.allFinite())
             {
                 return std::nullopt;
             }
@@ -121,7 +131,19 @@ namespace myslam::domain
 
         [[nodiscard]] std::optional<Vec3> unproject(const Vec2 &uv) const override
         {
-            return Vec3((uv.x() - cx_) / fx_, (uv.y() - cy_) / fy_, 1.0);
+            // 与 MeiCameraModel 对称：契约说「投影不可逆时返回 nullopt」，
+            // 而 fx/fy 为 0 或像素含 NaN 时这里会产出 inf/NaN，且 has_value()
+            // 仍为真——调用方（如前端的 mapPixel）只判 !ray，毒值会继续传播。
+            if (!uv.allFinite() || !(fx_ > 0.0) || !(fy_ > 0.0))
+            {
+                return std::nullopt;
+            }
+            const Vec3 ray((uv.x() - cx_) / fx_, (uv.y() - cy_) / fy_, 1.0);
+            if (!ray.allFinite())
+            {
+                return std::nullopt;
+            }
+            return ray;
         }
 
         [[nodiscard]] double focalLengthPx() const noexcept override { return 0.5 * (fx_ + fy_); }
@@ -173,6 +195,13 @@ namespace myslam::domain
 
         [[nodiscard]] std::optional<Vec2> project(const Vec3 &pointCamera) const override
         {
+            // 无穷远输入会让 norm 与 denom 同时变成 inf，x/denom 给 0，
+            // 于是返回 (cx, cy) 一个「合法」像素——把「点不可投影」的信息
+            // 完全抹掉。退化三角化的深度很容易到 inf，必须在这里拦住。
+            if (!pointCamera.allFinite())
+            {
+                return std::nullopt;
+            }
             const double norm = pointCamera.norm();
             if (!(norm > 1e-9))
             {

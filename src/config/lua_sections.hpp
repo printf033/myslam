@@ -19,6 +19,7 @@
 #include "domain/config.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <format>
 #include <string>
 #include <string_view>
@@ -72,6 +73,17 @@ namespace myslam::config
                               "minKeyframeInterval",
                               "maxKeyframeInterval",
                               "minTriangulationParallaxPx",
+                              "maxDepthBaselineRatio",
+                              "minTriangulationBaselineDeg",
+                              "minTrackSeparationPx",
+                              "detectBeforeTrack",
+                              "chi2MultiplierNew",
+                              "chi2UseLandmarkCovariance",
+                              "zuptMaxVelocity",
+                              "zuptMaxDisparity",
+                              "zuptMinFeatures",
+                              "zuptNoiseMultiplier",
+                              "initialCovarianceFromInit",
                               "landmarkGateWarmupObs",
                               "minLandmarkDepth",
                               "maxLandmarkDepth",
@@ -99,7 +111,22 @@ namespace myslam::config
                               "recoveryBiasSigma",
                               "estimator",
                               "timeOffsetSeconds",
-                              "exposureSeconds"});
+                              "exposureSeconds",
+                              "chi2Gating",
+                              "chi2Multiplier",
+                              "chi2Confidence",
+                              "enableRansac",
+                              "ransacThresholdSigma",
+                              "ransacConfidence",
+                              "gridColumns",
+                              "gridRows",
+                              "publishCovariance",
+                              "landmarkRepresentation",
+                              "inverseDepthAngularSigma",
+                              "dynamicEnabled",
+                              "dynamicMinRotationDeg",
+                              "dynamicPoseCount",
+                              "dynamicWindowSeconds"});
 
             bool valid = true;
             fieldTypeErrors() = 0;
@@ -145,8 +172,11 @@ namespace myslam::config
             loadInteger(L, idx, kSection, "imageWidth", 1, 100'000, cfg.camera.intrinsics.imageWidth);
             loadInteger(L, idx, kSection, "imageHeight", 1, 100'000, cfg.camera.intrinsics.imageHeight);
             // MEI 参数：xi 与 pinholeScale 只在 model = "mei" 下参与几何（针孔
-            // 下 pinholeScale 按 1 处理、xi 被归一化为 0）；k1/k2/p1/p2 则在两种
-            // 模型下都作为 radtan 畸变生效——带畸变的针孔相机需要它们。
+            // 下 pinholeScale 按 1 处理、xi 被归一化为 0）。
+            //
+            // k1/k2/p1/p2 同样只在 MeiCameraModel 里参与几何：针孔模型
+            // 要求输入图像**已预矫正**，不会自己应用 radtan 畸变。这两个字段
+            // 仍然解析并保存，是因为切换 model 时不必重新录入整套标定。
             // 所有值都解析并保存，切换 model 时不必重新录入整套标定。
             loadDouble(L, idx, kSection, "xi", -10.0, 10.0, cfg.camera.intrinsics.xi);
             loadDouble(L, idx, kSection, "k1", -10.0, 10.0, cfg.camera.intrinsics.k1);
@@ -206,18 +236,67 @@ namespace myslam::config
             loadBool(L, idx, kSection, "postOptOutlierMarking", cfg.vision.postOptOutlierMarking);
             loadBool(L, idx, kSection, "preoptTemporaryRejection", cfg.vision.preoptTemporaryRejection);
 
+            // 统计门控与前端几何校验
+            loadBool(L, idx, kSection, "chi2Gating", cfg.vision.chi2Gating);
+            loadDouble(L, idx, kSection, "chi2Multiplier", 1.0, 1e4, cfg.vision.chi2Multiplier);
+            loadDouble(L, idx, kSection, "chi2MultiplierNew", 1.0, 1e4, cfg.vision.chi2MultiplierNew);
+            loadBool(L, idx, kSection, "chi2UseLandmarkCovariance", cfg.vision.chi2UseLandmarkCovariance);
+            loadDouble(L, idx, kSection, "chi2Confidence", 0.5, 0.999999, cfg.vision.chi2Confidence);
+            loadBool(L, idx, kSection, "enableRansac", cfg.vision.enableRansac);
+            loadDouble(L, idx, kSection, "ransacThresholdSigma", 0.1, 100.0, cfg.vision.ransacThresholdSigma);
+            loadDouble(L, idx, kSection, "ransacConfidence", 0.5, 0.999999, cfg.vision.ransacConfidence);
+            loadInteger(L, idx, kSection, "gridColumns", 1, 64, cfg.vision.gridColumns);
+            loadInteger(L, idx, kSection, "gridRows", 1, 64, cfg.vision.gridRows);
+            loadDouble(L, idx, kSection, "minTrackSeparationPx", 0.0, 1e4, cfg.vision.minTrackSeparationPx);
+            loadBool(L, idx, kSection, "detectBeforeTrack", cfg.vision.detectBeforeTrack);
+            loadBool(L, idx, kSection, "publishCovariance", cfg.estimator.publishCovariance);
+
+            // 路标参数化：与 estimator 一样用 lua_type 严格判断，否则数字
+            // 会被静默协变成字符串名字。
+            lua_getfield(L, idx, "landmarkRepresentation");
+            if (lua_isnil(L, -1))
+            {
+                // 未配置：沿用代码默认值（global3d）
+            }
+            else if (lua_type(L, -1) == LUA_TSTRING)
+            {
+                cfg.estimator.landmarkRepresentation = lua_tostring(L, -1);
+            }
+            else
+            {
+                reportError("vio.landmarkRepresentation 应为字符串，实际为 {}，配置不合法", typeName(L));
+                valid = false;
+            }
+            lua_pop(L, 1);
+
+            loadDouble(L, idx, kSection, "inverseDepthAngularSigma", 1e-6, 1.0, cfg.estimator.inverseDepthAngularSigma);
+
+            // 动态初始化
+            loadBool(L, idx, kSection, "dynamicEnabled", cfg.initialization.dynamicEnabled);
+            loadDouble(L, idx, kSection, "dynamicMinRotationDeg", 1.0, 180.0, cfg.initialization.dynamicMinRotationDeg);
+            loadInteger(L, idx, kSection, "dynamicPoseCount", 2, 64, cfg.initialization.dynamicPoseCount);
+            loadDouble(L, idx, kSection, "dynamicWindowSeconds", 0.1, 60.0, cfg.initialization.dynamicWindowSeconds);
+
             // 关键帧选取策略
             loadDouble(L, idx, kSection, "minParallaxPx", 0.0, 1e4, cfg.vision.minParallaxPx);
             loadDouble(L, idx, kSection, "minTrackingRatio", 0.0, 1.0, cfg.vision.minTrackingRatio);
             loadDouble(L, idx, kSection, "minKeyframeInterval", 0.0, 60.0, cfg.vision.minKeyframeInterval);
             loadDouble(L, idx, kSection, "maxKeyframeInterval", 0.0, 60.0, cfg.vision.maxKeyframeInterval);
             loadDouble(L, idx, kSection, "minTriangulationParallaxPx", 0.0, 1e4, cfg.vision.minTriangulationParallaxPx);
+            loadDouble(L, idx, kSection, "maxDepthBaselineRatio", 0.0, 1e6, cfg.vision.maxDepthBaselineRatio);
+            loadDouble(L, idx, kSection, "minTriangulationBaselineDeg", 0.0, 90.0,
+                       cfg.vision.minTriangulationBaselineDeg);
             loadInteger(L, idx, kSection, "landmarkGateWarmupObs", 0, 1'000, cfg.vision.landmarkGateWarmupObs);
             loadDouble(L, idx, kSection, "minLandmarkDepth", 0.0, 1e4, cfg.vision.minLandmarkDepth);
             loadDouble(L, idx, kSection, "maxLandmarkDepth", 0.0, 1e4, cfg.vision.maxLandmarkDepth);
             loadInteger(L, idx, kSection, "minVisualFactorsForHealth", 0, 10'000, cfg.vision.minVisualFactorsForHealth);
             loadDouble(L, idx, kSection, "zuptWindowSeconds", 1e-3, 10.0, cfg.estimator.zuptWindowSeconds);
             loadDouble(L, idx, kSection, "zuptVelocitySigma", 1e-4, 10.0, cfg.estimator.zuptVelocitySigma);
+            loadDouble(L, idx, kSection, "zuptMaxVelocity", 0.0, 100.0, cfg.estimator.zuptMaxVelocity);
+            loadDouble(L, idx, kSection, "zuptMaxDisparity", 0.0, 1e4, cfg.estimator.zuptMaxDisparity);
+            loadInteger(L, idx, kSection, "zuptMinFeatures", 0, 1'000'000, cfg.estimator.zuptMinFeatures);
+            loadDouble(L, idx, kSection, "zuptNoiseMultiplier", 1.0, 1e4, cfg.estimator.zuptNoiseMultiplier);
+            loadBool(L, idx, kSection, "initialCovarianceFromInit", cfg.estimator.initialCovarianceFromInit);
             loadInteger(L, idx, kSection, "extraSmootherIterations", 0, 100, cfg.estimator.extraSmootherIterations);
 
             // 滑动窗口
@@ -241,6 +320,17 @@ namespace myslam::config
             loadInteger(L, idx, kSection, "healthMinActiveFeatures", 0, 100'000, cfg.health.minActiveFeatures);
             loadInteger(L, idx, kSection, "healthAlertStreakThreshold", 1, 1'000, cfg.health.alertStreakThreshold);
 
+            // 初始状态先验：位姿/速度/零偏的标准差。这三个字段一度只在
+            // checkUnknownKeys 的白名单里、却没有对应的解析调用——用户在
+            // config/*.lua 里写下的值既不生效，也不会被判成未知键，属于
+            // 「写了但静默不生效」这一类最难排查的配置故障。
+            valid = loadDoubleStrict(L, idx, kSection, "initialPoseSigma", 1e-4, 1e3, cfg.estimator.initialPoseSigma) &&
+                    valid;
+            valid = loadDoubleStrict(L, idx, kSection, "initialVelSigma", 1e-4, 1e3, cfg.estimator.initialVelSigma) &&
+                    valid;
+            valid = loadDoubleStrict(L, idx, kSection, "initialBiasSigma", 1e-4, 1e3, cfg.estimator.initialBiasSigma) &&
+                    valid;
+
             // 路标软先验与局部恢复先验：均为标准差 (m)，必须为正
             valid =
                 loadDoubleStrict(L, idx, kSection, "landmarkPriorSigma", 1e-3, 1e3, cfg.estimator.landmarkPriorSigma) &&
@@ -255,6 +345,21 @@ namespace myslam::config
                 valid;
 
             // 交叉约束：单字段合法但组合自相矛盾时不做自动纠正，交由使用者决策
+            if (cfg.estimator.landmarkRepresentation != "global3d" &&
+                cfg.estimator.landmarkRepresentation != "anchored_inverse_depth")
+            {
+                reportError("vio.landmarkRepresentation = \"{}\" 不是已知取值（global3d | anchored_inverse_depth）",
+                            cfg.estimator.landmarkRepresentation);
+                valid = false;
+            }
+            if (cfg.vision.chi2Gating && !cfg.estimator.publishCovariance)
+            {
+                // χ² 门控需要协方差。两者同时开启时后者会让前者静默退化为
+                // 像素阈值——告警一次，而不是让使用者以为统计门控在生效。
+                std::fprintf(stderr, "[myslam] config warning: vio.chi2Gating = true 但 publishCovariance = false："
+                                     "χ² 门控拿不到协方差，将退回像素阈值。如需统计门控请同时开启 "
+                                     "publishCovariance\n");
+            }
             if (cfg.vision.maxKeyframeInterval < cfg.vision.minKeyframeInterval)
             {
                 reportError("vio.maxKeyframeInterval ({}) 小于 minKeyframeInterval ({}): 强制插入间隔不应短于最小间隔",
@@ -340,9 +445,9 @@ namespace myslam::config
         {
             constexpr std::string_view kSection = "system";
             fieldTypeErrors() = 0;
-            checkUnknownKeys(
-                L, idx, kSection,
-                {"imuDt", "cameraDt", "totalDuration", "rmseThreshold", "initTimeout", "initialHeightMeters"});
+            checkUnknownKeys(L, idx, kSection,
+                             {"imuDt", "cameraDt", "totalDuration", "rmseThreshold", "initTimeout",
+                              "initialHeightMeters", "timingCsv"});
 
             loadDouble(L, idx, kSection, "cameraDt", 1e-6, 10.0, cfg.cameraDt);
             loadDouble(L, idx, kSection, "totalDuration", 1e-3, 86'400.0, cfg.totalDuration);
@@ -352,6 +457,8 @@ namespace myslam::config
             // 初始化写入的世界系高度：消去固定滞后优化的高度自由度，
             // 使估计轨迹可与仿真真值逐帧比较。区间取正值以排除笔误。
             loadDouble(L, idx, kSection, "initialHeightMeters", -1e3, 1e3, initCfg.initialHeightMeters);
+            // 空字符串 = 不写；路径不存在时由写入方报错，配置层不猜目录
+            loadString(L, idx, kSection, "timingCsv", cfg.timingCsvPath);
 
             // 旧配置兼容：imuDt 已改为派生量，单独提示比笼统的“未知字段”更可操作
             lua_getfield(L, idx, "imuDt");
@@ -481,8 +588,8 @@ namespace myslam::config
 
             // 相机模型决定前端如何把像素投到虚拟针孔平面：前端不做模型分支，
             // 而是靠 xi = 0 让 Mei & Rives 公式精确退化为标准针孔。因此针孔
-            // 模型下必须把 xi 归零（normalizeForModel），否则从 SubT 基线继承
-            // 的 xi = 1.58 会让针孔图被当作鱼眼图反解，边缘特征点被挤到镜头边框上。
+            // 模型下必须把 xi 归零（normalizeForModel），否则继承来的非零 xi
+            // 会让针孔图被当作鱼眼图反解，边缘特征点被挤到镜头边框上。
             //
             // 只有使用者显式写了 xi 才提示：从 MEI 基线切到 pinhole 时 xi 必然
             // 非零，那是模型切换的正常结果，不是配置错误。

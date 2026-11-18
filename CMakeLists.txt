@@ -74,14 +74,21 @@ endif()
 # Runtime configuration assets
 #
 # config/ 下的 Lua 配置文件随构建树同步一份，示例程序从构建目录运行时可直接
-# 用相对路径 config/config.lua 找到。COPYONLY 仍会跟踪源文件变化：改完 lua
-# 后构建会自动重新配置并刷新副本。
+# 用相对路径 config/<数据源>.lua 找到。COPYONLY 仍会跟踪源文件变化：改完 lua
+# 后构建会自动重新配置并刷新副本；CONFIGURE_DEPENDS 让「新增一个数据源 lua」
+# 也能被自动发现，无需手动重跑 cmake。
 # -----------------------------------------------------------------------------
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/config/config.lua"
-    "${CMAKE_CURRENT_BINARY_DIR}/config/config.lua"
-    COPYONLY
+file(GLOB MYSLAM_CONFIG_LUA_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/config/*.lua"
 )
+foreach(_lua_file ${MYSLAM_CONFIG_LUA_FILES})
+    get_filename_component(_lua_name "${_lua_file}" NAME)
+    configure_file(
+        "${_lua_file}"
+        "${CMAKE_CURRENT_BINARY_DIR}/config/${_lua_name}"
+        COPYONLY
+    )
+endforeach()
 
 # -----------------------------------------------------------------------------
 # Developer Tooling (only active when building as top-level project)

@@ -174,6 +174,18 @@ namespace myslam::domain
             checkedThrough_ = -1e300;
         }
 
+        /**
+         * @brief 用**原始相机时刻**重置基线（内部扣除 @c timeOffsetSeconds）
+         *
+         * @c advanceTo() 工作在 @c cameraTime - timeOffsetSeconds_ 域，而调用方
+         * （回放器的段边界）手上只有未扣偏移的 @c cameraTime。让调用方自己减
+         * 偏移是错的且不对称：@c reset() 存的是未对齐值、下一帧 @c advanceTo()
+         * 的目标却是已对齐值。@c offset > 0 时 @c from > to，重启后前
+         * @c offset/dt 帧的切片全空（静默）；@c offset < 0 时反向多积一段。
+         * 把换算收在这里，调用方就没有写错的机会。
+         */
+        void resetToCameraTime(double cameraTime) { reset(cameraTime - timeOffsetSeconds_); }
+
         [[nodiscard]] double integratedUntil() const noexcept { return integratedUntil_; }
         [[nodiscard]] std::size_t buffered() const noexcept { return buffer_.size(); }
         [[nodiscard]] const SyncStats &stats() const noexcept { return stats_; }

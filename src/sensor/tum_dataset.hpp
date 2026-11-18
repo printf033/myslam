@@ -295,6 +295,7 @@ namespace myslam::dataset
             }
             std::string line;
             std::size_t lines = 0;
+            std::size_t invalidQuaternionLines = 0;
             while (std::getline(in, line))
             {
                 if (line.empty() || line[0] == '#')
@@ -319,10 +320,25 @@ namespace myslam::dataset
                 GroundTruthPose pose;
                 pose.position = domain::Vec3(values[1], values[2], values[3]);
                 pose.orientation = Eigen::Quaterniond(values[7], values[4], values[5], values[6]);
-                pose.orientation.normalize();
+                // 动捕失锁时常把无效帧写成 `0 0 0 0`。Eigen 的 normalize() 就是
+                // `*this / norm()`，零模会得到全 NaN，并经 calibrateAccelerometerAxes
+                // 的 accelRotation_ 把**全部**加速度样本污染成 NaN、让 buildImu 的
+                // gyro 静默置零。这里丢弃该行而不是让毒值进链路。
+                const double norm = pose.orientation.norm();
+                if (!(norm > 1e-9) || !std::isfinite(norm))
+                {
+                    ++invalidQuaternionLines;
+                    continue;
+                }
+                pose.orientation.coeffs() /= norm;
                 groundTruthNs_.push_back(secondsToNs(values[0]));
                 groundTruth_.push_back(pose);
                 ++lines;
+            }
+            if (invalidQuaternionLines > 0)
+            {
+                mylog::warn("[数据加载] 真值轨迹中有 {} 行四元数模长无效（通常为动捕失锁），已跳过",
+                            invalidQuaternionLines);
             }
             if (lines < 2)
             {
@@ -417,10 +433,9 @@ namespace myslam::dataset
         /**
          * @brief 标定加速度计坐标系到光学系的旋转（Wahba / Kabsch）
          *
-         * TUM 的 accelerometer.txt 与 RGB 光学系既不同轴、也不共面：实测三个
-         * freiburg1 序列都有约 3.4° 的固定安装倾角（世界系水平分量约 0.58），
-         * 仅靠 24 种轴置换无法表达，残余倾角会以恒定加速度的形式注入积分，
-         * 3 秒就漂数米。
+         * TUM 的 accelerometer.txt 与 RGB 光学系既不同轴、也不共面：实测存在仅靠
+         * 24 种轴置换无法表达的固定安装倾角，残余倾角会以恒定加速度的形式注入
+         * 积分，3 秒就漂数米。
          *
          * 静止时加速度计测的是比力 f = -g，因此
          *   R_gt^T · (0, 0, +9.81) ≈ R_fix · accel_raw

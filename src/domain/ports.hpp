@@ -56,6 +56,15 @@ namespace myslam::domain
         /// @c status == OK 时有效
         std::optional<KinematicState> state;
 
+        /**
+         * @brief 本帧位姿的边际协方差（切线顺序，见 @c Mat6）
+         *
+         * 协方差是「估计器知不知道自己有多不确定」的唯一出口。缺它时，
+         * 一致性检验（NEES）与统计门控（χ²）都必须明确缺席，而不是退化成
+         * 像素经验阈值。不传播协方差的后端留空即可。
+         */
+        PoseCovariance poseCovariance{};
+
         HealthReport health{};
         /// 失败/跳过原因，供日志使用
         std::string detail;
@@ -90,12 +99,14 @@ namespace myslam::domain
          *
          * @param firstKeyframe 首个关键帧（编号与观测）
          * @param initialState 对齐后的初始位姿、速度与零偏
+         * @param initialCovariance 初始位姿协方差；为空时用配置的固定 sigma
          * @return false 表示本帧注入失败（实现已截住异常）。流水线会保持
          *         `GRAVITY_ALIGNED` 并在下一帧重试；若持续失败，它始终进不了
          *         `TRACKING_OK`，由编排层按"未完成初始化"上报，而不是带着
          *         空估计器继续跑。
          */
-        virtual bool initialize(const Keyframe &firstKeyframe, const KinematicState &initialState) = 0;
+        virtual bool initialize(const Keyframe &firstKeyframe, const KinematicState &initialState,
+                                const PoseCovariance &initialCovariance = {}) = 0;
 
         /**
          * @brief 处理一个关键帧
@@ -192,6 +203,71 @@ namespace myslam::domain
             (void)time;
             return std::nullopt;
         }
+    };
+
+    /**
+     * @brief 动态（运动起始）初始化的产物
+     */
+    struct DynamicInitResult
+    {
+        bool success{false};
+        /// 成功时的初始状态（世界系已按重力对齐）
+        KinematicState state{};
+        /**
+         * @brief 初始状态的位姿协方差（切线顺序：前旋转、后平移）
+         *
+         * 由线性系统的残差尺度与（AᵀA）⁻¹ 推出，不是拍脑袋的经验值。
+         * 后端用它替代固定先验 sigma：静止起步与运动起步的真实不确定度
+         * 差一个量级，用同一套常数必然一头过宽、另一头过窄。
+         *
+         * 求解失败或无法可靠估计时留空，调用方退回配置的固定值——
+         * 「无法检验」不等于「零不确定度」。
+         */
+        PoseCovariance poseCovariance{};
+        /// 参与求解的帧数与视觉内点数（诊断用）
+        std::size_t framesUsed{0};
+        std::size_t inliers{0};
+        /// 失败原因，供日志
+        std::string detail;
+    };
+
+    /**
+     * @brief 动态初始化端口：视觉观测 + IMU -> 初始状态
+     *
+     * @par 为什么单独成端口
+     *
+     * 静止初始化只需要 IMU（判方差、对齐重力），纯数学，能住在 domain 层。
+     * 动态初始化需要视觉几何（本质矩阵、三角化），而 domain 层不依赖
+     * OpenCV。把它抽成端口之后：pipeline 只持有接口，具体实现在
+     * frontend_cv 目标里，分层不被破坏。
+     *
+     * @par 失败必须是常态
+     *
+     * 该接口在每一帧都会被调，绝大多数时候返回失败（旋转变励不够、共视
+     * 特征太少、线性系统病态）。实现不得抛异常，也不得为了“成功”而编造
+     * 一个没把握的初值——一个错的初值比继续等待代价大得多。
+     */
+    class IDynamicInitializer
+    {
+    public:
+        virtual ~IDynamicInitializer() = default;
+
+        /// 清空内部缓存（流水线重建时调用）
+        virtual void reset() = 0;
+
+        /**
+         * @brief 尝试从一段视觉-惯性观测中解出初始状态
+         *
+         * 用 @c Keyframe 而不是 @c Frame：编排层需要缓存若干帧供求解，
+         * 而 @c Frame::image 是一个零拷贝视图，指向传感器源的内存——缓存
+         * 它会在源复用缓冲区之后变成悬空指针。动态初始化只用观测（像素与
+         * 射线），不需要图像，因此按值缓存 @c Keyframe 是安全的。
+         *
+         * @param frames 按时间升序的观测帧
+         * @param imu 覆盖这些帧时间范围的 IMU 切片
+         */
+        [[nodiscard]] virtual DynamicInitResult tryInitialize(std::span<const Keyframe> frames,
+                                                              std::span<const ImuSlice> imu) = 0;
     };
 
     /**

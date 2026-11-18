@@ -17,6 +17,7 @@
 #include "domain/config.hpp"
 #include "domain/status.hpp"
 #include "domain/types.hpp"
+#include <algorithm>
 #include <format>
 #include <string>
 
@@ -77,27 +78,38 @@ namespace myslam::domain
             const HealthReport report = diagnose(state, activeFeatures, config_);
             if (report.isHealthy)
             {
-                streak_ = 0;
+                inertialStreak_ = 0;
+                visualStreak_ = 0;
                 return report;
             }
 
-            ++streak_;
-            if (streak_ >= config_.alertStreakThreshold)
+            // 每类降级单独计数：交叉出现的「惯性 1 帧 + 视觉 1 帧 + 惯性 1 帧」
+            // 曾共用同一个计数器而凑够阈值，而其中没有任何一类连续成立。
+            // 滞回的本意是「同一故障持续多帧」，跨类别求和把它绕过了。
+            int &streak = report.degradation == Degradation::INERTIAL ? inertialStreak_ : visualStreak_;
+            ++streak;
+            if (streak >= config_.alertStreakThreshold)
             {
                 return report;
             }
-            return {true, Degradation::NONE,
-                    std::format("{} (连续 {}/{} 次，暂不降级)", report.alertMessage, streak_,
-                                config_.alertStreakThreshold)};
+            return {
+                true, Degradation::NONE,
+                std::format("{} (连续 {}/{} 次，暂不降级)", report.alertMessage, streak, config_.alertStreakThreshold)};
         }
 
-        void reset() noexcept { streak_ = 0; }
-        [[nodiscard]] int streak() const noexcept { return streak_; }
+        void reset() noexcept
+        {
+            inertialStreak_ = 0;
+            visualStreak_ = 0;
+        }
+        /// 两类降级计数中较大者（诊断用）
+        [[nodiscard]] int streak() const noexcept { return std::max(inertialStreak_, visualStreak_); }
         [[nodiscard]] const HealthConfig &config() const noexcept { return config_; }
 
     private:
         HealthConfig config_{};
-        int streak_{0};
+        int inertialStreak_{0};
+        int visualStreak_{0};
     };
 
 } // namespace myslam::domain

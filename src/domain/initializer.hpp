@@ -108,7 +108,6 @@ namespace myslam::domain
 
             const double accStd = std::sqrt(varAcc.sum() / 3.0);
             const double gyroStd = std::sqrt(varGyro.sum() / 3.0);
-
             // 静止门限随噪声配置缩放：单样本标准差 = sigma * sqrt(rate)，取 5 倍并保留工业下限
             const double rateScale = std::sqrt(std::max(1.0, rateHz()));
             const double accThreshold = std::max(0.3, 5.0 * noiseAccel() * rateScale);
@@ -145,6 +144,15 @@ namespace myslam::domain
 
             alignedPose_ = Pose{rotation, Vec3::Zero()};
 
+            // 由样本统计推出倾角不确定度：静止时比力母体等于重力，
+            // 均值向量的标准误是 accStd/√n，它对应约 (标准误/g) 弧度的
+            // 倾斜误差。这是「能从观测里导出」的量，不需要经验常数。
+            //
+            // 夹紧上下限：样本极端干净时不为零（模型误差仍在），样本
+            // 稀疏时也不无限放大。
+            const double meanAccStd = accStd / std::sqrt(static_cast<double>(samples_.size()));
+            alignedTiltSigma_ = std::clamp(meanAccStd / std::max(1e-6, imu_.gravityMagnitude), 1e-4, 0.2);
+
             if (enforceStationary)
             {
                 alignedBias_ = Bias{Vec3::Zero(), meanGyro};
@@ -172,7 +180,7 @@ namespace myslam::domain
             alignedPose = alignedPose_;
             alignedBias = alignedBias_;
 
-            const auto rpy = alignedPose_.q.toRotationMatrix().eulerAngles(2, 1, 0); // yaw, pitch, roll
+            const auto rpy = alignedPose_.orientation.toRotationMatrix().eulerAngles(2, 1, 0); // yaw, pitch, roll
             mylog::info("[初始化-步骤2: 重力粗对齐] 测得比力: [{:.3f}, {:.3f}, {:.3f}] m/s^2, 估算 Roll: {:.2f}°, "
                         "Pitch: {:.2f}°, Yaw: {:.2f}°",
                         meanAcc(0), meanAcc(1), meanAcc(2), rpy(2) * 180.0 / std::numbers::pi,
@@ -196,12 +204,23 @@ namespace myslam::domain
                 return false;
             }
 
-            alignedPose_ = Pose{initialPose.q, Vec3::Zero()};
+            alignedPose_ = Pose{initialPose.orientation, Vec3::Zero()};
             alignedBias_ = Bias{};
+
+            // 倾角不确定度必须显式写，不能留 0：0 会被下游当成「倾角完全已知」，
+            // 先验因此被拧到适配器的 kMinSigma=1e-4 rad（约 0.006°），比默认的
+            // initialPoseSigma 强三个数量级。而这条路径的用途恰恰是消融实验
+            // ——initialTiltDeg 故意把初始姿态弄歪——最不能出现的就是一个
+            // 拧死的倾角先验，否则「偏差由估计器自行收敛」根本不可能发生。
+            // 取「故意弄歪的角度」作为下界：歪多少就先验松多少。
+            constexpr double kMinTiltSigmaRad = 0.01;
+            const double tiltSigmaRad = std::abs(config_.initialTiltDeg) * std::numbers::pi / 180.0;
+            alignedTiltSigma_ = std::max(tiltSigmaRad, kMinTiltSigmaRad);
+
             alignedPose = alignedPose_;
             alignedBias = alignedBias_;
 
-            const auto rpy = alignedPose_.q.toRotationMatrix().eulerAngles(2, 1, 0);
+            const auto rpy = alignedPose_.orientation.toRotationMatrix().eulerAngles(2, 1, 0);
             mylog::warn("[初始化-跳过对齐] 未做静止检测与重力估计：初始姿态固定为 Roll: {:.2f}°, Pitch: {:.2f}°, "
                         "Yaw: {:.2f}°，零偏置零。世界系 z 轴不再与真实重力对齐，"
                         "该偏差只能由估计器自行收敛",
@@ -219,6 +238,14 @@ namespace myslam::domain
         [[nodiscard]] const Pose &alignedPose() const noexcept { return alignedPose_; }
         [[nodiscard]] const Bias &alignedBias() const noexcept { return alignedBias_; }
 
+        /**
+         * @brief 由静止样本导出的倾角标准差 (rad)
+         *
+         * 只覆盖 roll/pitch：航向绕重力不可观，静止初始化对它没有任何
+         * 信息，因此不在这个量里——调用方应把 yaw 的方差单独给足。
+         */
+        [[nodiscard]] double alignedTiltSigma() const noexcept { return alignedTiltSigma_; }
+
         /// 丢弃采样窗口（重建时调用）
         void resetSamples()
         {
@@ -226,6 +253,9 @@ namespace myslam::domain
             state_ = SystemState::UNINITIALIZED;
             alignedPose_ = Pose{};
             alignedBias_ = Bias{};
+            // 与 alignedPose_/alignedBias_ 一样属于「对齐结果」：留着上一段的
+            // 旧值会让下一次对齐前的一次读取拿到过期的不确定度。
+            alignedTiltSigma_ = 0.0;
         }
 
     private:
@@ -245,6 +275,7 @@ namespace myslam::domain
         std::vector<ImuSample> samples_;
         Pose alignedPose_{};
         Bias alignedBias_{};
+        double alignedTiltSigma_{0.0};
     };
 
 } // namespace myslam::domain

@@ -19,9 +19,11 @@
 #include "myslam.hpp"
 #include "pipeline/pipeline.hpp"
 #include "sensor/simulator.hpp"
+#include <Eigen/Cholesky>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -76,6 +78,7 @@ namespace myslam::vio
             mylog::info("[配置参数] 相机内参({}) 观测模型={}, IMU 采样率={:.0f}Hz, 估计器={}",
                         camera::cameraModelName(config_.camera.intrinsics.model), pipeline_.observationModel()->name(),
                         config_.imu.rateHz, pipeline_.estimator()->name());
+            logEffectiveConfig(config_, system_);
 
             const double imuDt = domain::SystemConfig::imuDtFrom(config_.imu.rateHz);
             if (!(imuDt > 0.0))
@@ -122,8 +125,9 @@ namespace myslam::vio
                     highRate.has_value() && imuSampleIndex % logStride == 0)
                 {
                     mylog::debug("[高频实时推算] t={:.3f}s: P=[{:.3f}, {:.3f}, {:.3f}], V=[{:.3f}, {:.3f}, {:.3f}]",
-                                 currentTime, highRate->pose.t.x(), highRate->pose.t.y(), highRate->pose.t.z(),
-                                 highRate->velocity.x(), highRate->velocity.y(), highRate->velocity.z());
+                                 currentTime, highRate->pose.position.x(), highRate->pose.position.y(),
+                                 highRate->pose.position.z(), highRate->velocity.x(), highRate->velocity.y(),
+                                 highRate->velocity.z());
                 }
                 ++imuSampleIndex;
 
@@ -147,7 +151,7 @@ namespace myslam::vio
                         {
                             initialized = true;
                             ++keyframeId;
-                            recordSample(samples, currentTime, init.initialPose->t, truth, skippedNoTruth);
+                            recordSample(samples, currentTime, init.initialPose->position, truth, skippedNoTruth);
                         }
                     }
                     else
@@ -175,10 +179,10 @@ namespace myslam::vio
                             }
                             else if (outcome.producedPose())
                             {
-                                const domain::Vec3 estimated = outcome.pose->t;
+                                const domain::Vec3 estimated = outcome.pose->position;
                                 if (truth)
                                 {
-                                    const domain::Vec3 gtPosition = truth->state.pose.t;
+                                    const domain::Vec3 gtPosition = truth->state.pose.position;
                                     mylog::info(
                                         "[位姿对比] KF #{}: 估计=[{:.3f}, {:.3f}, {:.3f}], 真值=[{:.3f}, {:.3f}, "
                                         "{:.3f}], 绝对误差={:.3f}m",
@@ -191,7 +195,8 @@ namespace myslam::vio
                                                 keyframeId, estimated.x(), estimated.y(), estimated.z());
                                 }
                                 ++keyframeId;
-                                recordSample(samples, currentTime, estimated, truth, skippedNoTruth);
+                                recordSample(samples, currentTime, estimated, truth, skippedNoTruth,
+                                             outcome.poseCovariance);
 
                                 if (!outcome.health.isHealthy)
                                 {
@@ -230,12 +235,36 @@ namespace myslam::vio
             return evaluate(samples, initialized, sawAnyGroundTruth, skippedNoTruth, pipeline_.resets());
         }
 
+        /**
+         * @brief 把分段耗时写到配置指定的 CSV，并打一行汇总
+         *
+         * 写文件失败只告警：计时是观测设施，不能因为它让一次运行失败。
+         */
+        void writeTimings() const
+        {
+            if (system_.timingCsvPath.empty() || pipeline_.timings().empty())
+            {
+                return;
+            }
+            std::ofstream out(system_.timingCsvPath);
+            if (!out)
+            {
+                mylog::warn("[耗时] 无法写入 {}，分段耗时只在日志里保留", system_.timingCsvPath);
+                mylog::info("[耗时] {}", pipeline_.timings().summary());
+                return;
+            }
+            out << domain::StageTimings::csvHeader() << pipeline_.timings().toCsv();
+            mylog::info("[耗时] 分段耗时已写入 {}: {}", system_.timingCsvPath, pipeline_.timings().summary());
+        }
+
     private:
         struct TrajectorySample
         {
             double timestamp{0.0};
             domain::Vec3 estimated;
             domain::Vec3 groundTruth;
+            /// 估计位置协方差；后端未提供时该样本不参与 NEES
+            std::optional<domain::Mat3> positionCovariance{};
         };
 
         /// 默认真值仿真器：观测模型必须与估计器声明的一致
@@ -243,6 +272,52 @@ namespace myslam::vio
         makeDefaultSource(const domain::PipelineConfig &config, const VioPipeline &pipeline)
         {
             return std::make_unique<VioSimulator>(makeSimulatorOptions(config), pipeline.observationModel());
+        }
+
+        /**
+         * @brief 把实际生效的配置逐项打到日志
+         *
+         * 配置是「代码默认值 + 配置文件 + 命令行」叠加的结果，事后想反推
+         * 「刚才跑的到底是哪一套」只能翻日志。启动时一次性回显，并标注
+         * 每个门控现在是统计门控还是像素门控——它决定出错时该去哪一段代码
+         * 找原因。
+         */
+        static void logEffectiveConfig(const domain::PipelineConfig &config, const domain::SystemConfig &system)
+        {
+            const auto &intr = config.camera.intrinsics;
+            mylog::info(
+                "[生效配置-相机] {} {}x{} fx={:.2f} fy={:.2f} cx={:.1f} cy={:.1f} 外参平移=[{:.3f}, {:.3f}, {:.3f}] "
+                "时间偏移={:.4f}s 曝光={:.4f}s",
+                camera::cameraModelName(intr.model), intr.imageWidth, intr.imageHeight, intr.fx, intr.fy, intr.cx,
+                intr.cy, config.camera.bodyPSensor.position.x(), config.camera.bodyPSensor.position.y(),
+                config.camera.bodyPSensor.position.z(), config.camera.timeOffsetSeconds, config.camera.exposureSeconds);
+            mylog::info(
+                "[生效配置-IMU] rate={:.0f}Hz 噪声 acc={:.2e} gyro={:.2e} 零偏游走 acc={:.2e} gyro={:.2e} g={:.3f}",
+                config.imu.rateHz, config.imu.accelNoiseSigma, config.imu.gyroNoiseSigma, config.imu.accelBiasRw,
+                config.imu.gyroBiasRw, config.imu.gravityMagnitude);
+            mylog::info("[生效配置-门控] 外点判定={} 像素软/硬/预优化={:.1f}/{:.1f}/{:.1f}px streak={} "
+                        "χ²multiplier={:.1f} 置信={:.3f}",
+                        (config.vision.chi2Gating && config.estimator.publishCovariance) ? "χ²统计检验" : "像素阈值",
+                        config.vision.maxReprojectionError, config.vision.maxReprojectionErrorHard,
+                        config.vision.maxReprojectionErrorPreopt, config.vision.outlierStreakThreshold,
+                        config.vision.chi2Multiplier, config.vision.chi2Confidence);
+            mylog::info("[生效配置-前端] 特征数下限={} 网格={}x{} RANSAC={} 阈值={:.2f}σ 置信={:.3f}",
+                        config.vision.minFeatures, config.vision.gridColumns, config.vision.gridRows,
+                        config.vision.enableRansac ? "on" : "off", config.vision.ransacThresholdSigma,
+                        config.vision.ransacConfidence);
+            mylog::info("[生效配置-关键帧] 视差>={:.1f}px 共视<{:.2f} 间隔[{:.2f}, {:.2f}]s 三角化视差>={:.1f}px",
+                        config.vision.minParallaxPx, config.vision.minTrackingRatio, config.vision.minKeyframeInterval,
+                        config.vision.maxKeyframeInterval, config.vision.minTriangulationParallaxPx);
+            mylog::info("[生效配置-估计器] {} 窗口={:.2f}s 迭代={} 路标={} 协方差={} 零速窗口={:.2f}s",
+                        config.estimator.name, config.estimator.slidingWindowLag,
+                        config.estimator.extraSmootherIterations, config.estimator.landmarkRepresentation,
+                        config.estimator.publishCovariance ? "上报" : "不上报", config.estimator.zuptWindowSeconds);
+            mylog::info("[生效配置-初始化] 重力对齐={} 动态初始化={} 最少样本={} 窗口={:.1f}s 超时={:.1f}s",
+                        config.initialization.gravityAlignment ? "on" : "off",
+                        config.initialization.dynamicEnabled ? "on" : "off", config.initialization.minSamples,
+                        config.initialization.windowSeconds, config.initialization.timeoutSeconds);
+            mylog::info("[生效配置-运行时] 相机步长={:.4f}s 时长={:.2f}s RMSE门限={:.3f}m", system.cameraDt,
+                        system.totalDuration, system.rmseThreshold);
         }
 
         /// 构造流水线前确保注册表已就绪（参数求值先于 pipeline_ 构造）
@@ -253,14 +328,20 @@ namespace myslam::vio
         }
 
         static void recordSample(std::vector<TrajectorySample> &out, double timestamp, const domain::Vec3 &estimated,
-                                 const std::optional<domain::GroundTruth> &truth, std::size_t &skipped)
+                                 const std::optional<domain::GroundTruth> &truth, std::size_t &skipped,
+                                 const domain::PoseCovariance &covariance = {})
         {
             if (!truth)
             {
                 ++skipped;
                 return;
             }
-            out.push_back(TrajectorySample{timestamp, estimated, truth->state.pose.t});
+            std::optional<domain::Mat3> positionCovariance;
+            if (const auto block = domain::translationCovariance(covariance); block.has_value())
+            {
+                positionCovariance = *block;
+            }
+            out.push_back(TrajectorySample{timestamp, estimated, truth->state.pose.position, positionCovariance});
         }
 
         domain::RunReport evaluate(const std::vector<TrajectorySample> &samples, bool initialized,
@@ -299,22 +380,67 @@ namespace myslam::vio
             }
 
             double sumSqError = 0.0;
+            std::vector<double> neesValues;
+            neesValues.reserve(samples.size());
             for (const TrajectorySample &sample : samples)
             {
-                const double error = (sample.estimated - sample.groundTruth).norm();
+                const domain::Vec3 residual = sample.estimated - sample.groundTruth;
+                const double error = residual.norm();
                 sumSqError += error * error;
                 if (error > report.maxError)
                 {
                     report.maxError = error;
+                }
+
+                // 仿真路径的估计与真值本就同源（世界系由重力对齐定下，
+                // 真值来自同一仿真器），因此不需要 Umeyama 对齐，
+                // NEES 直接用位姿协方差的平移块。
+                if (!sample.positionCovariance.has_value())
+                {
+                    continue;
+                }
+                const Eigen::LDLT<domain::Mat3> ldlt(*sample.positionCovariance);
+                if (ldlt.info() != Eigen::Success || !ldlt.isPositive())
+                {
+                    continue;
+                }
+                const double nees = residual.dot(ldlt.solve(residual));
+                if (std::isfinite(nees) && nees >= 0.0)
+                {
+                    neesValues.push_back(nees);
                 }
             }
 
             report.keyframeCount = samples.size();
             report.rmse = std::sqrt(sumSqError / static_cast<double>(samples.size()));
 
+            if (!neesValues.empty())
+            {
+                report.neesSamples = neesValues.size();
+                double neesSum = 0.0;
+                for (double value : neesValues)
+                {
+                    neesSum += value;
+                }
+                report.neesMean = neesSum / static_cast<double>(neesValues.size());
+            }
+
+            writeTimings();
             mylog::info("评估关键帧样本数 : {}", report.keyframeCount);
             mylog::info("整体平移 RMSE 误差: {:.4f} 米", report.rmse);
             mylog::info("最大轨迹偏差       : {:.4f} 米", report.maxError);
+            if (report.neesSamples > 0)
+            {
+                // 理论期望值 = 3（位置三自由度）。判读：远大于 3 是过度自信，
+                // 远小于 3 是过度保守。这行之前，「误差小但不知道有多准」与
+                // 「误差小且知道有多准」在报告上完全一样。
+                mylog::info("位置 NEES 均值     : {:.3f}（{} 个样本，理论期望 3）", report.neesMean,
+                            report.neesSamples);
+            }
+            else
+            {
+                mylog::warn("位置 NEES 不可用：后端未提供位姿协方差，无法做一致性检验");
+            }
             if (report.resets > 0)
             {
                 // resets 同时计入完整重置与就地重建：只有前者会换坐标系。
