@@ -15,13 +15,16 @@
  * 流水线。断档时丢弃本批切片并重建段——绝不把跨断层的积分送进估计器。
  */
 
+#include "adapters/gtsam/pose_graph.hpp"
 #include "adapters/register_builtin.hpp"
 #include "app/run_observer.hpp"
+#include "common/config_summary.hpp"
 #include "common/dataset_config.hpp"
 #include "common/ply_export.hpp"
 #include "domain/camera_model.hpp"
 #include "domain/config.hpp"
 #include "domain/ports.hpp"
+#include "domain/pose_graph.hpp"
 #include "domain/status.hpp"
 #include "domain/time_synchronizer.hpp"
 #include "domain/types.hpp"
@@ -124,9 +127,15 @@ namespace myslam::dataset
          * 仿真与打分，回放由序列时间戳驱动，一个都不读。此前它被存成成员却
          * 从未使用，属于"看起来依赖"而非真实依赖。
          */
+        /**
+         * @param timingCsvPath 分段耗时 CSV 的落盘路径；空表示只写日志。
+         *        排在 @c factory 之前是刻意的：所有入口都需要它，而注入工厂
+         *        只在测试里用。反过来排会让每个入口都得显式写一个 `{}` 占位，
+         *        而「因为要写占位符所以干脆不传」正是它此前从未生效的原因。
+         */
         ReplayRunner(const domain::PipelineConfig &config, const MeiIntrinsics &intrinsics,
                      const DatasetRunConfig &runConfig, std::unique_ptr<vio::IRunObserver> observer = nullptr,
-                     domain::EstimatorFactory factory = {}, std::string timingCsvPath = {})
+                     std::string timingCsvPath = {}, domain::EstimatorFactory factory = {})
             : config_(config),
               // 初始化顺序与成员声明一致（config_ → timingCsvPath_ → intrinsics_
               // → runConfig_ → observer_ → factory_），否则 -Wreorder。
@@ -158,8 +167,8 @@ namespace myslam::dataset
             struct Segment
             {
                 Segment(const domain::PipelineConfig &config, const MeiIntrinsics &intrinsics, int maxFeatures,
-                        const domain::EstimatorFactory &factory)
-                    : pipeline(config, factory, makeDynamicInitializer(config, intrinsics)),
+                        const domain::EstimatorFactory &factory, const std::shared_ptr<domain::IPoseGraph> &poseGraph)
+                    : pipeline(config, factory, makeDynamicInitializer(config, intrinsics), poseGraph),
                       sync(config.imu),
                       tracker(intrinsics, domain::makeCameraModel(intrinsics), pipeline.observationModel(),
                               config.vision, maxFeatures)
@@ -183,8 +192,14 @@ namespace myslam::dataset
 
             domain::KeyframeId keyframeId = 0;
 
+            // 位姿图跨段存活：一段丢失重建后，新流水线接着往同一张图里写。
+            // 每段各建一张图会让「长期轨迹」只剩最后一段，多地图就退化成了
+            // 多次互不相干的单地图运行。
+            const std::shared_ptr<domain::IPoseGraph> poseGraph =
+                config_.map.poseGraphEnabled ? std::make_shared<adapters::GtsamPoseGraph>() : nullptr;
+
             std::optional<Segment> segment;
-            segment.emplace(config_, intrinsics_, runConfig_.maxFeatures, factory_);
+            segment.emplace(config_, intrinsics_, runConfig_.maxFeatures, factory_, poseGraph);
 
             std::ofstream tum;
             if (!runConfig_.outputTum.empty())
@@ -208,6 +223,15 @@ namespace myslam::dataset
 
             report.segments = 1;
             const bool rendering = observer_ != nullptr && observer_->active();
+
+            // 回放入口没有 SystemConfig：时长由序列决定，传默认值会打印出
+            // 「时长=5s」这种与事实不符的数字。因此不输出运行时段。
+            {
+                for (const auto &line : common::summarizeConfigLines(config_, std::nullopt))
+                {
+                    mylog::info("[生效配置] {}", line);
+                }
+            }
             std::vector<domain::Vec3> exportedLandmarks;
             std::vector<domain::Vec3> exportedTrajectory;
 
@@ -239,7 +263,9 @@ namespace myslam::dataset
                 {
                     previousState = segment->pipeline.latestState();
                 }
-                segment.emplace(config_, intrinsics_, runConfig_.maxFeatures, factory_);
+                // 位姿图跨段共享：上面那个 poseGraph 变量必须传进去，
+                // 否则每段各建一张图，长期轨迹只剩最后一段。
+                segment.emplace(config_, intrinsics_, runConfig_.maxFeatures, factory_, poseGraph);
                 if (!segment->pipeline.valid())
                 {
                     mylog::error("[回放] 重建后的流水线无效，终止回放: {}", segment->pipeline.error());

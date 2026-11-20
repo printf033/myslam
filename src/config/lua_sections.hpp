@@ -78,6 +78,7 @@ namespace myslam::config
                               "minTrackSeparationPx",
                               "detectBeforeTrack",
                               "chi2MultiplierNew",
+                              "chi2ShortCircuitRatio",
                               "chi2UseLandmarkCovariance",
                               "zuptMaxVelocity",
                               "zuptMaxDisparity",
@@ -126,7 +127,11 @@ namespace myslam::config
                               "dynamicEnabled",
                               "dynamicMinRotationDeg",
                               "dynamicPoseCount",
-                              "dynamicWindowSeconds"});
+                              "dynamicWindowSeconds",
+                              "poseGraphEnabled",
+                              "poseGraphOptimizeInterval",
+                              "lostGraceSeconds",
+                              "placeRecognitionCandidates"});
 
             bool valid = true;
             fieldTypeErrors() = 0;
@@ -240,6 +245,8 @@ namespace myslam::config
             loadBool(L, idx, kSection, "chi2Gating", cfg.vision.chi2Gating);
             loadDouble(L, idx, kSection, "chi2Multiplier", 1.0, 1e4, cfg.vision.chi2Multiplier);
             loadDouble(L, idx, kSection, "chi2MultiplierNew", 1.0, 1e4, cfg.vision.chi2MultiplierNew);
+            // 0 合法：残差一到 0 就复核（最贵）；1.0 表示只有超像素门限才复核。
+            loadDouble(L, idx, kSection, "chi2ShortCircuitRatio", 0.0, 10.0, cfg.vision.chi2ShortCircuitRatio);
             loadBool(L, idx, kSection, "chi2UseLandmarkCovariance", cfg.vision.chi2UseLandmarkCovariance);
             loadDouble(L, idx, kSection, "chi2Confidence", 0.5, 0.999999, cfg.vision.chi2Confidence);
             loadBool(L, idx, kSection, "enableRansac", cfg.vision.enableRansac);
@@ -319,6 +326,16 @@ namespace myslam::config
             loadDouble(L, idx, kSection, "healthMaxSpeed", 1e-3, 1e4, cfg.health.maxSpeed);
             loadInteger(L, idx, kSection, "healthMinActiveFeatures", 0, 100'000, cfg.health.minActiveFeatures);
             loadInteger(L, idx, kSection, "healthAlertStreakThreshold", 1, 1'000, cfg.health.alertStreakThreshold);
+
+            // 地图世代与长期一致性。
+            // lostGraceSeconds 允许 0：那是「丢帧即重建」的旧行为，是显式选择，
+            // 不是一个需要被钳位纠正的错误值。
+            loadBool(L, idx, kSection, "poseGraphEnabled", cfg.map.poseGraphEnabled);
+            loadInteger(L, idx, kSection, "poseGraphOptimizeInterval", 0, 10'000, cfg.map.poseGraphOptimizeInterval);
+            loadDouble(L, idx, kSection, "lostGraceSeconds", 0.0, 600.0, cfg.map.lostGraceSeconds);
+            // 位置识别的候选数：目前没有实现消费它，但摘要会打印这个值。
+            // 打印一个改不了的参数比不打印更糟——用户会以为调它有用。
+            loadInteger(L, idx, kSection, "placeRecognitionCandidates", 0, 100, cfg.map.placeRecognitionCandidates);
 
             // 初始状态先验：位姿/速度/零偏的标准差。这三个字段一度只在
             // checkUnknownKeys 的白名单里、却没有对应的解析调用——用户在

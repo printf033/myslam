@@ -45,6 +45,10 @@ namespace myslam::adapters
 
         [[nodiscard]] std::string_view name() const noexcept override { return "imu_only"; }
 
+        [[nodiscard]] domain::MapId activeMap() const noexcept override { return activeMap_; }
+
+        void setActiveMap(domain::MapId map) noexcept override { activeMap_ = map; }
+
         bool initialize(const domain::Keyframe &firstKeyframe, const domain::KinematicState &initialState,
                         const domain::PoseCovariance &initialCovariance = {}) override
         {
@@ -99,7 +103,7 @@ namespace myslam::adapters
         [[nodiscard]] domain::EstimateSnapshot snapshot() const override
         {
             domain::EstimateSnapshot snapshot;
-            snapshot.keyframes.push_back({firstKeyframeId_, state_.timestamp, state_.pose});
+            snapshot.keyframes.push_back({firstKeyframeId_, state_.timestamp, state_.pose, std::nullopt, activeMap_});
             return snapshot;
         }
 
@@ -111,6 +115,8 @@ namespace myslam::adapters
         domain::KeyframeId firstKeyframeId_{0};
         std::size_t keyframeCount_{0};
         std::size_t visualObservations_{0};
+        /// 当前地图编号：由编排层通过 @c setActiveMap 设定
+        domain::MapId activeMap_{0};
     };
 
 } // namespace myslam::adapters

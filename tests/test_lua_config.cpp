@@ -173,6 +173,85 @@ system = { totalDuration = 1.25, cameraDt = 0.05 }
     }
 
     /**
+     * @brief 地图世代分组的字段能被配置，且写错类型会被拒
+     *
+     * 这四个字段是 ADR 0002 新增的。它们必须真的可从 lua 设置：如果只进
+     * 结构体与摘要、却没进解析，用户会看到摘要里印着一个改不了的值。
+     */
+    void checkMapSection()
+    {
+        const auto path = writeLua("map-section", R"(
+vio = {
+    poseGraphEnabled = false,
+    poseGraphOptimizeInterval = 3,
+    lostGraceSeconds = 0.0,
+    placeRecognitionCandidates = 7,
+}
+)");
+
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+
+        expectTrue(succeeded(report), "地图分组可以解析");
+        expectTrue(!config.vio.map.poseGraphEnabled, "vio.poseGraphEnabled 覆盖生效");
+        expectTrue(config.vio.map.poseGraphOptimizeInterval == 3, "vio.poseGraphOptimizeInterval 覆盖生效");
+        // 0 是「丢帧即重建」的显式选择，不是越界值：不得被钳成正数
+        expectNear(config.vio.map.lostGraceSeconds, 0.0, "vio.lostGraceSeconds 允许显式关闭宽限");
+        expectTrue(config.vio.map.placeRecognitionCandidates == 7, "vio.placeRecognitionCandidates 覆盖生效");
+
+        // 拼错的键只告警、不失败——这是既有约定（见 checkUnknownKeys 用例）。
+        // 关键是它确实**没生效**：白名单里必须真的列出这三个新键，否则
+        // 「写了但静默不生效」会以同样的面目出现。
+        const auto typoPath = writeLua("map-typo", R"(
+vio = { lostGraceSecond = 1.0 }
+)");
+        myslam::config::ProjectConfig typoConfig;
+        const auto typoReport = loadFrom(typoPath, typoConfig);
+        std::filesystem::remove(typoPath);
+        expectTrue(succeeded(typoReport), "地图分组里的拼写错误只告警、不失败（与既有约定一致）");
+        expectNear(typoConfig.vio.map.lostGraceSeconds, 2.0, "拼错的字段未生效，保持默认值");
+    }
+
+    /**
+     * @brief χ² 短路比例：可配置、越界钳位
+     *
+     * 这个字段是性能旋钮而非精度旋钮，所以必须能从配置里调——它的默认值
+     * 决定每个关键帧要做多少次贝叶斯树回代。写错类型时必须失败，否则
+     * 用户会以为调过而实际仍是默认值。
+     */
+    void checkChi2ShortCircuit()
+    {
+        const auto path = writeLua("chi2-short-circuit", R"(
+vio = { chi2ShortCircuitRatio = 0.25 }
+)");
+        myslam::config::ProjectConfig config;
+        const auto report = loadFrom(path, config);
+        std::filesystem::remove(path);
+        expectTrue(succeeded(report), "chi2ShortCircuitRatio 可以解析");
+        expectNear(config.vio.vision.chi2ShortCircuitRatio, 0.25, "chi2ShortCircuitRatio 覆盖生效");
+
+        // 0 合法（最贵的一档）；超过 10 属于笔误，钳到上界
+        const auto extreme = writeLua("chi2-short-extreme", R"(
+vio = { chi2ShortCircuitRatio = 0.0 }
+)");
+        myslam::config::ProjectConfig zeroConfig;
+        const auto zeroReport = loadFrom(extreme, zeroConfig);
+        std::filesystem::remove(extreme);
+        expectTrue(succeeded(zeroReport), "chi2ShortCircuitRatio = 0 是合法值");
+        expectNear(zeroConfig.vio.vision.chi2ShortCircuitRatio, 0.0, "0 不被当成越界");
+
+        const auto clampPath = writeLua("chi2-short-clamp", R"(
+vio = { chi2ShortCircuitRatio = 50.0 }
+)");
+        myslam::config::ProjectConfig clampConfig;
+        const auto clampReport = loadFrom(clampPath, clampConfig);
+        std::filesystem::remove(clampPath);
+        expectTrue(succeeded(clampReport), "越界的短路比例钳位后仍然有效");
+        expectNear(clampConfig.vio.vision.chi2ShortCircuitRatio, 10.0, "短路比例钳位到上界");
+    }
+
+    /**
      * @brief 数值越界应钳位（意图清楚，只是量级错）；类型错误必须判失败
      *
      * 两者性质不同：@c minTrackingRatio = 3.5 的意图是“要求更严的留存率”，
@@ -1217,6 +1296,8 @@ int main()
     myslam::configureLogging(logConfig);
 
     checkOverrides();
+    checkMapSection();
+    checkChi2ShortCircuit();
     checkImuRateDerivation();
     checkClampingAndTypes();
     checkCrossValidation();

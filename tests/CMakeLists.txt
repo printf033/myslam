@@ -66,6 +66,15 @@ if(TARGET myslam::myslam_lua)
     )
 endif()
 
+# 位姿图：跨窗口的长期一致性。它必须 include gtsam 适配器，而 myslam_test
+# 刻意只依赖领域层，因此单独成为一条测试。
+add_executable(myslam_pose_graph_test test_pose_graph.cpp)
+target_link_libraries(myslam_pose_graph_test PRIVATE
+    myslam::myslam
+    myslam::myslam_sanitized
+)
+add_test(NAME myslam_pose_graph_test COMMAND myslam_pose_graph_test)
+
 # 动态初始化需要视觉几何（本质矩阵、PnP），因此必须链接 frontend_cv。
 # 与 myslam_test 分开的理由是它把 OpenCV 拉进测试依赖：核心层可以在没有
 # OpenCV 的环境里编译通过，本条测试不该破坏那个性质。

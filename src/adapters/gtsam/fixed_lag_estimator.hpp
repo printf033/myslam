@@ -41,6 +41,7 @@
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/triangulation.h>
 #include <gtsam/inference/Symbol.h>
+#include <gtsam/linear/JointMarginal.h>
 #include <gtsam/navigation/CombinedImuFactor.h>
 #include <gtsam/navigation/ImuBias.h>
 #include <gtsam/navigation/NavState.h>
@@ -121,6 +122,11 @@ namespace myslam::adapters
         }
 
         [[nodiscard]] std::string_view name() const noexcept override { return "gtsam_fixed_lag"; }
+
+        /// 当前地图编号：由编排层在每次构造/重建后设定
+        [[nodiscard]] domain::MapId activeMap() const noexcept override { return activeMap_; }
+
+        void setActiveMap(domain::MapId map) noexcept override { activeMap_ = map; }
 
         [[nodiscard]] bool valid() const noexcept { return valid_; }
 
@@ -379,7 +385,7 @@ namespace myslam::adapters
                         const auto stampIt = keyframeTimestamps_.find(id);
                         snapshot.keyframes.push_back(
                             {id, stampIt != keyframeTimestamps_.end() ? stampIt->second : latestTimestamp_,
-                             fromGtsam(pose), queryPoseCovariance(id)});
+                             fromGtsam(pose), queryPoseCovariance(id), activeMap_});
                     }
                 }
 
@@ -398,7 +404,7 @@ namespace myslam::adapters
                         ::gtsam::Point3 ptW;
                         if (landmarkWorldPosition(id, ptW))
                         {
-                            snapshot.landmarks.push_back({id, fromGtsam(ptW)});
+                            snapshot.landmarks.push_back({id, fromGtsam(ptW), activeMap_});
                         }
                     }
                 }
@@ -410,7 +416,7 @@ namespace myslam::adapters
                         if (symbol.chr() == 'l')
                         {
                             snapshot.landmarks.push_back(
-                                {static_cast<domain::LandmarkId>(symbol.index()), fromGtsam(point)});
+                                {static_cast<domain::LandmarkId>(symbol.index()), fromGtsam(point), activeMap_});
                         }
                     }
                 }
@@ -419,7 +425,7 @@ namespace myslam::adapters
             {
                 for (const auto &[id, point] : triangulatedLandmarks_)
                 {
-                    snapshot.landmarks.push_back({id, fromGtsam(point)});
+                    snapshot.landmarks.push_back({id, fromGtsam(point), activeMap_});
                 }
             }
             return snapshot;
@@ -687,7 +693,20 @@ namespace myslam::adapters
                 {
                     return std::nullopt;
                 }
+                return worldCovarianceFromParam(id, cov);
+            }
+            catch (const std::exception &)
+            {
+                return std::nullopt;
+            }
+        }
 
+        /// 由参数空间 3x3 协方差推到世界系（两种参数化共用同一条数值链）
+        [[nodiscard]] std::optional<domain::Mat3> worldCovarianceFromParam(domain::LandmarkId id,
+                                                                           const Eigen::Matrix3d &cov) const
+        {
+            try
+            {
                 Eigen::Vector3d param;
                 if (useInverseDepth_)
                 {
@@ -1191,9 +1210,15 @@ namespace myslam::adapters
                 {
                     // 短路：残差明显低时无论协方差如何都会接受。统计门控
                     // 的目的是随协方差缩放门限，只在「像素门限正在做决定」
-                    // 的区间才有意义。每个观测算一次 3x3 边际协方差需要一次
-                    // 分解，无条件付出会把后端耗时甩到两倍以上。
-                    const bool decisionInPlay = residualPx > 0.25 * config_.vision.maxReprojectionError;
+                    // 的区间才有意义。
+                    //
+                    // 比例由 chi2ShortCircuitRatio 定，默认 1.0 = 只有已经
+                    // 超像素门限的观测才复核。把它压到 0.25（曾经的值）会让
+                    // 残差 2 px 的观测也去取路标协方差，而每次取都要一次
+                    // 贝叶斯树回代：实测单帧后端从 35 ms 涨到 106 ms，
+                    // 输出轨迹逐位相同。
+                    const bool decisionInPlay =
+                        residualPx > config_.vision.chi2ShortCircuitRatio * config_.vision.maxReprojectionError;
                     if (!decisionInPlay)
                     {
                         outlierStreak_.erase(observation.id);
@@ -1525,6 +1550,8 @@ namespace myslam::adapters
 
         domain::PipelineConfig config_;
         std::shared_ptr<const domain::ICameraModel> camera_;
+        /// 当前地图编号：由编排层通过 @c setActiveMap 设定，用于标注快照
+        domain::MapId activeMap_{0};
         const domain::IPinholeCalibration *pinhole_{nullptr};
         bool valid_{true};
         /// 路标参数化方式；全局 3D 点与锚定逆深度共用其余流程

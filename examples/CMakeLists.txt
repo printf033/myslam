@@ -49,6 +49,19 @@ if(MYSLAM_BUILD_DATASET_TOOLS)
         target_link_libraries(3_rosbag_vio PRIVATE myslam::myslam_lua)
     endif()
 
+    # 离线回环闭环验证：用已有轨迹 + 原序列图像，检验回环能否把三圈拉齐。
+    # 它是诊断工具而不是主流程：不改变 VIO 输出，只回答「回环这条路上限在哪」。
+    add_executable(5_loop_closure 5_loop_closure.cpp)
+    target_link_libraries(5_loop_closure PRIVATE
+        myslam::myslam
+        myslam::replay
+        myslam::frontend_cv
+        myslam::myslam_sanitized
+    )
+    if(TARGET myslam::myslam_lua)
+        target_link_libraries(5_loop_closure PRIVATE myslam::myslam_lua)
+    endif()
+
     # TUM RGB-D 数据集：有运动捕捉真值，回放后可直接算 ATE。
     # 需要 OpenCV 读图，且 gyro 由真值差分合成（数据集无陀螺仪）。
     add_executable(4_tum_vio 4_tum_vio.cpp)

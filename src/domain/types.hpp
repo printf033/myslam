@@ -54,6 +54,19 @@ namespace myslam::domain
      */
     using PoseCovariance = std::optional<Mat6>;
 
+    /**
+     * @brief 地图编号：一个「坐标系世代」
+     *
+     * 坐标系的连续性不是布尔量，而是「哪一张地图」的身份。跟踪丢失后重开
+     * 一张地图，意味着新地图的位姿与旧地图不可直接比较，但**旧地图不必
+     * 销毁**：它仍然是一段可信的轨迹，重定位可以回来接上它。
+     *
+     * 旧实现里这条语义被压成一次 @c reset()：坐标系归零，历史没有任何
+     * 容器能装下它。于是 @c RecoveryAction::RELOCALIZE 是一个无法实现的
+     * 承诺——没有任何东西可以被「重新定位到」。
+     */
+    using MapId = int;
+
     /// 关键帧编号：由编排层单调分配，重建后继续递增（跨段不重号）
     using KeyframeId = int;
     /// 特征编号：由前端跨帧维护，后端只当作不透明标识
@@ -243,11 +256,16 @@ namespace myslam::domain
 
     /**
      * @brief 一条路标估计
+     *
+     * @c mapId 是必需而不是可选：同一个几何点在不同地图里的坐标属于不同
+     * 坐标系，缺少地图身份的 `Vec3` 只能靠调用方记得「这批点属于哪段」，
+     * 而多地图之后这种记忆必然出错。
      */
     struct LandmarkEstimate
     {
         LandmarkId id{0};
         Vec3 position = Vec3::Zero();
+        MapId mapId{0};
     };
 
     /**
@@ -260,6 +278,26 @@ namespace myslam::domain
         Pose pose{};
         /// 位姿边际协方差；估计器不提供时为 @c std::nullopt
         PoseCovariance poseCovariance{};
+        /// 本帧所属地图；跨地图的位姿不可直接相减
+        MapId mapId{0};
+    };
+
+    /**
+     * @brief 地图世代的对外可见状态
+     *
+     * @c revision 是**地图内容**的版本号，单调递增：估计器重建、切换地图、
+     * 位姿图修正历史位姿都会让它前进。可视化与导出据此判断「手上这份快照
+     * 是否已经过期」，而不是每帧重新拉全量。
+     *
+     * @c mapCount 是已经产生过节点的地图数。它 > 1 表示这次运行确实经历过
+     * 丢失与重开，而不是一条从未断过的轨迹——这是「多地图」可被验证的最小
+     * 证据。
+     */
+    struct MapInfo
+    {
+        MapId activeMap{0};
+        std::uint64_t revision{0};
+        std::size_t mapCount{1};
     };
 
     /**
@@ -268,6 +306,10 @@ namespace myslam::domain
      * 用值返回而不是引用：旧接口承诺「引用在下一次调用修改状态前有效」，
      * 这条约定无法被类型检查，调用方稍有不慎就握着悬空引用。快照的拷贝
      * 成本只在导出点云/轨迹时发生，与每帧求解相比可以忽略。
+     *
+     * 多地图之后，快照里可能同时存在多个 @c mapId 的关键帧与路标：只要
+     * 估计器保留了旧地图的轨迹，它们就该一起出现在这里。调用方按
+     * @c mapId 分组，**不得**把不同地图的位姿放进同一个坐标系里相减。
      */
     struct EstimateSnapshot
     {

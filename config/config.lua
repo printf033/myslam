@@ -109,6 +109,11 @@ vio = {
     chi2Gating = true,
     chi2Multiplier = 5.0,    -- 门限松弛倍数：超过 multiplier × 95% 分位数才剔除
     chi2Confidence = 0.95,   -- χ² 单侧置信水平
+    -- 短路比例：残差低于「比例 × maxReprojectionError」时跳过统计复核。
+    -- 这是**性能**旋钮不是精度旋钮：每次复核要取一次路标边际协方差（约 1 ms，
+    -- 与一次完整求解同量级）。1.0 = 只有已超像素门限的观测才复核；压到 0.25
+    -- 会让单帧后端从 35 ms 涨到 106 ms，而轨迹逐位不变。
+    chi2ShortCircuitRatio = 1.0,
 
     -- 前端几何校验与空间均匀化
     enableRansac = true,          -- 用基础矩阵 RANSAC 剔除几何不一致的跟踪点

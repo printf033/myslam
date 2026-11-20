@@ -9,11 +9,14 @@
 #include "adapters/register_builtin.hpp"
 #include "adapters/simple/imu_only_estimator.hpp"
 #include "app/trajectory_eval.hpp"
+#include "common/config_summary.hpp"
 #include "domain/camera_model.hpp"
 #include "domain/config.hpp"
 #include "domain/health_monitor.hpp"
 #include "domain/initializer.hpp"
+#include "domain/place_recognition.hpp"
 #include "domain/ports.hpp"
+#include "domain/pose_graph.hpp"
 #include "domain/propagator.hpp"
 #include "domain/registry.hpp"
 #include "domain/time_synchronizer.hpp"
@@ -27,6 +30,7 @@
 #include <memory>
 #include <numbers>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -147,6 +151,178 @@ namespace
 
     private:
         myslam::vio::VioSimulator inner_;
+    };
+
+    /**
+     * @brief 位置识别替身：只记录被索引的关键帧
+     *
+     * 参考实现缺席是刻意的（可靠的跨地图检索需要外观描述子），但端口本身
+     * 必须可验证：它决定 @c RELOCALIZE 是否可执行。否则这个端口就是一段
+     * 永远不会被调用的声明。
+     */
+    class StubPlaceRecognizer final : public myslam::domain::IPlaceRecognizer
+    {
+    public:
+        [[nodiscard]] std::string_view name() const noexcept override { return "stub_recognizer"; }
+
+        bool index(myslam::domain::MapId map, const myslam::domain::Keyframe &keyframe) override
+        {
+            indexed.push_back({map, keyframe.id});
+            return true;
+        }
+
+        [[nodiscard]] std::vector<myslam::domain::PlaceCandidate> query(const myslam::domain::Keyframe &,
+                                                                        std::size_t) override
+        {
+            ++queryCalls;
+            return {};
+        }
+
+        void reset() override { indexed.clear(); }
+
+        [[nodiscard]] std::size_t indexedKeyframes() const override { return indexed.size(); }
+
+        std::vector<std::pair<myslam::domain::MapId, myslam::domain::KeyframeId>> indexed;
+        int queryCalls{0};
+    };
+
+    /**
+     * @brief 位姿图替身：只记录调用，不做优化
+     *
+     * 流水线的职责是「登记正确的节点与边」，gtsam 实现的职责是「优化对不对」。
+     * 两者分开测，前者用本替身就能覆盖，不必把优化器拉进每一个断言。
+     */
+    class StubPoseGraph final : public myslam::domain::IPoseGraph
+    {
+    public:
+        [[nodiscard]] bool addNode(const myslam::domain::PoseGraphNode &node) override
+        {
+            for (const auto &existing : nodes_)
+            {
+                if (existing.map == node.map && existing.id == node.id)
+                {
+                    return false;
+                }
+            }
+            nodes_.push_back(node);
+            ++revision_;
+            return true;
+        }
+
+        [[nodiscard]] bool addEdge(const myslam::domain::PoseGraphEdge &edge) override
+        {
+            for (const auto &existing : edges_)
+            {
+                if (existing.map == edge.map && existing.from == edge.from && existing.to == edge.to)
+                {
+                    return false;
+                }
+            }
+            edges_.push_back(edge);
+            ++revision_;
+            return true;
+        }
+
+        [[nodiscard]] bool optimize() override
+        {
+            ++optimizeCalls;
+            // 默认不宣称修正：否则「登记节点推进版本号」这条断言会被这里的
+            // 返回值污染，无法区分版本号到底是谁推进的。
+            return reportCorrection;
+        }
+
+        [[nodiscard]] std::vector<myslam::domain::PoseGraphNode> nodes() const override { return nodes_; }
+
+        [[nodiscard]] std::vector<myslam::domain::PoseGraphNode> nodesOf(myslam::domain::MapId map) const override
+        {
+            std::vector<myslam::domain::PoseGraphNode> out;
+            for (const auto &node : nodes_)
+            {
+                if (node.map == map)
+                {
+                    out.push_back(node);
+                }
+            }
+            return out;
+        }
+
+        [[nodiscard]] std::vector<myslam::domain::PoseGraphEdge> edgesOf(myslam::domain::MapId map) const override
+        {
+            std::vector<myslam::domain::PoseGraphEdge> out;
+            for (const auto &edge : edges_)
+            {
+                if (edge.map == map)
+                {
+                    out.push_back(edge);
+                }
+            }
+            return out;
+        }
+
+        [[nodiscard]] std::size_t edgeCount() const override { return edges_.size(); }
+
+        [[nodiscard]] std::size_t mapCount() const override
+        {
+            std::set<myslam::domain::MapId> maps;
+            for (const auto &node : nodes_)
+            {
+                maps.insert(node.map);
+            }
+            return maps.size();
+        }
+
+        [[nodiscard]] std::uint64_t revision() const override { return revision_; }
+
+        std::vector<myslam::domain::PoseGraphNode> nodes_;
+        std::vector<myslam::domain::PoseGraphEdge> edges_;
+        int optimizeCalls{0};
+        /// optimize() 的返回值：false 表示「没有历史位姿被修正」
+        bool reportCorrection{false};
+        std::uint64_t revision_{0};
+    };
+
+    /**
+     * @brief 可配置失败语义的估计器替身
+     *
+     * 与 @c StubEstimator 分开：那个只区分「成功 / 局部恢复」，而恢复门控
+     * 需要表达「失败 + 建议重建 + 降级类型」的三元组合。
+     */
+    class RecoveryStubEstimator final : public myslam::domain::IEstimator
+    {
+    public:
+        [[nodiscard]] std::string_view name() const noexcept override { return "recovery_stub"; }
+
+        bool initialize(const myslam::domain::Keyframe &, const myslam::domain::KinematicState &,
+                        const myslam::domain::PoseCovariance & = {}) override
+        {
+            return true;
+        }
+
+        myslam::domain::StepResult addKeyframe(const myslam::domain::Keyframe &,
+                                               std::span<const myslam::domain::ImuSlice>) override
+        {
+            ++processCalls;
+            myslam::domain::StepResult result;
+            result.status = fail ? myslam::domain::StepStatus::FAILED : myslam::domain::StepStatus::OK;
+            result.recovery = fail ? recovery : myslam::domain::RecoveryAction::NONE;
+            result.health = report;
+            result.detail = "test: scripted failure";
+            if (!fail)
+            {
+                result.state = state;
+            }
+            return result;
+        }
+
+        [[nodiscard]] myslam::domain::KinematicState latestState() const override { return state; }
+        [[nodiscard]] myslam::domain::HealthReport health() const override { return report; }
+        [[nodiscard]] myslam::domain::EstimateSnapshot snapshot() const override { return {}; }
+
+        bool fail{true};
+        myslam::domain::RecoveryAction recovery{myslam::domain::RecoveryAction::RESET_PIPELINE};
+        myslam::domain::HealthReport report{};
+        myslam::domain::KinematicState state{};
+        int processCalls{0};
     };
 
     /// 直接驱动流水线（不经 VioBenchmark），返回是否初始化与产出位姿数
@@ -1162,6 +1338,572 @@ int main()
         slowConfig.imu.rateHz = 100.0; // 10 ms > 1 ms
         myslam::vio::VioBenchmark slowRun(slowConfig, slowImu);
         expectTrue(!slowRun.run().initialized, "imuDt greater than cameraDt is rejected");
+    }
+
+    // ------------------------------------------------------------------
+    // χ² 短路比例：性能旋钮不得改变结果
+    //
+    // 短路比例决定「残差多小时的观测跳过统计复核」。压低它会让每个关键帧
+    // 多做几十次贝叶斯树回代（实测单帧 35 ms → 106 ms），但如果那些计算
+    // 不改变任何一个判定，就是纯粹的浪费。
+    //
+    // 这条断言把「省掉的计算确实是冗余的」钉成回归门禁：两种比例下关键帧
+    // 数与 RMSE 必须**完全相同**，而不是「接近」。若哪天短路阈值被调低，
+    // 或者门控逻辑变得依赖那部分协方差，这里会立刻失败。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::SystemConfig shortSystem;
+        shortSystem.totalDuration = 3.0;
+
+        myslam::domain::PipelineConfig coarse = config;
+        coarse.vision.chi2ShortCircuitRatio = 1.0; // 默认：只有超像素门限才复核
+        myslam::vio::VioBenchmark coarseRun(coarse, shortSystem);
+        const myslam::domain::RunReport coarseReport = coarseRun.run();
+
+        myslam::domain::PipelineConfig fine = config;
+        fine.vision.chi2ShortCircuitRatio = 0.25; // 旧默认：残差 2 px 就复核
+        myslam::vio::VioBenchmark fineRun(fine, shortSystem);
+        const myslam::domain::RunReport fineReport = fineRun.run();
+
+        expectTrue(coarseReport.initialized && fineReport.initialized, "both short-circuit ratios initialize");
+        expectTrue(coarseReport.keyframeCount == fineReport.keyframeCount,
+                   "the short-circuit ratio does not change the keyframe count");
+        expectTrue(std::abs(coarseReport.rmse - fineReport.rmse) < 1e-12,
+                   "the short-circuit ratio does not change the trajectory (bit-identical rmse)");
+        expectTrue(coarseReport.resets == fineReport.resets,
+                   "the short-circuit ratio does not change the recovery behaviour");
+    }
+
+    // ------------------------------------------------------------------
+    // 地图身份：reset 是「新一代坐标系」，不是「历史终结」
+    //
+    // 旧实现里两者是同一件事：reset 把 mapId 一起丢了，于是「重定位到
+    // 旧地图」没有任何东西可以定位到。这里钉住的是：换地图后旧地图的节点
+    // 仍然在位姿图里，而新地图有自己的编号与自己的锚点。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::PipelineConfig mapConfig = config;
+        mapConfig.map.poseGraphEnabled = true;
+        // 每帧都优化，但 stub 默认不宣称修正：这样「版本号前进」只能来自
+        // 节点/边登记，而不是 optimize() 的副作用。
+        mapConfig.map.poseGraphOptimizeInterval = 1;
+
+        auto graph = std::make_shared<StubPoseGraph>();
+        myslam::vio::VioPipeline pipeline(mapConfig, {}, nullptr, graph);
+        expectTrue(pipeline.valid(), "pipeline with a pose graph assembles");
+        expectTrue(pipeline.mapInfo().activeMap == 0, "the first map is numbered 0");
+
+        myslam::domain::ImuSample imu;
+        imu.accel = myslam::domain::Vec3(0.0, 0.0, mapConfig.imu.gravityMagnitude);
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+
+        auto makeFrame = [](double timestamp, double shift)
+        {
+            myslam::domain::Frame frame;
+            frame.timestamp = timestamp;
+            for (int i = 0; i < 10; ++i)
+            {
+                myslam::domain::Observation observation;
+                observation.id = i;
+                observation.uv = myslam::domain::Vec2(100.0 + static_cast<double>(i) + shift, 100.0);
+                frame.observations.push_back(observation);
+            }
+            return frame;
+        };
+
+        expectTrue(pipeline.stepInitialization(1, makeFrame(2.0, 0.0), 2.0).tracking, "map test initializes");
+        // 首帧必须成为位姿图的锚点：否则第一条边会因为 from 节点不存在而被丢弃。
+        expectTrue(graph->nodes_.size() == 1, "the first keyframe is registered as a pose-graph node");
+        expectTrue(!graph->nodes_.front().covariance.has_value(),
+                   "the first node of a map is a gauge anchor (no covariance)");
+
+        const auto beforeRevision = pipeline.mapInfo().revision;
+        for (int i = 1; i <= 30; ++i)
+        {
+            imu.timestamp = 2.0 + 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        const auto posed = pipeline.processFrame(2, makeFrame(2.5, 30.0), 2.5);
+        expectTrue(posed.producedPose(), "the second keyframe produces a pose");
+        expectTrue(graph->nodes_.size() == 2, "the second keyframe joins the graph");
+        expectTrue(graph->edges_.size() == 1, "exactly one edge connects the two keyframes");
+        expectTrue(graph->nodes_.back().covariance.has_value(), "non-anchor nodes carry a covariance");
+        expectTrue(graph->edges_.front().sharedObservations > 0,
+                   "the shared-observation count is measured, not defaulted");
+        expectTrue(pipeline.mapInfo().revision > beforeRevision, "registering keyframes advances the map revision");
+        expectTrue(graph->optimizeCalls >= 1,
+                   "the pipeline actually asks the pose graph to optimize on the configured interval");
+
+        // 长期轨迹覆盖全部已登记关键帧（包括之后会被边缘化掉的）
+        expectTrue(pipeline.longTermTrajectory().size() == graph->nodes_.size(),
+                   "the long-term trajectory is the pose graph, not the sliding window");
+
+        pipeline.reset(myslam::domain::RecoveryAction::RESET_PIPELINE);
+        expectTrue(pipeline.mapInfo().activeMap == 1, "a full reset opens a new map identity");
+        expectTrue(graph->nodes_.size() == 2, "the old map's nodes survive the reset");
+        expectTrue(pipeline.mapInfo().mapCount >= 1, "the retained map is still counted");
+
+        // 新地图重新初始化后，两个地图共存于同一张图
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 3.0 + 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(pipeline.stepInitialization(2, makeFrame(5.0, 0.0), 5.0).tracking, "the second map initializes");
+        expectTrue(graph->mapCount() == 2, "two coordinate generations coexist after a reset");
+        expectTrue(graph->nodes_.back().map == 1, "new nodes are tagged with the new map id");
+    }
+
+    // ------------------------------------------------------------------
+    // 无位姿图时 mapCount 仍然跟随世代前进
+    //
+    // 旧实现用 max(自身, poseGraph_->mapCount()) 兜底：未注入位姿图时那个
+    // 兜底不存在，两张地图跑完 mapCount 仍然是 1——「断过几次」这个事实
+    // 就此消失。世代计数不能依赖一个可选的旁路组件。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::PipelineConfig plainConfig = config;
+        plainConfig.map.poseGraphEnabled = false;
+
+        auto estimator = std::make_unique<RecoveryStubEstimator>();
+        estimator->fail = false;
+        std::vector<RecoveryStubEstimator *> created;
+
+        myslam::domain::EstimatorFactory factory = [&created](const myslam::domain::PipelineConfig &cfg)
+            -> std::expected<myslam::domain::EstimatorBundle, std::string>
+        {
+            auto rebuilt = std::make_unique<RecoveryStubEstimator>();
+            rebuilt->fail = false;
+            created.push_back(rebuilt.get());
+            return myslam::domain::EstimatorBundle{std::move(rebuilt),
+                                                   myslam::domain::makeVirtualPinholeModel(cfg.camera.intrinsics)};
+        };
+
+        myslam::vio::VioPipeline pipeline(plainConfig, std::move(estimator),
+                                          myslam::domain::makeVirtualPinholeModel(config.camera.intrinsics), factory);
+        expectTrue(pipeline.poseGraph() == nullptr, "no pose graph is present in this configuration");
+        expectTrue(pipeline.mapInfo().mapCount == 1, "a fresh run reports a single generation");
+
+        pipeline.reset(myslam::domain::RecoveryAction::RESET_PIPELINE);
+        expectTrue(pipeline.mapInfo().activeMap == 1, "the reset opens generation 1");
+        expectTrue(pipeline.mapInfo().mapCount == 2, "generation count advances even without a pose graph");
+
+        pipeline.reset(myslam::domain::RecoveryAction::RESET_PIPELINE);
+        expectTrue(pipeline.mapInfo().mapCount == 3, "generations keep counting");
+    }
+
+    // ------------------------------------------------------------------
+    // 共视数必须来自这条边的两个端点，不能借用更早的基线
+    //
+    // 视觉中断期间会插入「空观测关键帧」把 IMU 窗口消费掉。关键帧决策器
+    // 的基线在此时刻意保留更早的一帧（否则恢复后无基线可比），若共视数
+    // 也读那份基线，就会给一条「两帧之间毫无共同特征」的边一个虚高的
+    // 权重——而权重正是位姿图判断该信谁的唯一依据。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::PipelineConfig config2 = config;
+        config2.map.poseGraphEnabled = true;
+        config2.map.poseGraphOptimizeInterval = 0;
+        config2.estimator.slidingWindowLag = 0.1; // 保留窗口 0.4 s，便于强制插帧
+        config2.map.lostGraceSeconds = 0.0;
+
+        auto graph = std::make_shared<StubPoseGraph>();
+        auto estimator = std::make_unique<RecoveryStubEstimator>();
+        estimator->fail = false;
+        myslam::vio::VioPipeline pipeline(config2, std::move(estimator),
+                                          myslam::domain::makeVirtualPinholeModel(config2.camera.intrinsics), {},
+                                          nullptr, graph);
+        expectTrue(pipeline.valid(), "co-visibility pipeline assembles");
+
+        auto makeFrame = [](double timestamp, double shift)
+        {
+            myslam::domain::Frame frame;
+            frame.timestamp = timestamp;
+            for (int i = 0; i < 10; ++i)
+            {
+                myslam::domain::Observation observation;
+                observation.id = i;
+                observation.uv = myslam::domain::Vec2(100.0 + static_cast<double>(i) + shift, 100.0);
+                frame.observations.push_back(observation);
+            }
+            return frame;
+        };
+
+        myslam::domain::ImuSample imu;
+        imu.accel = myslam::domain::Vec3(0.0, 0.0, config2.imu.gravityMagnitude);
+        auto feed = [&imu, &pipeline](double from, double to)
+        {
+            for (double time = from; time < to; time += 0.005)
+            {
+                imu.timestamp = time;
+                pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+            }
+        };
+
+        feed(0.0, 2.0);
+        expectTrue(pipeline.stepInitialization(1, makeFrame(2.0, 0.0), 2.0).tracking,
+                   "co-visibility pipeline initializes");
+
+        // 第二条边：两帧共视 10 个特征
+        feed(2.0, 2.5);
+        expectTrue(pipeline.processFrame(2, makeFrame(2.5, 30.0), 2.5).producedPose(), "second keyframe is accepted");
+        expectTrue(graph->edges_.size() == 1, "one edge so far");
+        expectTrue(graph->edges_.back().sharedObservations == 10,
+                   "co-visibility counts the actually shared feature ids");
+
+        // 制造 IMU 窗口超时，强制插入一个**空观测**关键帧
+        feed(2.5, 4.0);
+        const auto forced = pipeline.processFrame(3, myslam::domain::Frame{}, 4.0);
+        expectTrue(forced.kind == myslam::vio::FrameOutcome::Kind::KEYFRAME_OPTIMIZED,
+                   "an overdue IMU window forces an observation-free keyframe");
+        expectTrue(graph->edges_.size() == 2, "the forced keyframe still produces an edge");
+        expectTrue(graph->edges_.back().sharedObservations == 0,
+                   "an observation-free keyframe shares nothing with the previous one");
+
+        // 恢复视觉：与空观测帧之间同样没有任何共视。旧实现会拿「更早那帧」
+        // 的观测来算，得出 10 这个虚高值。
+        feed(4.0, 4.5);
+        const auto recovered = pipeline.processFrame(4, makeFrame(4.5, 60.0), 4.5);
+        expectTrue(recovered.producedPose(), "a visual keyframe is accepted after the outage");
+        expectTrue(graph->edges_.size() == 3, "the recovery keyframe adds an edge");
+        expectTrue(graph->edges_.back().sharedObservations == 0,
+                   "the recovery edge does not borrow the pre-outage baseline");
+    }
+
+    // ------------------------------------------------------------------
+    // 位姿图宣称修正时，流水线的地图版本号必须前进
+    //
+    // 上一段证明「登记推进版本号」，这一段证明「修正也推进」——两者是不同
+    // 的事件，任一缺失都会让消费者漏掉一次「历史被改写过」。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::PipelineConfig config3 = config;
+        config3.map.poseGraphEnabled = true;
+        config3.map.poseGraphOptimizeInterval = 1;
+
+        auto graph = std::make_shared<StubPoseGraph>();
+        graph->reportCorrection = true;
+
+        auto estimator = std::make_unique<RecoveryStubEstimator>();
+        estimator->fail = false;
+        myslam::vio::VioPipeline pipeline(config3, std::move(estimator),
+                                          myslam::domain::makeVirtualPinholeModel(config3.camera.intrinsics), {},
+                                          nullptr, graph);
+        expectTrue(pipeline.valid(), "revision pipeline assembles");
+
+        myslam::domain::ImuSample imu;
+        imu.accel = myslam::domain::Vec3(0.0, 0.0, config3.imu.gravityMagnitude);
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(pipeline.stepInitialization(1, myslam::domain::Frame{}, 2.0).tracking,
+                   "revision pipeline initializes");
+        const auto beforeEdge = pipeline.mapInfo().revision;
+
+        auto frame = myslam::domain::Frame{};
+        frame.timestamp = 2.5;
+        for (int i = 0; i < 10; ++i)
+        {
+            myslam::domain::Observation observation;
+            observation.id = i;
+            observation.uv = myslam::domain::Vec2(100.0 + static_cast<double>(i) + 30.0, 100.0);
+            frame.observations.push_back(observation);
+        }
+        for (int i = 0; i < 100; ++i)
+        {
+            imu.timestamp = 2.0 + 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(pipeline.processFrame(2, frame, 2.5).producedPose(), "the edge-producing keyframe is accepted");
+        expectTrue(graph->optimizeCalls == 1, "the configured interval triggers exactly one optimization");
+        // 版本号至少前进两次：登记节点/边一次，位姿图宣称修正一次。
+        expectTrue(pipeline.mapInfo().revision >= beforeEdge + 2,
+                   "a reported correction advances the map revision on top of registration");
+    }
+
+    // ------------------------------------------------------------------
+    // 视觉退化不得触发坐标系重建
+    //
+    // 估计器说「我失败了，请重建」而 health 说是 VISUAL，两者直接冲突：
+    // 重建对「图像是黑的」毫无作用，只会让已经在累积的轨迹反复归零。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::HealthReport visualDegraded;
+        visualDegraded.isHealthy = false;
+        visualDegraded.degradation = myslam::domain::Degradation::VISUAL;
+        visualDegraded.alertMessage = "test: observation starvation";
+
+        auto estimator = std::make_unique<RecoveryStubEstimator>();
+        estimator->fail = true;
+        estimator->recovery = myslam::domain::RecoveryAction::RESET_PIPELINE;
+        estimator->report = visualDegraded;
+        RecoveryStubEstimator *const raw = estimator.get();
+
+        myslam::vio::VioPipeline pipeline(config, std::move(estimator),
+                                          myslam::domain::makeVirtualPinholeModel(config.camera.intrinsics));
+        myslam::domain::ImuSample imu;
+        imu.accel = myslam::domain::Vec3(0.0, 0.0, config.imu.gravityMagnitude);
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(pipeline.stepInitialization(1, myslam::domain::Frame{}, 2.0).tracking,
+                   "visual-degradation test initializes");
+
+        // 推进到远超宽限的时刻：视觉退化仍然不重建
+        for (int i = 0; i < 2000; ++i)
+        {
+            imu.timestamp = 2.0 + 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        auto frame = myslam::domain::Frame{};
+        frame.timestamp = 12.0;
+        for (int i = 0; i < 10; ++i)
+        {
+            myslam::domain::Observation observation;
+            observation.id = i;
+            observation.uv = myslam::domain::Vec2(100.0 + static_cast<double>(i), 100.0);
+            frame.observations.push_back(observation);
+        }
+        const auto outcome = pipeline.processFrame(2, frame, 12.0);
+        expectTrue(raw->processCalls > 0, "the estimator was actually asked to solve");
+        expectTrue(outcome.recovery == myslam::domain::RecoveryAction::NONE,
+                   "visual degradation never triggers a coordinate-system rebuild");
+        expectTrue(outcome.kind == myslam::vio::FrameOutcome::Kind::KEYFRAME_FAILED,
+                   "the failure itself is still reported");
+    }
+
+    // ------------------------------------------------------------------
+    // 丢失宽限：连续失败不足宽限时保持坐标系，超过后才重建
+    //
+    // 「丢一帧就重构」与「给几秒去抓回来」是两套不同的失败哲学。这里验证
+    // 宽限真的是**连续**计时：中间成功一次就把计时清零。
+    // ------------------------------------------------------------------
+    {
+        myslam::domain::PipelineConfig graceConfig = config;
+        graceConfig.map.lostGraceSeconds = 1.0;
+
+        auto estimator = std::make_unique<RecoveryStubEstimator>();
+        estimator->fail = true;
+        estimator->recovery = myslam::domain::RecoveryAction::RESET_PIPELINE;
+        estimator->report = myslam::domain::HealthReport{}; // 健康，只是求解失败
+        RecoveryStubEstimator *const raw = estimator.get();
+
+        int factoryCalls = 0;
+        myslam::domain::EstimatorFactory factory = [&raw, &factoryCalls](const myslam::domain::PipelineConfig &cfg)
+            -> std::expected<myslam::domain::EstimatorBundle, std::string>
+        {
+            ++factoryCalls;
+            auto rebuilt = std::make_unique<RecoveryStubEstimator>();
+            rebuilt->fail = true;
+            rebuilt->recovery = myslam::domain::RecoveryAction::RESET_PIPELINE;
+            return myslam::domain::EstimatorBundle{std::move(rebuilt),
+                                                   myslam::domain::makeVirtualPinholeModel(cfg.camera.intrinsics)};
+        };
+
+        myslam::vio::VioPipeline pipeline(graceConfig, std::move(estimator),
+                                          myslam::domain::makeVirtualPinholeModel(config.camera.intrinsics), factory);
+        myslam::domain::ImuSample imu;
+        imu.accel = myslam::domain::Vec3(0.0, 0.0, config.imu.gravityMagnitude);
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(pipeline.stepInitialization(1, myslam::domain::Frame{}, 2.0).tracking, "grace test initializes");
+
+        auto makeFrame = [](double timestamp, double shift)
+        {
+            myslam::domain::Frame frame;
+            frame.timestamp = timestamp;
+            for (int i = 0; i < 10; ++i)
+            {
+                myslam::domain::Observation observation;
+                observation.id = i;
+                observation.uv = myslam::domain::Vec2(100.0 + static_cast<double>(i) + shift, 100.0);
+                frame.observations.push_back(observation);
+            }
+            return frame;
+        };
+
+        auto feedImuUntil = [&imu, &pipeline](double from, double to)
+        {
+            for (double t = from; t < to; t += 0.005)
+            {
+                imu.timestamp = t;
+                pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+            }
+        };
+
+        feedImuUntil(2.0, 2.4);
+        const auto firstFailure = pipeline.processFrame(2, makeFrame(2.4, 30.0), 2.4);
+        expectTrue(firstFailure.recovery == myslam::domain::RecoveryAction::NONE,
+                   "the first failure starts the grace clock instead of rebuilding");
+        expectTrue(raw->processCalls == 1, "the failure really came from the estimator");
+
+        feedImuUntil(2.4, 3.0);
+        const auto withinGrace = pipeline.processFrame(3, makeFrame(3.0, 60.0), 3.0);
+        expectTrue(withinGrace.recovery == myslam::domain::RecoveryAction::NONE,
+                   "failures inside the grace window keep the coordinate frame");
+        expectTrue(factoryCalls == 0, "no rebuild was attempted inside the grace window");
+
+        feedImuUntil(3.0, 3.6);
+        const auto pastGrace = pipeline.processFrame(4, makeFrame(3.6, 90.0), 3.6);
+        expectTrue(pastGrace.recovery == myslam::domain::RecoveryAction::RESET_PIPELINE,
+                   "exceeding the grace window escalates to a coordinate-system rebuild");
+
+        // 连续性的反例：中间成功一次之后，宽限重新计时
+        auto healthy = std::make_unique<RecoveryStubEstimator>();
+        healthy->fail = false;
+        healthy->state = myslam::domain::KinematicState{};
+        myslam::vio::VioPipeline second(graceConfig, std::move(healthy),
+                                        myslam::domain::makeVirtualPinholeModel(config.camera.intrinsics), factory);
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 0.005 * static_cast<double>(i);
+            second.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(second.stepInitialization(1, myslam::domain::Frame{}, 2.0).tracking, "continuity test initializes");
+        for (int i = 0; i < 200; ++i)
+        {
+            imu.timestamp = 2.0 + 0.005 * static_cast<double>(i);
+            second.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(second.processFrame(2, makeFrame(3.0, 30.0), 3.0).producedPose(), "a healthy keyframe is accepted");
+    }
+
+    // ------------------------------------------------------------------
+    // RELOCALIZE 没有识别器时不得被执行，也不得静默换成重建
+    //
+    // 两个错误方向都不允许：真的去重定位（没有实现会崩）与降级成重建
+    // （坐标系归零，正是 RELOCALIZE 想避免的）。
+    // ------------------------------------------------------------------
+    {
+        auto estimator = std::make_unique<RecoveryStubEstimator>();
+        estimator->fail = true;
+        estimator->recovery = myslam::domain::RecoveryAction::RELOCALIZE;
+        RecoveryStubEstimator *const raw = estimator.get();
+
+        myslam::vio::VioPipeline pipeline(config, std::move(estimator),
+                                          myslam::domain::makeVirtualPinholeModel(config.camera.intrinsics));
+        myslam::domain::ImuSample imu;
+        imu.accel = myslam::domain::Vec3(0.0, 0.0, config.imu.gravityMagnitude);
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(pipeline.stepInitialization(1, myslam::domain::Frame{}, 2.0).tracking,
+                   "relocalize test initializes");
+
+        for (int i = 0; i < 2000; ++i)
+        {
+            imu.timestamp = 2.0 + 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        auto frame = myslam::domain::Frame{};
+        frame.timestamp = 12.0;
+        for (int i = 0; i < 10; ++i)
+        {
+            myslam::domain::Observation observation;
+            observation.id = i;
+            observation.uv = myslam::domain::Vec2(100.0 + static_cast<double>(i), 100.0);
+            frame.observations.push_back(observation);
+        }
+        const auto outcome = pipeline.processFrame(2, frame, 12.0);
+        expectTrue(raw->processCalls > 0, "the relocalize request came from the estimator");
+        expectTrue(outcome.recovery == myslam::domain::RecoveryAction::NONE,
+                   "RELOCALIZE without a recognizer is not silently downgraded to a rebuild");
+        expectTrue(pipeline.mapInfo().activeMap == 0,
+                   "the coordinate-frame generation is untouched after an unexecutable relocalize");
+    }
+
+    // ------------------------------------------------------------------
+    // 注入了识别器之后 RELOCALIZE 才可达
+    //
+    // 上一条用例证明「没有识别器时不会被假装执行」；这一条证明端口不是
+    // 摆设：一旦注入，估计器的请求必须原样透传到编排层，由编排层去决定
+    // 怎么用（当前编排层不做隐式重定位——实现不在这一层）。
+    // ------------------------------------------------------------------
+    {
+        auto estimator = std::make_unique<RecoveryStubEstimator>();
+        estimator->fail = true;
+        estimator->recovery = myslam::domain::RecoveryAction::RELOCALIZE;
+
+        auto recognizer = std::make_shared<StubPlaceRecognizer>();
+        myslam::vio::VioPipeline pipeline(
+            config, std::move(estimator), myslam::domain::makeVirtualPinholeModel(config.camera.intrinsics),
+            myslam::domain::EstimatorFactory{}, /*dynamicInitializer=*/nullptr, /*poseGraph=*/nullptr, recognizer);
+        expectTrue(pipeline.placeRecognizer() != nullptr, "the injected recognizer is reachable from the pipeline");
+
+        myslam::domain::ImuSample imu;
+        imu.accel = myslam::domain::Vec3(0.0, 0.0, config.imu.gravityMagnitude);
+        for (int i = 0; i < 400; ++i)
+        {
+            imu.timestamp = 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        expectTrue(pipeline.stepInitialization(1, myslam::domain::Frame{}, 2.0).tracking,
+                   "recognizer test initializes");
+
+        for (int i = 0; i < 2000; ++i)
+        {
+            imu.timestamp = 2.0 + 0.005 * static_cast<double>(i);
+            pipeline.feedImu(myslam::domain::ImuSlice{imu, 0.005});
+        }
+        auto frame = myslam::domain::Frame{};
+        frame.timestamp = 12.0;
+        for (int i = 0; i < 10; ++i)
+        {
+            myslam::domain::Observation observation;
+            observation.id = i;
+            observation.uv = myslam::domain::Vec2(100.0 + static_cast<double>(i), 100.0);
+            frame.observations.push_back(observation);
+        }
+        const auto outcome = pipeline.processFrame(2, frame, 12.0);
+        expectTrue(outcome.recovery == myslam::domain::RecoveryAction::RELOCALIZE,
+                   "with a recognizer present the request is passed through instead of swallowed");
+        expectTrue(pipeline.mapInfo().activeMap == 0,
+                   "the pipeline does not open a new map on its own for a relocalize request");
+    }
+
+    // ------------------------------------------------------------------
+    // 生效配置摘要：所有分组必须出现
+    //
+    // 摘要的唯一价值是「不漏字段」。逐个分组断言比断言某个具体数值更
+    // 有意义：数值会随默认值变化，而漏掉一个分组永远不应该是可接受的。
+    // ------------------------------------------------------------------
+    {
+        const myslam::domain::SystemConfig runtime{};
+        const std::string summary = myslam::common::summarizeConfig(config, runtime);
+        for (const char *group : {"[相机]", "[外参]", "[IMU]", "[视觉]", "[前端]", "[门控]", "[初始化]", "[估计器]",
+                                  "[健康]", "[地图]", "[运行时]"})
+        {
+            expectTrue(summary.find(group) != std::string::npos, "the effective-config summary covers every group");
+        }
+        // 地图分组必须真的反映配置，而不是写死一句说明
+        expectTrue(summary.find("位姿图=on") != std::string::npos,
+                   "the map group reflects the configured pose-graph switch");
+        expectTrue(summary.find(config.estimator.name) != std::string::npos,
+                   "the estimator group names the backend that will run");
+
+        const auto lines = myslam::common::summarizeConfigLines(config, runtime);
+        expectTrue(lines.size() == 11, "the summary is split into one line per group");
+
+        // 回放入口没有 SystemConfig。传一个默认构造的实例会打印「时长=5s」，
+        // 而回放时长由序列本身决定——那是与事实不符的数字，不是无害的占位。
+        const std::string withoutRuntime = myslam::common::summarizeConfig(config, std::nullopt);
+        expectTrue(withoutRuntime.find("[地图]") != std::string::npos,
+                   "the map group is still reported without a runtime config");
+        expectTrue(withoutRuntime.find("[运行时]") == std::string::npos,
+                   "the runtime line is omitted when no runtime config exists");
     }
 
     myslam::flushLogging();

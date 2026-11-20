@@ -549,7 +549,8 @@ int main(int argc, char **argv)
         observer = std::make_unique<myslam::viz::ReplayObserver>(runConfig.viz, intrinsics, probe.observationModel());
     }
 
-    myslam::dataset::ReplayRunner runner(vioConfig, intrinsics, runConfig, std::move(observer));
+    myslam::dataset::ReplayRunner runner(vioConfig, intrinsics, runConfig, std::move(observer),
+                                         project.system.timingCsvPath);
     const myslam::dataset::DatasetRunReport report = runner.run(source);
 
     std::printf("\n===== 回放结果 =====\n");

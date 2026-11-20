@@ -167,6 +167,23 @@ namespace myslam::domain
          */
         double chi2MultiplierNew{12.0};
         /**
+         * @brief χ² 门控的短路比例：残差低于 `比例 × maxReprojectionError` 时直接接受
+         *
+         * @par 这不是精度旋钮，是性能旋钮
+         *
+         * 每个走统计复核的观测都要取一次路标边际协方差，而那是一次贝叶斯树
+         * 回代——实测单次约 1 ms，与一次完整求解同量级。比例定得过低
+         * （0.25 意味着残差 2 px 就要复核）会让每个关键帧付出几十次回代：
+         * 实测 200 特征下单帧从 35 ms 涨到 106 ms，而**输出轨迹逐位相同**
+         * 0.25 / 0.75 / 1.0 三种比例的 230 个关键帧位姿完全一致（最大差
+         * 0.00 cm）——那些计算没有改变任何一个判定。
+         *
+         * 1.0 的语义最干净：像素门限先做粗筛，只有已经超限的观测才交给
+         * χ² 复核（χ² 此时的作用是「能否救回」，而不是「精细分割」）。
+         * 需要更精细判定时可以调低，代价按上面的量级线性增长。
+         */
+        double chi2ShortCircuitRatio{1.0};
+        /**
          * @brief 是否把路标自身协方差计入 χ² 的 S 矩阵
          *
          * 只用位姿协方差时 S 偏小、χ² 偏大：深度尚未收敛的路标会被误杀。
@@ -379,6 +396,37 @@ namespace myslam::domain
     };
 
     /**
+     * @brief 地图世代与长期一致性
+     *
+     * @par 丢失宽限为什么必须在配置里
+     *
+     * 「丢一帧就重构」与「给几秒去重定位」是两套不同的失败哲学，没有中间
+     * 态可言。硬编码任何一边都等于替用户做了选择：短序列回放（TUM、SubT）
+     * 常见几十毫秒的遮挡，立刻重构会把一段本来能接上的轨迹切成两段；而
+     * 真实长时运行里持续失败必须尽快重开地图，否则每帧都在做一次注定失败
+     * 的求解。
+     */
+    struct MapConfig
+    {
+        /// 是否登记位姿图（没有注入实现时本开关无效，且不报错）
+        bool poseGraphEnabled{true};
+
+        /// 每多少个关键帧优化一次位姿图；<= 0 表示不主动优化
+        int poseGraphOptimizeInterval{8};
+
+        /**
+         * @brief 丢失宽限 (s)
+         *
+         * 估计器连续失败的时间未超过它时，流水线不执行 @c RESET_PIPELINE，
+         * 保持坐标系并继续尝试。<= 0 表示不容忍，失败即重建。
+         */
+        double lostGraceSeconds{2.0};
+
+        /// 位置识别一次返回的候选数上限（仅在注入了识别器时有意义）
+        int placeRecognitionCandidates{3};
+    };
+
+    /**
      * @brief 一次运行的完整算法配置
      */
     struct PipelineConfig
@@ -389,6 +437,7 @@ namespace myslam::domain
         InitializationConfig initialization{};
         EstimatorConfig estimator{};
         HealthConfig health{};
+        MapConfig map{};
 
         /// 由重力方向的消融初始姿态
         [[nodiscard]] Pose ablationInitialPose() const noexcept

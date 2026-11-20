@@ -90,6 +90,24 @@ namespace myslam::domain
         [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
         /**
+         * @brief 当前地图编号（坐标系世代）
+         *
+         * 单地图实现可以固定返回 0。一旦编排层切换了地图而实现仍返回 0，
+         * 快照里新旧两代的位姿就无法区分——那种情况下多地图只是名义上的。
+         */
+        [[nodiscard]] virtual MapId activeMap() const noexcept { return 0; }
+
+        /**
+         * @brief 告知估计器当前地图编号
+         *
+         * 编排层在每次构造与重建后调用一次，把「这一代坐标系属于哪张地图」
+         * 交给估计器，让它输出的 @c KeyframeState::mapId 与编排层的记账一致。
+         * 只支持单地图的实现可以忽略；忽略的代价是快照里所有 @c mapId 都是 0，
+         * 调用方必须自己用流水线的 @c mapInfo() 补齐。
+         */
+        virtual void setActiveMap(MapId map) noexcept { (void)map; }
+
+        /**
          * @brief 注入首个关键帧并建立内部状态
          *
          * 首个关键帧的**观测**必须随先验一起传入：它是下一次三角化的基线。

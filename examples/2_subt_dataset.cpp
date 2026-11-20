@@ -472,7 +472,14 @@ int main(int argc, char **argv)
         myslam::vio::VioPipeline probe(vioConfig);
         observer = std::make_unique<myslam::viz::ReplayObserver>(runConfig.viz, intrinsics, probe.observationModel());
     }
-    myslam::dataset::ReplayRunner runner(vioConfig, intrinsics, runConfig, std::move(observer));
+    // system.timingCsv 之前没有消费者：配置里写了路径、解析进了
+    // SystemConfig，但回放器拿不到它，分段耗时永远只存在于一条日志里。
+    // 这类「写了但静默不生效」的字段比不存在的字段更难排查。
+    // system.timingCsv 之前没有消费者：配置里写了路径、也解析进了
+    // SystemConfig，但回放器拿不到它，分段耗时永远只存在于一条日志里。
+    // 这类「写了但静默不生效」的字段比不存在的字段更难排查。
+    myslam::dataset::ReplayRunner runner(vioConfig, intrinsics, runConfig, std::move(observer),
+                                         project.system.timingCsvPath);
     const myslam::dataset::DatasetRunReport report = runner.run(sequence);
 
     if (!runConfig.outputTum.empty())

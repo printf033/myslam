@@ -37,6 +37,7 @@ namespace myslam::domain
         kInitialization, ///< 初始化状态机推进（stepInitialization 整体）
         kPropagation,    ///< 优化之间的 IMU 外推
         kEstimator,      ///< 估计器单次 addKeyframe（含求解与门控）
+        kPoseGraph,      ///< 位姿图登记与批量优化（跨窗口长期一致性）
         kCount
     };
 
@@ -50,6 +51,8 @@ namespace myslam::domain
             return "propagation";
         case TimingStage::kEstimator:
             return "estimator";
+        case TimingStage::kPoseGraph:
+            return "pose_graph";
         case TimingStage::kCount:
             break;
         }

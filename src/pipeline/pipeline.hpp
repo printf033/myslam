@@ -27,7 +27,9 @@
 #include "domain/config.hpp"
 #include "domain/initializer.hpp"
 #include "domain/keyframe_selector.hpp"
+#include "domain/place_recognition.hpp"
 #include "domain/ports.hpp"
+#include "domain/pose_graph.hpp"
 #include "domain/propagator.hpp"
 #include "domain/registry.hpp"
 #include "domain/stage_timings.hpp"
@@ -35,6 +37,7 @@
 #include "domain/types.hpp"
 #include "logger.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <deque>
 #include <format>
@@ -42,6 +45,7 @@
 #include <numbers>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -109,13 +113,17 @@ namespace myslam::vio
          * @param factory 估计器工厂；为空时按 @c config.estimator.name 查询注册表
          */
         explicit VioPipeline(const domain::PipelineConfig &config, domain::EstimatorFactory factory = {},
-                             std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer = nullptr)
+                             std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer = nullptr,
+                             std::shared_ptr<domain::IPoseGraph> poseGraph = nullptr,
+                             std::shared_ptr<domain::IPlaceRecognizer> placeRecognizer = nullptr)
             : config_(config),
               factory_(factory ? std::move(factory) : registryFactory()),
               initializer_(config.initialization, config.imu),
               selector_(config.vision),
               propagator_(config.imu),
-              dynamicInitializer_(std::move(dynamicInitializer))
+              dynamicInitializer_(std::move(dynamicInitializer)),
+              poseGraph_(std::move(poseGraph)),
+              placeRecognizer_(std::move(placeRecognizer))
         {
             if (dynamicInitializer_ && !config_.initialization.dynamicEnabled)
             {
@@ -157,7 +165,9 @@ namespace myslam::vio
          */
         VioPipeline(const domain::PipelineConfig &config, std::unique_ptr<domain::IEstimator> estimator,
                     std::shared_ptr<const domain::ICameraModel> observationModel, domain::EstimatorFactory factory = {},
-                    std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer = nullptr)
+                    std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer = nullptr,
+                    std::shared_ptr<domain::IPoseGraph> poseGraph = nullptr,
+                    std::shared_ptr<domain::IPlaceRecognizer> placeRecognizer = nullptr)
             : config_(config),
               factory_(std::move(factory)),
               initializer_(config.initialization, config.imu),
@@ -168,8 +178,16 @@ namespace myslam::vio
               // 这些成员加上互相依赖的初始化表达式，真实顺序就会与书写顺序不符。
               estimator_(std::move(estimator)),
               model_(std::move(observationModel)),
-              dynamicInitializer_(std::move(dynamicInitializer))
+              dynamicInitializer_(std::move(dynamicInitializer)),
+              poseGraph_(std::move(poseGraph)),
+              placeRecognizer_(std::move(placeRecognizer))
         {
+            if (estimator_ != nullptr)
+            {
+                // 注入路径同样要把当前地图告知估计器：否则快照里的 mapId
+                // 恒为 0，第一次切换地图之后新旧两代无法区分。
+                estimator_->setActiveMap(mapInfo_.activeMap);
+            }
             if (!estimator_ || !model_)
             {
                 error_ = "注入的估计器或观测模型为空";
@@ -460,6 +478,10 @@ namespace myslam::vio
             }
 
             propagator_.reset(initialState);
+            // 首帧也要进位姿图：它是这张地图的 gauge 锚点，也是下一条边的
+            // 起点。若只登记后续帧，第一条边会因为 from 节点不存在而被丢弃。
+            registerPoseGraphNode(firstKeyframe, initialState, initialCovariance);
+            lastPoseGraphObservations_ = firstKeyframe.observations;
             lastState_ = initialState;
             lastKeyframeId_ = keyframeId;
             lastKeyframeObservations_ = frame.observations;
@@ -554,9 +576,21 @@ namespace myslam::vio
                 {
                     outcome.kind = FrameOutcome::Kind::KEYFRAME_FAILED;
                     outcome.failureReason = "估计器返回 OK 但未给出状态";
-                    outcome.recovery = domain::RecoveryAction::RESET_PIPELINE;
+                    outcome.recovery = gateRecovery(domain::RecoveryAction::RESET_PIPELINE, result.health, timestamp);
                     return outcome;
                 }
+                {
+                    // 位姿图计时独立成段：它是唯一「随时间增长」的阶段
+                    // （每次优化覆盖全历史），混在 estimator 里会让
+                    // 「哪一段在变慢」变成猜谜。
+                    const domain::StageTimings::Scoped poseGraphTimer(timings_, domain::TimingStage::kPoseGraph);
+                    registerPoseGraphNode(keyframe, *result.state, result.poseCovariance);
+                    registerPoseGraphEdge(keyframe, *result.state);
+                }
+                // 位姿图专用基线：无条件跟随本帧更新。@c lastKeyframeObservations_
+                // 在空观测关键帧时会被刻意保留，那份保留是为关键帧决策器服务
+                // 的；拿它算共视会让「从」端点与观测对不上。
+                lastPoseGraphObservations_ = frame.observations;
                 propagator_.reset(*result.state);
                 lastState_ = *result.state;
                 lastKeyframeId_ = keyframeId;
@@ -570,6 +604,12 @@ namespace myslam::vio
                 lastKeyframeTimestamp_ = timestamp;
                 clearImuWindow();
                 consecutiveLocalRebuilds_ = 0;
+                // 成功的一帧取消丢失计时：宽限是「连续失败」的容忍，而不是
+                // 「累计失败次数」的预算。否则长时间运行里零星的单帧失败会
+                // 累积到超时，在图像其实一直正常的情况下把坐标系切成两段。
+                lostSince_ = -1.0;
+                visualOutageWarned_ = false;
+                graceWarned_ = false;
                 outcome.pose = result.state->pose;
                 outcome.poseCovariance = result.poseCovariance;
                 outcome.kind = FrameOutcome::Kind::KEYFRAME_OPTIMIZED;
@@ -578,6 +618,9 @@ namespace myslam::vio
             case domain::StepStatus::RECOVERED:
                 // 估计器已局部恢复：坐标系连续，但本帧不产出位姿。
                 // 刻意不更新上一关键帧基线，让下一次三角化的基线更长。
+                lostSince_ = -1.0;
+                visualOutageWarned_ = false;
+                graceWarned_ = false;
                 outcome.kind = FrameOutcome::Kind::KEYFRAME_RECOVERED;
                 return outcome;
 
@@ -588,6 +631,7 @@ namespace myslam::vio
             case domain::StepStatus::FAILED:
                 outcome.kind = FrameOutcome::Kind::KEYFRAME_FAILED;
                 outcome.failureReason = result.detail;
+                outcome.recovery = gateRecovery(result.recovery, result.health, timestamp);
                 return outcome;
             }
 
@@ -653,6 +697,21 @@ namespace myslam::vio
             initDeadline_ = -1.0;
             consecutiveLocalRebuilds_ = 0;
             ++resets_;
+
+            // 完整重置意味着坐标系作废：这是「新一代」的开始，而不是历史的
+            // 终结。旧地图的节点留在位姿图里——它仍然是一段可信的轨迹，
+            // 重定位可以回来接上它。旧实现把两者混为一件事（reset 即丢弃），
+            // 于是 RELOCALIZE 没有任何东西可以定位到。
+            ++mapInfo_.activeMap;
+            // mapCount 是世代口径，与是否注入位姿图无关：未注入位姿图时两张
+            // 地图跑完，旧实现仍然报告 mapCount = 1。
+            mapInfo_.mapCount = static_cast<std::size_t>(mapInfo_.activeMap) + 1;
+            ++mapInfo_.revision;
+            hasNodeInCurrentMap_ = false;
+            visualOutageWarned_ = false;
+            graceWarned_ = false;
+            keyframesSinceOptimize_ = 0;
+            lostSince_ = -1.0;
 
             if (!factory_)
             {
@@ -724,9 +783,248 @@ namespace myslam::vio
             return estimator_ ? estimator_->diagnostics() : domain::EstimatorDiagnostics{};
         }
 
+        /**
+         * @brief 地图世代信息
+         *
+         * @c activeMap 与 @c mapCount 都是「世代」口径：@c activeMap 从 0 单调
+         * 递增，@c mapCount = activeMap + 1。二者都不依赖位姿图是否在场——
+         * 旧实现拿 `max(自身, poseGraph_->mapCount())` 兜底，于是未注入位姿图时
+         * 两张地图跑完 @c mapCount 仍然是 1。
+         *
+         * 为什么不用位姿图的 `mapCount()`：那个量是「**有节点**的地图数」，
+         * 与「经历过多少世代」不是一回事。重建后立刻结束的运行会产生一个
+         * 没有节点的世代，两者必然不等。把它们折叠进同一个字段会让「到底
+         * 断过几次」变成一个猜不出来的数。
+         *
+         * @c revision 是地图内容版本：登记新节点/新边、估计器就地重建、切换
+         * 世代、位姿图修正历史位姿都会让它前进。
+         */
+        [[nodiscard]] domain::MapInfo mapInfo() const { return mapInfo_; }
+
+        /// 位姿图（可能为空指针；调用方必须判空）
+        [[nodiscard]] const domain::IPoseGraph *poseGraph() const noexcept { return poseGraph_.get(); }
+
+        /// 位置识别器（可能为空；为空时 @c RELOCALIZE 不被执行）
+        [[nodiscard]] const domain::IPlaceRecognizer *placeRecognizer() const noexcept
+        {
+            return placeRecognizer_.get();
+        }
+
+        /**
+         * @brief 全历史长期轨迹（按地图分成段输出）
+         *
+         * 与 @c snapshot() 的区别是覆盖面：快照来自估计器，只覆盖固定滞后
+         * 窗口；这里是位姿图，覆盖自本次运行开始的所有关键帧，包括已经被
+         * 边缘化掉的那些。不同地图的位姿不在同一个坐标系里，因此返回值
+         * 里每一段都带自己的 @c map，调用方不得把它们直接相减。
+         */
+        [[nodiscard]] std::vector<domain::PoseGraphNode> longTermTrajectory() const
+        {
+            return poseGraph_ ? poseGraph_->nodes() : std::vector<domain::PoseGraphNode>{};
+        }
+
     private:
         /// 就地重建的连续上限：超过即放弃坐标系连续性
         static constexpr std::size_t kMaxConsecutiveLocalRebuilds = 3;
+
+        /**
+         * @brief 把一个成功关键帧登记为位姿图节点
+         *
+         * 每张地图的第一个节点不带协方差（作为 gauge 锚点），其余节点带上
+         * 估计器给出的绝对协方差。位姿图的任务不是重新估计绝对位姿，而是
+         * 让相对关系自洽；给锚点一个可漂移的协方差只会让整段轨迹跟着漂。
+         */
+        void registerPoseGraphNode(const domain::Keyframe &keyframe, const domain::KinematicState &state,
+                                   const domain::PoseCovariance &covariance)
+        {
+            if (!poseGraph_ || !config_.map.poseGraphEnabled)
+            {
+                return;
+            }
+
+            domain::PoseGraphNode node;
+            node.map = mapInfo_.activeMap;
+            node.id = keyframe.id;
+            node.timestamp = keyframe.timestamp;
+            node.pose = state.pose;
+            // 每张地图的首个节点是 gauge 锚点：**刻意**丢弃调用方给的首帧
+            // 协方差。锚点若可漂，整段轨迹会跟着漂，而位姿图的任务是让相对
+            // 关系自洽、不是重新估计绝对位姿。协方差仍然有用——它被首帧的
+            // 视觉因子消费，只是不该进这张图。
+            node.covariance = hasNodeInCurrentMap_ ? covariance : domain::PoseCovariance{};
+            if (poseGraph_->addNode(node))
+            {
+                // 地图内容真的变了：版本号必须前进。否则外部消费者靠
+                // revision 判断「快照是否过期」时会漏掉后续所有关键帧——
+                // 它只在重建/优化时前进，而正常追踪并不重建。
+                ++mapInfo_.revision;
+            }
+            hasNodeInCurrentMap_ = true;
+        }
+
+        /**
+         * @brief 在当前帧与上一个成功关键帧之间登记一条共视边
+         *
+         * 必须在更新 @c lastState_ / @c lastKeyframeId_ 之前调用：它读的正是
+         * 那两个「上一条边」的端点。
+         */
+        void registerPoseGraphEdge(const domain::Keyframe &keyframe, const domain::KinematicState &state)
+        {
+            if (!poseGraph_ || !config_.map.poseGraphEnabled || !lastState_ || !hasLastKeyframe())
+            {
+                return;
+            }
+
+            domain::PoseGraphEdge edge;
+            edge.map = mapInfo_.activeMap;
+            edge.from = lastKeyframeId_;
+            edge.to = keyframe.id;
+            edge.relative = lastState_->pose.inverse() * state.pose;
+            // **不能**用 @c lastKeyframeObservations_ 算共视：那份基线在「空观测
+            // 关键帧」时会刻意保留更早的一帧（给关键帧决策器用），而这条边的
+            // 端点 `from` 是那个空帧。拿旧基线与新帧求交会得出一个虚高的共视数，
+            // 而实际上两帧之间一个共同特征都没有——边被赋予它不配有的信息量。
+            edge.sharedObservations = countSharedObservations(lastPoseGraphObservations_, keyframe.observations);
+            // 共视越多，相对位姿越可信。标准差按 1/sqrt(n) 收缩（方差按 1/n），
+            // 这是独立观测平均的基本关系；不用线性 1/n 是因为那会让共视 200 个点
+            // 的边获得比绝对位姿还小两个量级的方差，把整张图钉死在一条边上。
+            // 共视 0 时按 n=1 处理：这条边只剩位姿观测本身的约束（纯 IMU 那段），
+            // 它具有最大的方差，而不是被当成无效。
+            const double scale = 1.0 / std::sqrt(static_cast<double>(std::max(1, edge.sharedObservations)));
+            edge.covariance = domain::defaultRelativeCovariance() * (scale * scale);
+            if (!poseGraph_->addEdge(edge))
+            {
+                return;
+            }
+            ++mapInfo_.revision;
+            ++keyframesSinceOptimize_;
+            const int interval = config_.map.poseGraphOptimizeInterval;
+            if (interval > 0 && keyframesSinceOptimize_ >= static_cast<std::size_t>(interval))
+            {
+                keyframesSinceOptimize_ = 0;
+                if (poseGraph_->optimize())
+                {
+                    ++mapInfo_.revision;
+                    mylog::info("[流水线] 位姿图修正了历史位姿（{} 个节点，{} 条边）", poseGraph_->nodes().size(),
+                                poseGraph_->edgeCount());
+                }
+            }
+        }
+
+        /**
+         * @brief 把估计器的恢复建议变成「本次真的该执行什么」
+         *
+         * 三件事在这里发生，都是契约层表达不了、必须由编排层判断的：
+         *   1. 视觉退化不重建坐标系——下一帧图像依旧，重建只会反复归零；
+         *   2. 丢失宽限——连续失败不足 @c lostGraceSeconds 时保持坐标系；
+         *   3. @c RELOCALIZE 没有识别器时明确不执行，而不是静默换成重建。
+         */
+        [[nodiscard]] domain::RecoveryAction gateRecovery(domain::RecoveryAction requested,
+                                                          const domain::HealthReport &health, double timestamp)
+        {
+            if (requested == domain::RecoveryAction::NONE)
+            {
+                return requested;
+            }
+
+            if (requested == domain::RecoveryAction::RELOCALIZE)
+            {
+                if (!placeRecognizer_)
+                {
+                    // 没有识别器就没有「可以重定位到的历史」。把它换成重建
+                    // 等于把 RELOCALIZE 静默降级成它本来要避免的那件事。
+                    mylog::warn("[流水线] 估计器请求重定位，但未注入位置识别器；保持坐标系继续追踪");
+                    return domain::RecoveryAction::NONE;
+                }
+                return requested;
+            }
+
+            if (requested == domain::RecoveryAction::RESET_ESTIMATOR)
+            {
+                // 就地重建保留坐标系，代价只有一次重建，不需要宽限。
+                //
+                // 但仍然清掉两条告警位：估计器从「视觉退化」改口成「我自己
+                // 有问题」是一个新事件，后续再退化时应当重新告警一次。
+                visualOutageWarned_ = false;
+                graceWarned_ = false;
+                return requested;
+            }
+
+            // 以下都是 RESET_PIPELINE。
+            if (health.degradation == domain::Degradation::VISUAL)
+            {
+                // 外部观测退化：重建坐标系对「图像是黑的」毫无作用，只会让
+                // 已经在累积的轨迹反复归零。只有估计器内部失稳才值得重建。
+                //
+                // 告警只打一次：视觉中断会持续几十帧，每帧一条会让日志被同一条
+                // 信息填满，真正的新事件反而看不见。编排层在失败路径上还会再打
+                // 一条 error，所以这里的重复只会放大噪音。
+                lostSince_ = -1.0;
+                graceWarned_ = false;
+                if (!visualOutageWarned_)
+                {
+                    mylog::warn("[流水线] 视觉退化请求重建，拒绝：重建不会让下一帧图像变好（{}）；"
+                                "后续同类请求不再重复告警",
+                                health.alertMessage);
+                    visualOutageWarned_ = true;
+                }
+                return domain::RecoveryAction::NONE;
+            }
+            visualOutageWarned_ = false;
+
+            if (config_.map.lostGraceSeconds > 0.0)
+            {
+                if (lostSince_ < 0.0)
+                {
+                    lostSince_ = timestamp;
+                    graceWarned_ = false;
+                }
+                const double lost = timestamp - lostSince_;
+                if (lost < config_.map.lostGraceSeconds)
+                {
+                    // 同样只告警一次：宽限期内可能连续失败几十帧，逐帧告警会
+                    // 把「正在等待」变成日志噪音。
+                    if (!graceWarned_)
+                    {
+                        mylog::warn("[流水线] 丢入宽限，保持坐标系继续尝试（窗口 {:.2f}s）",
+                                    config_.map.lostGraceSeconds);
+                        graceWarned_ = true;
+                    }
+                    return domain::RecoveryAction::NONE;
+                }
+                mylog::info("[流水线] 丢失 {:.2f}s 超过宽限，执行坐标系重建", lost);
+            }
+
+            graceWarned_ = false;
+
+            lostSince_ = -1.0;
+            return requested;
+        }
+
+        /// 两帧观测的共视特征数（按跨帧 ID 求交）
+        [[nodiscard]] static int countSharedObservations(const std::vector<domain::Observation> &previous,
+                                                         const std::vector<domain::Observation> &current)
+        {
+            if (previous.empty() || current.empty())
+            {
+                return 0;
+            }
+            std::unordered_set<domain::FeatureId> ids;
+            ids.reserve(previous.size());
+            for (const auto &observation : previous)
+            {
+                ids.insert(observation.id);
+            }
+            int shared = 0;
+            for (const auto &observation : current)
+            {
+                if (ids.contains(observation.id))
+                {
+                    ++shared;
+                }
+            }
+            return shared;
+        }
 
         /**
          * @brief 接管工厂产出，校验完整性
@@ -747,6 +1045,9 @@ namespace myslam::vio
             }
             estimator_ = std::move(bundle.estimator);
             model_ = std::move(bundle.observationModel);
+            // 适配器需要知道自己服务的是哪一代坐标系，否则快照里的 mapId
+            // 恒为 0，多地图时新旧两代的位姿无法区分。
+            estimator_->setActiveMap(mapInfo_.activeMap);
             return true;
         }
 
@@ -838,6 +1139,7 @@ namespace myslam::vio
                 // 造成重复积分。imuWindowOverdue_ 也一并保留，让这段区间尽快
                 // 在下一次相机帧被消费掉。
                 ++consecutiveLocalRebuilds_;
+                ++mapInfo_.revision;
                 if (consecutiveLocalRebuilds_ > kMaxConsecutiveLocalRebuilds)
                 {
                     // 重建后仍持续失败：保留窗口的代价（无界增长 + 每帧完整求解）
@@ -878,6 +1180,23 @@ namespace myslam::vio
         std::shared_ptr<const domain::ICameraModel> model_;
         /// 动态初始化实现（可为空）；只在 initialization.dynamicEnabled 时被调用
         std::unique_ptr<domain::IDynamicInitializer> dynamicInitializer_;
+        /// 长期一致性容器（可为空；为空时只靠估计器窗口）
+        ///
+        /// 用 @c shared_ptr 而不是 @c unique_ptr：位姿图与位置识别索引都
+        /// 必须**跨流水线重建存活**。丢失后重开地图时，新流水线要接着往
+        /// 同一张图里写，而不是从零开始——后者会让「多地图」退化成「多次
+        /// 单地图运行」。所有权留在调用方，流水线只借用。
+        std::shared_ptr<domain::IPoseGraph> poseGraph_;
+        /// 位置识别器（可为空；为空时 @c RELOCALIZE 不可执行）
+        std::shared_ptr<domain::IPlaceRecognizer> placeRecognizer_;
+        /// 地图世代记账：@c revision 由本类递增，@c mapCount 与位姿图取大
+        domain::MapInfo mapInfo_{};
+        /// 当前地图是否已经有锚点节点
+        bool hasNodeInCurrentMap_{false};
+        /// 自上次位姿图优化以来的关键帧数
+        std::size_t keyframesSinceOptimize_{0};
+        /// 连续丢失的起始时刻；< 0 表示未在丢失中
+        double lostSince_{-1.0};
         /// 初始化窗口内缓存的观测帧（只存观测，图像视图会失效）
         std::vector<domain::Keyframe> initFrames_;
         /// 初始化窗口内的 IMU 切片
@@ -900,6 +1219,16 @@ namespace myslam::vio
         /// 后退化为完整重置：坐标系不得不作废，但内存与算力被封顶。
         std::size_t consecutiveLocalRebuilds_{0};
         std::vector<domain::Observation> lastKeyframeObservations_;
+        /// 位姿图专用的「上一个关键帧观测」：无条件跟随每一帧更新
+        ///
+        /// 与 @c lastKeyframeObservations_ 分开是必需的：后者在空观测关键帧时
+        /// 会被刻意保留（关键帧决策需要一条可比的基线），而共视数必须量的是
+        /// 「这条边的两个端点之间」的真实重叠。
+        std::vector<domain::Observation> lastPoseGraphObservations_;
+        /// 视觉退化已告警过（限流用，避免中断期间每帧一条）
+        bool visualOutageWarned_{false};
+        /// 已进入丢失宽限并告警过（限流用）
+        bool graceWarned_{false};
         double lastKeyframeTimestamp_{-1.0};
         domain::KeyframeId lastKeyframeId_{0};
         std::optional<domain::KinematicState> lastState_;

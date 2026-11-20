@@ -583,7 +583,8 @@ int main(int argc, char **argv)
     }
     std::printf("可视化       : %s\n", vizDesc.empty() ? "关闭" : vizDesc.c_str());
 
-    myslam::dataset::ReplayRunner runner(vioConfig, intrinsics, runConfig, std::move(observer));
+    myslam::dataset::ReplayRunner runner(vioConfig, intrinsics, runConfig, std::move(observer),
+                                         project.system.timingCsvPath);
     const myslam::dataset::DatasetRunReport report = runner.run(source);
 
     std::printf("\n===== 回放结果 =====\n");

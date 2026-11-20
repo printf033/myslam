@@ -53,7 +53,7 @@ myslam/
 │   ├── pipeline/           # 编排核心，只依赖 domain
 │   ├── app/                # 两个入口：VioBenchmark（有真值，打分）、ReplayRunner（只统计）
 │   ├── viz/                # 窗口、去畸变图、观察者实现
-│   ├── common/ config/     # 非算法数据、Lua 解析
+│   ├── common/ config/     # 非算法数据、Lua 解析、生效配置摘要
 │   ├── vio.hpp             # 聚合头
 │   ├── log_config.hpp      # mylog 日志级别与文件输出封装（logger/fileManager 两节）
 │   └── myslam.hpp.in       # 版本头模板，构建时由 project(VERSION) 生成 myslam.hpp
@@ -70,9 +70,11 @@ myslam/
 domain ← common/config/sensor/frontend/adapters ← pipeline ← app ← viz
 ```
 
-`myslam::pipeline` 既不链接 GTSAM 也不链接 OpenCV。五个可替换端口
+`myslam::pipeline` 既不链接 GTSAM 也不链接 OpenCV。八个可替换端口
 （`IEstimator` / `IObservationExtractor` / `ICameraModel` / `IStatePropagator` /
-`ISensorSource`）及其实现见下文「经过多少种类」。
+`ISensorSource` / `IDynamicInitializer` / `IPoseGraph` / `IPlaceRecognizer`）及其实现
+见下文「经过多少种类」。后两个是**可选注入**：不注入时流水线照常工作，只是没有
+长期一致性与重定位。
 
 ## 架构
 
@@ -140,7 +142,7 @@ L7   gtsam::IncrementalFixedLagSmoother
 
 ### 经过多少种类
 
-**端口（可替换缝）**：5 个；对应 6 个接口——`IPinholeCalibration` 是 `ICameraModel` 的能力接口，不单独构成一条缝。全部定义在 `src/domain/ports.hpp` 与 `src/domain/camera_model.hpp`。
+**端口（可替换缝）**：8 个；对应 9 个接口——`IPinholeCalibration` 是 `ICameraModel` 的能力接口，不单独构成一条缝。`IDynamicInitializer`、`IPoseGraph`、`IPlaceRecognizer` 是**可选注入**：不注入时流水线照常工作，只是失去了动态初始化、长期一致性与重定位。定义在 `src/domain/ports.hpp`、`camera_model.hpp`、`pose_graph.hpp`、`place_recognition.hpp`。
 
 | 端口                                        | 实现                                                                               | 职责                                |
 | :------------------------------------------ | :--------------------------------------------------------------------------------- | :---------------------------------- |
@@ -150,8 +152,16 @@ L7   gtsam::IncrementalFixedLagSmoother
 | `domain::IPinholeCalibration`（能力接口） | `PinholeCameraModel`                                                             | 供只做针孔重投影的估计器查询        |
 | `domain::IStatePropagator`                | `StatePropagator`                                                                | 优化之间的 IMU 速率外推             |
 | `domain::ISensorSource`                   | `VioSimulator`                                                                   | 仿真/离线查询式数据源               |
+| `domain::IDynamicInitializer`（可选）       | `VisualImuInitializer`                                                          | 视觉 + IMU → 初始状态（实验性）       |
+| `domain::IPoseGraph`（可选）               | `GtsamPoseGraph`                                                                 | 跨窗口的长期一致性；整段历史轨迹      |
+| `domain::IPlaceRecognizer`（可选，仅契约） | **无参考实现**                                                                   | 跨地图/跨会话的位置检索              |
 
-（`ICameraModel` 与 `IPinholeCalibration` 在同一层，故上表 6 行对应 5 个「可替换缝」：估计器、前端、相机模型、外推器、数据源。）
+（`ICameraModel` 与 `IPinholeCalibration` 在同一层，故上表 9 行对应 8 个「可替换缝」：估计器、前端、相机模型、外推器、数据源、动态初始化、位姿图、位置识别。）
+
+`IPlaceRecognizer` 刻意没有参考实现：可靠的跨地图检索需要外观描述子，而
+`Observation` 只有像素、射线与跨帧编号（重建后重置）。用像素相似度凑一个能编译的
+实现会给出无法验证召回率的候选，比缺席更危险——它会让上层误以为 `RELOCALIZE`
+已经可用。缺席表现为明确失败（见 ADR 0002）。
 
 **一条仿真关键帧实际实例化的组件种类（按调用顺序）**：
 
@@ -165,16 +175,17 @@ L7   gtsam::IncrementalFixedLagSmoother
 8. `PreintegratedCombinedMeasurements`（GTSAM）
 9. `CombinedImuFactor` / `GenericProjectionFactor` / `PriorFactor`（GTSAM）
 10. `IncrementalFixedLagSmoother` + `ISAM2`（GTSAM）
-11. `mylog`（横切）
+11. `GtsamPoseGraph`（位姿图，可选）
+12. `mylog`（横切）
 
 **一条回放关键帧额外经过**：
 
-12. `SubtSequence`（数据读取）
-13. `TimeSynchronizer`（同步）
-14. `MeiFeatureTracker`（前端）
-15. `PinholeCameraModel` / `MeiCameraModel`（源模型与目标模型各一个）
-16. `ReplayObserver` → `MeiUndistorter` → `DatasetVisualizer`（可选显示）
-17. `io::writePly` / `std::ofstream`（TUM 轨迹）
+13. `SubtSequence`（数据读取）
+14. `TimeSynchronizer`（同步）
+15. `MeiFeatureTracker`（前端）
+16. `PinholeCameraModel` / `MeiCameraModel`（源模型与目标模型各一个）
+17. `ReplayObserver` → `MeiUndistorter` → `DatasetVisualizer`（可选显示）
+18. `io::writePly` / `std::ofstream`（TUM 轨迹）
 
 **层级计数**（按调用跳数计，即参与的类数 − 1，与上一节的 `L0..L6` 编号同一套口径）：
 
@@ -1094,7 +1105,8 @@ ctest --test-dir build --output-on-failure
 
 | 测试 | 覆盖 |
 | :--- | :--- |
-| `myslam_test` | 公开 API 可用、产出关键帧、RMSE 达标；契约自持（注入的估计器在 `reset` 后仍存在、缺工厂时明确失败、未知估计器名不静默回退）；双后端 A/B；时间同步；MEI 投影往返 |
+| `myslam_test` | 公开 API 可用、产出关键帧、RMSE 达标；契约自持（注入的估计器在 `reset` 后仍存在、缺工厂时明确失败、未知估计器名不静默回退）；双后端 A/B；时间同步；MEI 投影往返；地图世代（`reset` 换代而旧地图存活）、恢复门控（视觉退化不重建、丢失宽限、`RELOCALIZE` 不降级）、位姿图登记与优化调用、共视数不借用旧基线、无位姿图时世代计数仍前进、配置摘要分组完整性 |
+| `myslam_pose_graph_test` | 位姿图契约与 gtsam 实现：幂等、悬空边被拒、25 cm 漂移被压到 1 mm、锚点不动、双地图互不污染、版本号只在内容变化时前进、累积航向误差被修正、非有限位姿被拒绝（含四元数分量） |
 | `myslam_config_test` | 解析、钳位、交叉校验、未知键、四元数归一化、失败路径、日志节生效、默认配置自洽 |
 | `myslam_intrinsics_test` | 内参文件：焦距落到虚拟针孔、畸变从基线继承、旧式 `fx` 字段被拒、主点回退与畸形输入被拒 |
 | `myslam_layer_check` | 分层依赖方向，任何跨层 `#include` 直接失败 |
@@ -1130,7 +1142,11 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu + `g++-14` 上跑格式检查、构
   用成熟倍数卡它等于在收敛完成前就判死刑。像素硬门限始终生效；雅可比用中心
   差分（穿过外参复合的解析式写错不会报错，只会让门控安静地在错误方向上工作）。
   残差明显低于像素软门限时跳过统计检验——那里无论协方差如何都会接受，而每次
-  检验都要一次 3×3 分解，无条件付出会让后端耗时翻倍。
+  检验都要取一次路标边际协方差，那是一次贝叶斯树回代（实测约 1 ms，与一次完整
+  求解同量级）。跳过阈值由 `chi2ShortCircuitRatio` 控制，默认 1.0（只有已经超
+  像素门限的观测才复核）。**这不是精度旋钮**：把它压到 0.25 会让单帧后端从
+  35 ms 涨到 106 ms，而 230 个关键帧的位姿逐位相同——多出来的计算没有改变任何
+  一个判定。`myslam_test` 用「两种比例下 RMSE 必须逐位相等」把这条性质钉住。
 - **RPE**：`app::evaluateRpe` 按固定路径长度比较相对位移与**相对旋转**误差——
   滑动窗口系统逐段积累误差，RPE 比 ATE 更能反映局部质量。`TrackSample` 携带
   姿态，因此 ATE 与 RPE 都能给出旋转分量；只量平移时「位置对了但朝向系统性
@@ -1207,8 +1223,12 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu + `g++-14` 上跑格式检查、构
 
 ## 限制
 
-- 无回环检测与全局重定位，误差随时间累积
-- 无地图持久化，路标随边缘化窗口回收
+- 无回环检测，也无位置识别的参考实现：`IPlaceRecognizer` 只有契约（见 ADR 0002），
+  `RELOCALIZE` 在没有注入识别器时不会被假装执行
+- 长期一致性只到**位姿图**为止：关键帧位姿在整段历史上自洽，但图上没有任何跨地图
+  的边，因此漂移被抑制而不是被消除。短序列上它不产生修正（`optimize()` 返回 false），
+  这是正确行为而非缺陷
+- 无地图持久化：位姿图在内存里，进程结束即丢；路标仍随边缘化窗口回收
 - 出厂适配器只有单目 + IMU；契约已带可选相机系射线与单观测噪声，但多相机与深度融合未实现
 - `TimeSynchronizer` 处理偏移、断档与乱序，不估计相机-IMU 时间偏移（`vio.timeOffsetSeconds` 是常量）
 - 动态初始化是**实验性**的：只做线性解，模型假设窗口内近似匀速。低速、
@@ -1217,8 +1237,10 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu + `g++-14` 上跑格式检查、构
   该窗口内尺度与重力方向接近退化，残差几乎相同的一组解可以给出数倍不同的尺度）。
   默认关闭，作为默认路径前需要非线性精化
 - 逆深度的 `inverseDepthAngularSigma` 是仿真标定值（0.09），换平台需重标
-- 路标协方差已计入 χ² 的 `S`，但只有残差接近门限时才去取（每帧几十个观测各
-  一次 3×3 分解会把后端耗时翻倍），门限乘法器仍需留余量（默认 5）
+- 每取一次边际协方差就是一次贝叶斯树回代（约 1 ms）。路标协方差只在残差超过
+  `chi2ShortCircuitRatio × maxReprojectionError` 时才取（默认 1.0），位姿协方差
+  则每个关键帧固定取一次（约 8 ms，占单帧后端 35 ms 的四分之一）。后者用
+  `publishCovariance = false` 可整体关闭，代价是 NEES 与 χ² 门控同时失效
 - 无 `install()` / `export()` 规则，`myslam` 是 INTERFACE 目标
 - 配置只在启动时加载一次，无热重载
 - 日志写到当前工作目录，而非项目管理的位置
@@ -1269,12 +1291,21 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu + `g++-14` 上跑格式检查、构
 | 数据集读取                 | `src/sensor/subt_dataset.hpp:74`                                       |
 | 可视化观察者               | `src/viz/replay_observer.hpp`                                          |
 | 领域类型 / 状态 / 恢复语义 | `src/domain/types.hpp`、`src/domain/status.hpp`                      |
+| 地图世代与版本号           | `src/domain/types.hpp`（`MapId` / `MapInfo`）、`pipeline/pipeline.hpp:mapInfo` |
+| 位姿图（契约）             | `src/domain/pose_graph.hpp`                                            |
+| 位姿图（gtsam 实现）       | `src/adapters/gtsam/pose_graph.hpp`                                    |
+| 位置识别（仅契约）         | `src/domain/place_recognition.hpp`                                     |
+| 恢复动作门控与丢失宽限     | `pipeline/pipeline.hpp:gateRecovery`                                   |
+| 生效配置摘要               | `src/common/config_summary.hpp`                                        |
 
 ## 设计决策
 
 - [ADR 0001：ports and adapters 与自持契约](docs/adr/0001-ports-and-adapters.md)
   —— 为什么契约放在 `domain/`、两个端口刻意**不**承诺什么、重构暴露的两个真实缺陷
   （首帧基线丢失、把两帧各自的相机系射线当视差）
+- [ADR 0002：地图世代、位姿图与位置识别](docs/adr/0002-map-identity-and-pose-graph.md)
+  —— 为什么 `reset()` 不再丢弃历史而是切换地图世代、视觉退化为什么不能触发坐标系
+  重建、位姿图为什么用批量 LM 且必须跨重建存活、位置识别为什么只定契约
 
 ## 工程约定
 

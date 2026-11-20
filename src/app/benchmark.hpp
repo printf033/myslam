@@ -10,9 +10,12 @@
  * 数据源不提供真值时只运行不评估。真实记录回放见 @c app/replay.hpp。
  */
 
+#include "adapters/gtsam/pose_graph.hpp"
 #include "adapters/register_builtin.hpp"
+#include "common/config_summary.hpp"
 #include "domain/config.hpp"
 #include "domain/ports.hpp"
+#include "domain/pose_graph.hpp"
 #include "domain/status.hpp"
 #include "domain/types.hpp"
 #include "logger.hpp"
@@ -26,6 +29,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -55,9 +59,27 @@ namespace myslam::vio
                      std::unique_ptr<domain::ISensorSource> source, domain::EstimatorFactory factory = {})
             : config_(config),
               system_(system),
-              pipeline_(config, prepareFactory(std::move(factory))),
+              pipeline_(config, prepareFactory(std::move(factory)),
+                        /*dynamicInitializer=*/nullptr, makeDefaultPoseGraph(config)),
               source_(source ? std::move(source) : makeDefaultSource(config_, pipeline_))
         {
+        }
+
+        /**
+         * @brief 按配置决定是否挂位姿图
+         *
+         * 「可注入但从未注入」是一种非常安静的不生效：端口、实现、测试都
+         * 存在，而实跑时永远是 nullptr。因此默认装配必须在这里发生，而不是
+         * 留给调用方记得传。
+         */
+        [[nodiscard]] static std::shared_ptr<domain::IPoseGraph>
+        makeDefaultPoseGraph(const domain::PipelineConfig &config)
+        {
+            if (!config.map.poseGraphEnabled)
+            {
+                return nullptr;
+            }
+            return std::make_shared<adapters::GtsamPoseGraph>();
         }
 
         /**
@@ -277,47 +299,15 @@ namespace myslam::vio
         /**
          * @brief 把实际生效的配置逐项打到日志
          *
-         * 配置是「代码默认值 + 配置文件 + 命令行」叠加的结果，事后想反推
-         * 「刚才跑的到底是哪一套」只能翻日志。启动时一次性回显，并标注
-         * 每个门控现在是统计门控还是像素门控——它决定出错时该去哪一段代码
-         * 找原因。
+         * 摘要本身在 @c common/config_summary.hpp，因为回放入口也要打同一份。
+         * 两处各写一份的后果不是"多写几行"，而是两份会各自漏掉不同的字段。
          */
         static void logEffectiveConfig(const domain::PipelineConfig &config, const domain::SystemConfig &system)
         {
-            const auto &intr = config.camera.intrinsics;
-            mylog::info(
-                "[生效配置-相机] {} {}x{} fx={:.2f} fy={:.2f} cx={:.1f} cy={:.1f} 外参平移=[{:.3f}, {:.3f}, {:.3f}] "
-                "时间偏移={:.4f}s 曝光={:.4f}s",
-                camera::cameraModelName(intr.model), intr.imageWidth, intr.imageHeight, intr.fx, intr.fy, intr.cx,
-                intr.cy, config.camera.bodyPSensor.position.x(), config.camera.bodyPSensor.position.y(),
-                config.camera.bodyPSensor.position.z(), config.camera.timeOffsetSeconds, config.camera.exposureSeconds);
-            mylog::info(
-                "[生效配置-IMU] rate={:.0f}Hz 噪声 acc={:.2e} gyro={:.2e} 零偏游走 acc={:.2e} gyro={:.2e} g={:.3f}",
-                config.imu.rateHz, config.imu.accelNoiseSigma, config.imu.gyroNoiseSigma, config.imu.accelBiasRw,
-                config.imu.gyroBiasRw, config.imu.gravityMagnitude);
-            mylog::info("[生效配置-门控] 外点判定={} 像素软/硬/预优化={:.1f}/{:.1f}/{:.1f}px streak={} "
-                        "χ²multiplier={:.1f} 置信={:.3f}",
-                        (config.vision.chi2Gating && config.estimator.publishCovariance) ? "χ²统计检验" : "像素阈值",
-                        config.vision.maxReprojectionError, config.vision.maxReprojectionErrorHard,
-                        config.vision.maxReprojectionErrorPreopt, config.vision.outlierStreakThreshold,
-                        config.vision.chi2Multiplier, config.vision.chi2Confidence);
-            mylog::info("[生效配置-前端] 特征数下限={} 网格={}x{} RANSAC={} 阈值={:.2f}σ 置信={:.3f}",
-                        config.vision.minFeatures, config.vision.gridColumns, config.vision.gridRows,
-                        config.vision.enableRansac ? "on" : "off", config.vision.ransacThresholdSigma,
-                        config.vision.ransacConfidence);
-            mylog::info("[生效配置-关键帧] 视差>={:.1f}px 共视<{:.2f} 间隔[{:.2f}, {:.2f}]s 三角化视差>={:.1f}px",
-                        config.vision.minParallaxPx, config.vision.minTrackingRatio, config.vision.minKeyframeInterval,
-                        config.vision.maxKeyframeInterval, config.vision.minTriangulationParallaxPx);
-            mylog::info("[生效配置-估计器] {} 窗口={:.2f}s 迭代={} 路标={} 协方差={} 零速窗口={:.2f}s",
-                        config.estimator.name, config.estimator.slidingWindowLag,
-                        config.estimator.extraSmootherIterations, config.estimator.landmarkRepresentation,
-                        config.estimator.publishCovariance ? "上报" : "不上报", config.estimator.zuptWindowSeconds);
-            mylog::info("[生效配置-初始化] 重力对齐={} 动态初始化={} 最少样本={} 窗口={:.1f}s 超时={:.1f}s",
-                        config.initialization.gravityAlignment ? "on" : "off",
-                        config.initialization.dynamicEnabled ? "on" : "off", config.initialization.minSamples,
-                        config.initialization.windowSeconds, config.initialization.timeoutSeconds);
-            mylog::info("[生效配置-运行时] 相机步长={:.4f}s 时长={:.2f}s RMSE门限={:.3f}m", system.cameraDt,
-                        system.totalDuration, system.rmseThreshold);
+            for (const auto &line : common::summarizeConfigLines(config, system))
+            {
+                mylog::info("[生效配置] {}", line);
+            }
         }
 
         /// 构造流水线前确保注册表已就绪（参数求值先于 pipeline_ 构造）
